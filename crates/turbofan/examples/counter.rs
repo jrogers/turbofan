@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-use cluster::{CloseReason, Ctx, Service, SessionId};
+use turbofan::{CloseReason, Ctx, Service, SessionId};
 
 /// This cluster's `Hello.service_id`.
 const SERVICE_ID: u32 = 1;
@@ -47,5 +47,5 @@ impl Service for Counter {
 }
 
 fn main() -> ExitCode {
-    cluster::run(SERVICE_ID, Counter::default())
+    turbofan::run(SERVICE_ID, Counter::default())
 }

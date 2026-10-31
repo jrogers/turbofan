@@ -1,5 +1,5 @@
 [package]
-name = "cluster"
+name = "turbofan"
 description = "A Raft-replicated state machine framework: a deterministic service, client sessions, timers and snapshots"
 version.workspace = true
 edition.workspace = true

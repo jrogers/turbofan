@@ -126,16 +126,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cluster"
-version = "0.1.0"
-dependencies = [
- "tempfile",
- "tokio",
- "turbojet",
- "turbojet-codegen",
-]
-
-[[package]]
 name = "compact_str"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -385,9 +375,9 @@ dependencies = [
 name = "oms"
 version = "0.1.0"
 dependencies = [
- "cluster",
  "tempfile",
  "tokio",
+ "turbofan",
  "turbojet",
  "turbojet-codegen",
 ]
@@ -904,6 +894,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "turbofan"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+ "turbojet",
+ "turbojet-codegen",
 ]
 
 [[package]]

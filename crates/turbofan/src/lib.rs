@@ -1,4 +1,4 @@
-//! A Raft-replicated state machine framework, after Aeron Cluster: a leader orders client input
+//! Turbofan: a Raft-replicated state machine framework, after Aeron Cluster: a leader orders client input
 //! into a log, a quorum makes it durable, and every node applies it to the same deterministic
 //! [`Service`]. Nothing here knows what the service does; its messages are opaque bytes.
 #![warn(clippy::unwrap_used)]

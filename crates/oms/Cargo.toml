@@ -11,7 +11,7 @@ name = "oms-node"
 path = "src/main.rs"
 
 [dependencies]
-cluster.workspace = true
+turbofan.workspace = true
 turbojet.workspace = true
 
 [build-dependencies]

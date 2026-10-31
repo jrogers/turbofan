@@ -11,9 +11,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use cluster::ClusterClient;
-use cluster::client::{Event, SendError};
 use oms::wire::{self, ExecType, OrdStatus, Side};
+use turbofan::ClusterClient;
+use turbofan::client::{Event, SendError};
 use turbojet::sbe::Encode;
 
 /// Orders sent but not yet filled: the gateway stops sending at this many.

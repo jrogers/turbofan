@@ -19,12 +19,12 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use cluster::client::{self, Client};
-use cluster::codec::{self, Record};
-use cluster::meta::Meta;
-use cluster::node::{self, ConnId, Node};
-use cluster::raft::{Config, NodeId, Persist, Role, Snapshot};
-use cluster::{Ctx, Service, SessionId};
+use turbofan::client::{self, Client};
+use turbofan::codec::{self, Record};
+use turbofan::meta::Meta;
+use turbofan::node::{self, ConnId, Node};
+use turbofan::raft::{Config, NodeId, Persist, Role, Snapshot};
+use turbofan::{Ctx, Service, SessionId};
 
 const MS: u64 = 1_000_000;
 const FAULT_PHASE: u64 = 20_000 * MS;
@@ -378,7 +378,7 @@ impl Sim {
         self.next_conn += 1;
         self.conns.insert(conn, Conn { client: ADMIN, node: id, up: true, to_node_at: 0, to_client_at: 0 });
         let mut frame = Vec::new();
-        codec::encode_frame(&cluster::wire::SnapshotRequest { request_id: self.admin_requests }, &mut frame).unwrap();
+        codec::encode_frame(&turbofan::wire::SnapshotRequest { request_id: self.admin_requests }, &mut frame).unwrap();
         let node = self.nodes.get_mut(&id).unwrap().node.as_mut().unwrap();
         node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, self.now);
         self.flush(id);
@@ -521,7 +521,7 @@ impl Sim {
         }
         if c == ADMIN {
             let (message, _) = codec::decode_frame(frame).unwrap().unwrap();
-            self.admin_answers += u64::from(matches!(message, cluster::wire::Decoded::SnapshotTaken(_)));
+            self.admin_answers += u64::from(matches!(message, turbofan::wire::Decoded::SnapshotTaken(_)));
             return;
         }
         self.clients[c].client.on_frame(&codec::decode_frame(frame).unwrap().unwrap().0);

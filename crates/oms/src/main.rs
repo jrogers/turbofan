@@ -1,8 +1,8 @@
 //! A node of the OMS cluster: `oms-node serve ...` or `oms-node snapshot ...` (see
-//! [`cluster::run`]).
+//! [`turbofan::run`]).
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    cluster::run(oms::SERVICE_ID, oms::Oms::default())
+    turbofan::run(oms::SERVICE_ID, oms::Oms::default())
 }
