@@ -4,8 +4,7 @@
 > **Pre-1.0, and not used in production yet.** It's simulated, fuzzed and tested over a real
 > network, but its APIs will change. It is provided as is, without warranty of any kind.
 
-**Turbofan** is a set of Rust components for building fault-tolerant, low-latency trading
-systems. It follows the same aims as [Turbojet](https://github.com/jrogers/turbojet): safe,
+**Turbofan** is a set of Rust components for building fault-tolerant systems. It has the aims of being safe,
 thoroughly tested, and fast.
 
 ## Crates
@@ -14,7 +13,6 @@ thoroughly tested, and fast.
 |---|---|
 | [`turbofan-cluster`](crates/turbofan-cluster) | A Raft-replicated state machine framework, after Aeron Cluster. A leader orders client input into a log, a quorum makes it durable, and every node applies it to the same deterministic service, so the service survives node failures without losing or repeating a message. |
 | [`turbofan-sbe`](crates/turbofan-sbe) | SBE (Simple Binary Encoding): codecs generated from message schemas in a `build.rs`, and a schemaless API for reading and writing fields one at a time. |
-| [`oms`](crates/oms) | An order management system built as a service on `turbofan-cluster`, with a gateway and venue example that checks every order's reports while nodes are killed. |
 
 ## Building and testing
 
