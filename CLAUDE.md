@@ -17,3 +17,5 @@ writing code.
 - `scripts/check.sh` (fmt, clippy `-D warnings`, tests, rustdoc) before calling work done.
   `SIM_SEEDS=1000 cargo test -p turbofan-cluster --release --test sim` for a longer simulation; a failure
   prints `SIM_SEED=<n>`, which replays it.
+- `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan-cluster/fuzz`,
+  outside the workspace; nightly and cargo-fuzz). `check.sh` only checks it builds.

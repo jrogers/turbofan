@@ -4,5 +4,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 echo "== fmt";    cargo fmt --all --check
 echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings
+echo "== fuzz";   cargo clippy --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --bins -- -D warnings
 echo "== test";   cargo test --workspace
 echo "== doc";    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
