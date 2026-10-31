@@ -1,4 +1,9 @@
-# turbofan
+<h1 align="center">turbofan</h1>
+
+<p align="center">
+  <a href="https://github.com/jrogers/turbofan/actions/workflows/ci.yml"><img src="https://github.com/jrogers/turbofan/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
+</p>
 
 > [!WARNING]
 > **Pre-1.0, and not used in production yet.** It's simulated, fuzzed and tested over a real
