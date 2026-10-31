@@ -1,5 +1,5 @@
 //! SBE (Simple Binary Encoding): what generated codecs share, and [`codegen`], which generates
-//! them. Copied from Turbojet's `turbojet::sbe` and `turbojet-codegen` (commit `8ec307f`).
+//! them.
 //!
 //! [`codegen::SbeGenerator`], from a `build.rs`, generates, for each message in the schema, a borrowed decoder (`NewOrderSingleRef`)
 //! and a struct to encode (`NewOrderSingle`), plus a `decode` function that reads the message
