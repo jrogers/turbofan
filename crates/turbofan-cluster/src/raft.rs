@@ -7,6 +7,11 @@
 //! **The driver's one rule:** perform an [`Outputs`]' `persist` operations in order and make them
 //! durable, then call [`Raft::on_persisted`], and only then send its `sends`. A vote or an ack
 //! then never goes out ahead of the state it promises.
+//!
+//! A leader's `appends` are the exception: they go out at once, while `persist` is under way, so
+//! followers write the leader's new records while it does. The leader counts itself towards a
+//! commit only once they're durable, and its term was durable before it asked for votes. If it
+//! crashes first, it comes back a follower without them, and can't lead that term again.
 
 use std::collections::VecDeque;
 
@@ -93,7 +98,9 @@ pub enum Persist {
 pub struct Outputs {
     /// Persist these first, in order.
     pub persist: Vec<Persist>,
-    /// Then send these frames.
+    /// A leader's `AppendEntries`: send these at once, without waiting for `persist`.
+    pub appends: Vec<(NodeId, Vec<u8>)>,
+    /// Once `persist` is durable, send these frames.
     pub sends: Vec<(NodeId, Vec<u8>)>,
     /// This node became leader in this batch: the caller should propose an entry of the new
     /// term, so that the entries of earlier terms commit.
@@ -554,7 +561,9 @@ impl Raft {
             count,
             entries: &bytes,
         };
-        self.send(id, &append);
+        let mut frame = Vec::new();
+        codec::encode_frame(&append, &mut frame).expect("an append is within a frame");
+        self.out.appends.push((id, frame));
         self.peers[peer].next = index;
     }
 
@@ -853,11 +862,12 @@ mod tests {
         codec::decode_frame(frame).unwrap().unwrap().0
     }
 
-    /// Makes the batch durable and returns its sends, as a driver would.
+    /// Makes the batch durable and returns its appends and sends, as a driver would.
     fn flush(raft: &mut Raft) -> Vec<(NodeId, Vec<u8>)> {
-        let out = raft.take_outputs();
+        let mut out = raft.take_outputs();
         raft.on_persisted(raft.last_index());
-        out.sends
+        out.appends.append(&mut out.sends);
+        out.appends
     }
 
     /// Delivers `sends` from `from`, and everything they cause, between the nodes in `up`.
@@ -894,6 +904,27 @@ mod tests {
     fn cluster(n: NodeId) -> Vec<Raft> {
         let members: Vec<NodeId> = (1..=n).collect();
         members.iter().map(|&id| Raft::new(config(id, &members), Meta::default(), None, &[], 0)).collect()
+    }
+
+    /// A leader's appends go out before its own records are durable, and it counts itself
+    /// towards a commit only once they are.
+    #[test]
+    fn a_leader_counts_itself_towards_a_commit_only_once_durable() {
+        let mut rafts = cluster(3);
+        let now = 1000 * MS;
+        elect(&mut rafts, &[1, 2, 3], 1, now);
+        let committed = rafts[0].commit_index();
+        let index = rafts[0].propose(b"x").unwrap();
+        let out = rafts[0].take_outputs();
+        assert!(matches!(out.persist[..], [Persist::Append(_)]), "{:?}", out.persist);
+        let (_, append) = out.appends.into_iter().find(|&(to, _)| to == 2).expect("an append for node 2");
+        rafts[1].on_message(1, &decode(&append), now);
+        for (_, ack) in flush(&mut rafts[1]) {
+            rafts[0].on_message(2, &decode(&ack), now);
+        }
+        assert_eq!(rafts[0].commit_index(), committed, "node 2 alone is one of three");
+        rafts[0].on_persisted(index);
+        assert_eq!(rafts[0].commit_index(), index, "with node 1 durable, two of three");
     }
 
     /// Raft's figure 8: a leader can't commit an entry of an earlier term by counting replicas,

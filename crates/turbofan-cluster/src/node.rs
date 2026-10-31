@@ -139,13 +139,17 @@ pub struct Config {
     pub egress_ring_entries: usize,
 }
 
-/// What one batch of inputs produced. Carry out in this order: `persist`, then
-/// [`Node::on_persisted`]; take outputs again until `persist` is empty; then all the sends.
+/// What one batch of inputs produced. Carry out in this order: send `peer_appends` and start on
+/// `persist`; once it's durable, [`Node::on_persisted`]; take outputs again until `persist` is
+/// empty; then all the other sends.
 #[derive(Debug, Default)]
 pub struct Outputs {
-    /// Persist these first, in order.
+    /// Persist these, in order.
     pub persist: Vec<Persist>,
-    /// Frames for peers.
+    /// A leader's `AppendEntries`, for peers: send these at once, without waiting for `persist`
+    /// (see [`crate::raft`]).
+    pub peer_appends: Vec<(NodeId, Vec<u8>)>,
+    /// Frames for peers, once `persist` is durable.
     pub peer_sends: Vec<(NodeId, Vec<u8>)>,
     /// Frames for clients.
     pub client_sends: Vec<(ConnId, Vec<u8>)>,
@@ -340,9 +344,15 @@ impl<S: Service> Node<S> {
             self.become_leader();
             let more = self.raft.take_outputs();
             out.persist.extend(more.persist);
+            out.appends.extend(more.appends);
             out.sends.extend(more.sends);
         }
-        Outputs { persist: out.persist, peer_sends: out.sends, client_sends: std::mem::take(&mut self.local.sends) }
+        Outputs {
+            persist: out.persist,
+            peer_appends: out.appends,
+            peer_sends: out.sends,
+            client_sends: std::mem::take(&mut self.local.sends),
+        }
     }
 
     /// When [`Node::on_tick`] next has something to do.

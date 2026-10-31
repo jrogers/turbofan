@@ -152,11 +152,13 @@ impl<S: Service + Send + 'static> Core<S> {
         }
     }
 
-    /// Persists, then sends, what the node has for the disk and the network.
+    /// Persists, then sends, what the node has for the disk and the network. A leader's appends go
+    /// first, so followers write them while it does.
     async fn flush(&mut self) -> io::Result<()> {
         let (mut peer_sends, mut client_sends) = (Vec::new(), Vec::new());
         loop {
             let out = self.node.take_outputs();
+            self.send_peers(out.peer_appends);
             peer_sends.extend(out.peer_sends);
             client_sends.extend(out.client_sends);
             if out.persist.is_empty() {
@@ -173,12 +175,7 @@ impl<S: Service + Send + 'static> Core<S> {
             self.storage = Some(storage);
             self.node.on_persisted(last?);
         }
-        for (to, frame) in peer_sends {
-            if let Some(tx) = self.peers.get(&to) {
-                // Full or down: Raft resends.
-                let _ = tx.try_send(frame);
-            }
-        }
+        self.send_peers(peer_sends);
         for (conn, frame) in client_sends {
             let Some(tx) = self.conns.get(&conn) else { continue };
             if tx.try_send(frame).is_err() {
@@ -188,6 +185,15 @@ impl<S: Service + Send + 'static> Core<S> {
             }
         }
         Ok(())
+    }
+
+    fn send_peers(&self, frames: Vec<(NodeId, Vec<u8>)>) {
+        for (to, frame) in frames {
+            if let Some(tx) = self.peers.get(&to) {
+                // Full or down: Raft resends.
+                let _ = tx.try_send(frame);
+            }
+        }
     }
 }
 

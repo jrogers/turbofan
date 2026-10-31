@@ -416,13 +416,16 @@ impl Sim {
         self.schedule(after, Event::Heal);
     }
 
-    /// Carries out a node's outputs as a driver must: persist (perhaps crashing partway), report
-    /// what's durable, and again while that produces more to persist (applying entries can
-    /// snapshot); then send.
+    /// Carries out a node's outputs as a driver must: send a leader's appends, persist (perhaps
+    /// crashing partway, the appends already sent), report what's durable, and again while that
+    /// produces more to persist (applying entries can snapshot); then send the rest.
     fn flush(&mut self, id: NodeId) {
         let (mut peer_sends, mut client_sends) = (Vec::new(), Vec::new());
         loop {
             let out = self.nodes.get_mut(&id).unwrap().node.as_mut().unwrap().take_outputs();
+            for (to, frame) in out.peer_appends {
+                self.send_peer(id, to, frame);
+            }
             // A snapshot from the leader that replaces the log: what it covers is checked by its
             // bytes, and the disk's log, still to be replaced, may hold uncommitted entries there.
             for op in &out.persist {

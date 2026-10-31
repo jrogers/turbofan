@@ -83,7 +83,8 @@ returns outputs (what to persist, what to send). It does no IO and never reads a
 - `node.rs` adds client sessions, timers and snapshots on top, and runs the service.
 - `client.rs` is the client's half of a session.
 - `driver.rs` runs a node on tokio, with TCP and files. It batches inputs while a write is syncing,
-  which gives group commit.
+  which gives group commit. A leader sends its new records to followers while it syncs them
+  itself, so a commit waits for the slower of the two rather than both in turn.
 - `remote.rs` runs a client on tokio.
 
 The wire protocol is `schema/cluster.xml`, generated into `wire` with `turbofan-sbe`. A log record
