@@ -1,4 +1,4 @@
-//! An order management system, as a [`turbofan::Service`]: the cluster replicates it, and every
+//! An order management system, as a [`turbofan_cluster::Service`]: the cluster replicates it, and every
 //! node runs the same orders through the same states.
 //!
 //! Gateways send [`wire::NewOrder`], [`wire::CancelOrder`] and [`wire::ReplaceOrder`], and get a
@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use turbofan::{CloseReason, Ctx, Service, SessionId};
+use turbofan_cluster::{CloseReason, Ctx, Service, SessionId};
 use turbojet::sbe::Encode;
 use wire::{ExecType, OrdStatus, Reason, Side};
 

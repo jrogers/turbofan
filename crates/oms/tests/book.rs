@@ -2,8 +2,8 @@
 
 use oms::Oms;
 use oms::wire::{self, ExecType, OrdStatus, Reason, Side};
-use turbofan::node::Effect;
-use turbofan::{Ctx, Service, SessionId};
+use turbofan_cluster::node::Effect;
+use turbofan_cluster::{Ctx, Service, SessionId};
 use turbojet::sbe::Encode;
 
 const VENUE: SessionId = 1;

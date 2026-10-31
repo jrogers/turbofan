@@ -377,7 +377,7 @@ version = "0.1.0"
 dependencies = [
  "tempfile",
  "tokio",
- "turbofan",
+ "turbofan-cluster",
  "turbojet",
  "turbojet-codegen",
 ]
@@ -897,7 +897,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "turbofan"
+name = "turbofan-cluster"
 version = "0.1.0"
 dependencies = [
  "tempfile",

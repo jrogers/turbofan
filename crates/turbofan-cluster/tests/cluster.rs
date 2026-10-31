@@ -7,10 +7,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use turbofan::client::Event;
-use turbofan::driver::{self, serve};
-use turbofan::raft::{self, NodeId};
-use turbofan::{ClusterClient, Ctx, Service, SessionId, node, request_snapshot};
+use turbofan_cluster::client::Event;
+use turbofan_cluster::driver::{self, serve};
+use turbofan_cluster::raft::{self, NodeId};
+use turbofan_cluster::{ClusterClient, Ctx, Service, SessionId, node, request_snapshot};
 
 const SERVICE_ID: u32 = 7;
 const MS: u64 = 1_000_000;

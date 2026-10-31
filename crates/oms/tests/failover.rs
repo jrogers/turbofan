@@ -7,9 +7,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use turbofan::driver::{self, serve};
-use turbofan::node;
-use turbofan::raft::{self, NodeId};
+use turbofan_cluster::driver::{self, serve};
+use turbofan_cluster::node;
+use turbofan_cluster::raft::{self, NodeId};
 
 #[path = "../examples/gateway.rs"]
 mod gateway;
