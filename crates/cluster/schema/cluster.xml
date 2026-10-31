@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The cluster's wire protocol: the handshake, peer (Raft), client, admin and log-entry messages.
+     Every frame is a u32 length and one of these messages. Services' own payloads are opaque
+     `payload` bytes here; each service has a schema of its own. -->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="0"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="groupSizeEncoding">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+        <!-- A service payload: MAX_PAYLOAD_BYTES. -->
+        <composite name="payloadData">
+            <type name="length" primitiveType="uint32" maxValue="65536"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <!-- Log records shipped verbatim, or a snapshot chunk: bounded by MAX_FRAME_BYTES. -->
+        <composite name="bulkData">
+            <type name="length" primitiveType="uint32" maxValue="1048000"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <composite name="addrData">
+            <type name="length" primitiveType="uint8"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <enum name="Role" encodingType="uint8">
+            <validValue name="Peer">1</validValue>
+            <validValue name="Client">2</validValue>
+            <validValue name="Admin">3</validValue>
+        </enum>
+        <enum name="CloseReason" encodingType="uint8">
+            <validValue name="Client">1</validValue>
+            <validValue name="Timeout">2</validValue>
+            <validValue name="Service">3</validValue>
+            <!-- The cluster has no such session: never opened, or closed. -->
+            <validValue name="NoSession">4</validValue>
+        </enum>
+    </types>
+
+    <!-- Handshake: the first frame each way on every connection. -->
+    <sbe:message name="Hello" id="1">
+        <field name="magic" id="1" type="uint32"/>
+        <field name="serviceId" id="2" type="uint32"/>
+        <field name="role" id="3" type="Role"/>
+        <field name="nodeId" id="4" type="uint8"/>
+    </sbe:message>
+
+    <!-- Peer to peer. -->
+    <sbe:message name="RequestVote" id="10">
+        <field name="term" id="1" type="uint64"/>
+        <field name="candidate" id="2" type="uint8"/>
+        <field name="lastIndex" id="3" type="uint64"/>
+        <field name="lastTerm" id="4" type="uint64"/>
+        <field name="preVote" id="5" type="uint8"/>
+    </sbe:message>
+    <sbe:message name="Vote" id="11">
+        <field name="term" id="1" type="uint64"/>
+        <field name="granted" id="2" type="uint8"/>
+        <field name="preVote" id="3" type="uint8"/>
+    </sbe:message>
+    <!-- `entries` is `count` log records, as stored. None is a heartbeat. -->
+    <sbe:message name="AppendEntries" id="12">
+        <field name="term" id="1" type="uint64"/>
+        <field name="leader" id="2" type="uint8"/>
+        <field name="prevIndex" id="3" type="uint64"/>
+        <field name="prevTerm" id="4" type="uint64"/>
+        <field name="commit" id="5" type="uint64"/>
+        <field name="count" id="6" type="uint32"/>
+        <data name="entries" id="7" type="bulkData"/>
+    </sbe:message>
+    <!-- `index`: the durable last index on success, where to retry from on failure. -->
+    <sbe:message name="AppendAck" id="13">
+        <field name="term" id="1" type="uint64"/>
+        <field name="success" id="2" type="uint8"/>
+        <field name="index" id="3" type="uint64"/>
+        <field name="snapshotIndex" id="4" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="InstallSnapshot" id="14">
+        <field name="term" id="1" type="uint64"/>
+        <field name="leader" id="2" type="uint8"/>
+        <field name="lastIndex" id="3" type="uint64"/>
+        <field name="lastTerm" id="4" type="uint64"/>
+        <field name="offset" id="5" type="uint64"/>
+        <field name="done" id="6" type="uint8"/>
+        <data name="chunk" id="7" type="bulkData"/>
+    </sbe:message>
+    <sbe:message name="SnapshotAck" id="15">
+        <field name="term" id="1" type="uint64"/>
+        <field name="offset" id="2" type="uint64"/>
+    </sbe:message>
+
+    <!-- Client to cluster. -->
+    <sbe:message name="Connect" id="20"/>
+    <sbe:message name="Reattach" id="21">
+        <field name="session" id="1" type="uint64"/>
+        <field name="lastEgressSeq" id="2" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Message" id="22">
+        <field name="session" id="1" type="uint64"/>
+        <field name="clientSeq" id="2" type="uint64"/>
+        <data name="payload" id="3" type="payloadData"/>
+    </sbe:message>
+    <sbe:message name="KeepAlive" id="23">
+        <field name="session" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Close" id="24">
+        <field name="session" id="1" type="uint64"/>
+    </sbe:message>
+
+    <!-- Cluster to client (and admin, for Redirect). An empty addr: no leader yet, retry. -->
+    <sbe:message name="Redirect" id="30">
+        <field name="leader" id="1" type="uint8"/>
+        <data name="addr" id="2" type="addrData"/>
+    </sbe:message>
+    <sbe:message name="Opened" id="31">
+        <field name="session" id="1" type="uint64"/>
+        <field name="appliedSeq" id="2" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Egress" id="32">
+        <field name="session" id="1" type="uint64"/>
+        <field name="egressSeq" id="2" type="uint64"/>
+        <field name="appliedSeq" id="3" type="uint64"/>
+        <data name="payload" id="4" type="payloadData"/>
+    </sbe:message>
+    <sbe:message name="KeepAliveAck" id="33">
+        <field name="appliedSeq" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Closed" id="34">
+        <field name="session" id="1" type="uint64"/>
+        <field name="reason" id="2" type="CloseReason"/>
+    </sbe:message>
+
+    <!-- Admin. -->
+    <sbe:message name="SnapshotRequest" id="40">
+        <field name="requestId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="SnapshotTaken" id="41">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="index" id="2" type="uint64"/>
+        <field name="quorumAcked" id="3" type="uint8"/>
+    </sbe:message>
+
+    <!-- Log-entry bodies: the payload of a log record. `timestamp` is the leader's clock in ns,
+         the only time the service sees. -->
+    <!-- The session's ID is this entry's log index. -->
+    <sbe:message name="SessionOpen" id="50">
+        <field name="timestamp" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="SessionMessage" id="51">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="session" id="2" type="uint64"/>
+        <field name="clientSeq" id="3" type="uint64"/>
+        <data name="payload" id="4" type="payloadData"/>
+    </sbe:message>
+    <sbe:message name="SessionClose" id="52">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="session" id="2" type="uint64"/>
+        <field name="reason" id="3" type="CloseReason"/>
+    </sbe:message>
+    <sbe:message name="TimerFired" id="53">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="id" id="2" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="NewTerm" id="54">
+        <field name="timestamp" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Snapshot" id="55">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="requestId" id="2" type="uint64"/>
+    </sbe:message>
+</sbe:messageSchema>

@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The OMS's messages: the payloads of cluster sessions. Gateways send orders and get execution
+     reports; the venue gateway gets orders to work and reports what the venue did. Prices are
+     integer ticks. -->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="oms" id="200" version="0"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="groupSizeEncoding">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+        <!-- MAX_CL_ORD_ID -->
+        <composite name="clOrdIdData">
+            <type name="length" primitiveType="uint8" maxValue="32"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <!-- MAX_SYMBOL -->
+        <composite name="symbolData">
+            <type name="length" primitiveType="uint8" maxValue="16"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <enum name="Side" encodingType="uint8">
+            <validValue name="Buy">1</validValue>
+            <validValue name="Sell">2</validValue>
+        </enum>
+        <!-- As FIX's OrdStatus. -->
+        <enum name="OrdStatus" encodingType="uint8">
+            <validValue name="PendingNew">1</validValue>
+            <validValue name="New">2</validValue>
+            <validValue name="PartiallyFilled">3</validValue>
+            <validValue name="Filled">4</validValue>
+            <validValue name="PendingCancel">5</validValue>
+            <validValue name="Canceled">6</validValue>
+            <validValue name="PendingReplace">7</validValue>
+            <validValue name="Rejected">8</validValue>
+        </enum>
+        <!-- As FIX's ExecType: what this report is about. -->
+        <enum name="ExecType" encodingType="uint8">
+            <validValue name="PendingNew">1</validValue>
+            <validValue name="New">2</validValue>
+            <validValue name="Trade">3</validValue>
+            <validValue name="PendingCancel">4</validValue>
+            <validValue name="Canceled">5</validValue>
+            <validValue name="PendingReplace">6</validValue>
+            <validValue name="Replaced">7</validValue>
+            <validValue name="Rejected">8</validValue>
+        </enum>
+        <enum name="Reason" encodingType="uint8">
+            <validValue name="None">0</validValue>
+            <validValue name="UnknownOrder">1</validValue>
+            <validValue name="DuplicateClOrdId">2</validValue>
+            <validValue name="InvalidQty">3</validValue>
+            <validValue name="InvalidPrice">4</validValue>
+            <validValue name="InvalidSymbol">5</validValue>
+            <validValue name="NoVenue">6</validValue>
+            <validValue name="TooLate">7</validValue>
+            <validValue name="Pending">8</validValue>
+            <validValue name="VenueRejected">9</validValue>
+            <validValue name="NotYourOrder">10</validValue>
+            <validValue name="InvalidClOrdId">11</validValue>
+            <validValue name="InvalidSide">12</validValue>
+            <!-- MAX_ORDERS reached. -->
+            <validValue name="Full">13</validValue>
+        </enum>
+    </types>
+
+    <!-- Gateway to OMS. -->
+    <sbe:message name="NewOrder" id="1">
+        <field name="side" id="1" type="Side"/>
+        <field name="qty" id="2" type="uint64"/>
+        <field name="price" id="3" type="int64"/>
+        <data name="clOrdId" id="4" type="clOrdIdData"/>
+        <data name="symbol" id="5" type="symbolData"/>
+    </sbe:message>
+    <sbe:message name="CancelOrder" id="2">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="ReplaceOrder" id="3">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="qty" id="2" type="uint64"/>
+        <field name="price" id="3" type="int64"/>
+    </sbe:message>
+
+    <!-- Venue gateway to OMS. The session that registers last is the venue's. -->
+    <sbe:message name="RegisterVenue" id="10"/>
+    <sbe:message name="VenueAck" id="11">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="VenueReject" id="12">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Fill" id="13">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="qty" id="2" type="uint64"/>
+        <field name="price" id="3" type="int64"/>
+    </sbe:message>
+    <!-- Canceled at the venue, asked for or not. -->
+    <sbe:message name="VenueCanceled" id="14">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="VenueReplaced" id="15">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+    <!-- The venue refused a cancel or replace. -->
+    <sbe:message name="VenueRequestReject" id="16">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+
+    <!-- OMS to gateway. `orderId` 0: refused before it was an order. -->
+    <sbe:message name="ExecReport" id="20">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="execType" id="2" type="ExecType"/>
+        <field name="ordStatus" id="3" type="OrdStatus"/>
+        <field name="side" id="4" type="Side"/>
+        <field name="qty" id="5" type="uint64"/>
+        <field name="price" id="6" type="int64"/>
+        <field name="cumQty" id="7" type="uint64"/>
+        <field name="leavesQty" id="8" type="uint64"/>
+        <field name="avgPx" id="9" type="int64"/>
+        <field name="lastQty" id="10" type="uint64"/>
+        <field name="lastPx" id="11" type="int64"/>
+        <field name="reason" id="12" type="Reason"/>
+        <data name="clOrdId" id="13" type="clOrdIdData"/>
+    </sbe:message>
+    <!-- A cancel or replace refused; the order is as it was. -->
+    <sbe:message name="CancelReject" id="21">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="reason" id="2" type="Reason"/>
+        <data name="clOrdId" id="3" type="clOrdIdData"/>
+    </sbe:message>
+    <sbe:message name="VenueRegistered" id="22"/>
+
+    <!-- OMS to venue gateway. -->
+    <sbe:message name="VenueNewOrder" id="30">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="side" id="2" type="Side"/>
+        <field name="qty" id="3" type="uint64"/>
+        <field name="price" id="4" type="int64"/>
+        <data name="symbol" id="5" type="symbolData"/>
+    </sbe:message>
+    <sbe:message name="VenueCancelOrder" id="31">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="VenueReplaceOrder" id="32">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="qty" id="2" type="uint64"/>
+        <field name="price" id="3" type="int64"/>
+    </sbe:message>
+
+    <!-- An order, in a snapshot. Notional is the sum of fill qty times price, as two halves. -->
+    <sbe:message name="OrderState" id="40">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="session" id="2" type="uint64"/>
+        <field name="side" id="3" type="Side"/>
+        <field name="qty" id="4" type="uint64"/>
+        <field name="price" id="5" type="int64"/>
+        <field name="cumQty" id="6" type="uint64"/>
+        <field name="notionalHigh" id="7" type="uint64"/>
+        <field name="notionalLow" id="8" type="uint64"/>
+        <field name="status" id="9" type="OrdStatus"/>
+        <field name="pendingQty" id="10" type="uint64"/>
+        <field name="pendingPrice" id="11" type="int64"/>
+        <data name="clOrdId" id="12" type="clOrdIdData"/>
+        <data name="symbol" id="13" type="symbolData"/>
+    </sbe:message>
+    <sbe:message name="OmsState" id="41">
+        <field name="nextOrderId" id="1" type="uint64"/>
+        <field name="venue" id="2" type="uint64"/>
+        <field name="orders" id="3" type="uint64"/>
+    </sbe:message>
+</sbe:messageSchema>

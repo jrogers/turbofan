@@ -1,0 +1,20 @@
+[package]
+name = "cluster"
+description = "A Raft-replicated state machine framework: a deterministic service, client sessions, timers and snapshots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+turbojet.workspace = true
+
+[build-dependencies]
+turbojet-codegen.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

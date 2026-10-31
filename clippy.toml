@@ -1,0 +1,4 @@
+# See docs/STYLE.md: a function should fit on a screen.
+too-many-lines-threshold = 70
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
