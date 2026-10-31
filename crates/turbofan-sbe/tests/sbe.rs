@@ -230,3 +230,57 @@ fn checked_in_codecs_are_current() {
         }
     }
 }
+
+/// A message written field by field with `raw` is the generated codec's, byte for byte, and
+/// reads back the same way. The schema is big-endian, with a group and data.
+#[test]
+fn raw_fields_match_the_generated_codec() {
+    use turbofan_sbe::raw::{Header, Reader, Writer};
+    let order =
+        versioned::Order { id: 7, qty: 50, price: Some(1.5), legs: &[versioned::OrderLegs { ratio: -2 }], note: b"hi" };
+    let generated = encode(|out| order.encode_into(out));
+
+    let mut out = Vec::new();
+    let mut w = Writer::big_endian(&mut out);
+    w.header(Header { block_length: 16, template_id: 1, schema_id: 7, version: 2 });
+    w.put(7_u32);
+    w.put(50_u32);
+    w.put(1.5_f64);
+    w.group_header(2, 1).unwrap();
+    w.put(-2_i16);
+    w.data::<u16>(b"hi").unwrap();
+    assert_eq!(out, generated);
+
+    let mut r = Reader::big_endian(&generated);
+    assert_eq!(r.header().unwrap(), Header { block_length: 16, template_id: 1, schema_id: 7, version: 2 });
+    let mut block = r.block(16).unwrap();
+    assert_eq!((block.get::<u32>(), block.get::<u32>(), block.get::<f64>()), (Ok(7), Ok(50), Ok(1.5)));
+    let (block_length, count) = r.group_header().unwrap();
+    let ratios: Vec<i16> = (0..count).map(|_| r.block(block_length.into()).unwrap().get().unwrap()).collect();
+    assert_eq!(ratios, [-2]);
+    assert_eq!(r.data::<u16>(), Ok(&b"hi"[..]));
+    assert!(r.is_empty());
+
+    // Cut anywhere, a read fails rather than panics.
+    for cut in 0..generated.len() {
+        let mut r = Reader::big_endian(&generated[..cut]);
+        let read = (|| {
+            let header = r.header()?;
+            r.block(header.block_length.into())?;
+            let (block_length, count) = r.group_header()?;
+            for _ in 0..count {
+                r.block(block_length.into())?;
+            }
+            r.data::<u16>().map(|_| ())
+        })();
+        assert_eq!(read, Err(SbeError::Truncated), "cut at {cut}");
+    }
+}
+
+#[test]
+fn raw_data_too_long_for_its_length_is_an_error_and_writes_nothing() {
+    let mut out = b"before".to_vec();
+    let error = turbofan_sbe::raw::Writer::new(&mut out).data::<u8>(&[0; 256]).unwrap_err();
+    assert_eq!(error, SbeError::TooLong { name: "data", len: 256, max: 255 });
+    assert_eq!(out, b"before");
+}

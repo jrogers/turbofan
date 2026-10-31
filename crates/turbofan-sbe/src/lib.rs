@@ -1,5 +1,5 @@
-//! SBE (Simple Binary Encoding): what generated codecs share, and [`codegen`], which generates
-//! them.
+//! SBE (Simple Binary Encoding): what generated codecs share, [`codegen`], which generates them,
+//! and [`raw`], for reading and writing fields one at a time without a schema.
 //!
 //! [`codegen::SbeGenerator`], from a `build.rs`, generates, for each message in the schema, a borrowed decoder (`NewOrderSingleRef`)
 //! and a struct to encode (`NewOrderSingle`), plus a `decode` function that reads the message
@@ -12,6 +12,7 @@
 //! (from a newer version) is read as far as the schema knows it.
 
 pub mod codegen;
+pub mod raw;
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -172,8 +173,9 @@ impl<E> Clone for Group<'_, E> {
 impl<E> Copy for Group<'_, E> {}
 
 // What generated codecs call: public so they can, but hidden from the docs, since it isn't an
-// application's API and may change with the generator. `pad` is the exception: applications
-// fill fixed-length character fields with it.
+// application's API and may change with the generator. `pad` and `Primitive` are the exceptions:
+// applications fill fixed-length character fields with `pad`, and `raw` reads and writes
+// `Primitive`s.
 
 /// `len` bytes of `bytes` from `at`.
 ///
@@ -243,8 +245,8 @@ pub fn reserve(out: &mut Vec<u8>, len: usize) -> &mut [u8] {
     &mut out[at..]
 }
 
-/// A primitive type SBE encodes, read and written at an offset in either byte order.
-#[doc(hidden)]
+/// A primitive type SBE encodes, read and written at an offset in either byte order: `u8` to
+/// `u64`, `i8` to `i64`, `f32` and `f64`. A `char` is a `u8`.
 pub trait Primitive: Copy {
     /// Its size in bytes.
     const SIZE: usize;

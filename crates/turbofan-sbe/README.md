@@ -69,6 +69,37 @@ newer version, is read as far as the schema goes. Bad input is an `SbeError`, ne
 Encoding checks each data field against its length limit. A field that's too long is an error,
 and the buffer is left as it was.
 
+## Without a schema
+
+`raw::Writer` and `raw::Reader` write and read a message one field at a time, in wire order, for
+code that knows the layout itself:
+- `header` for the message header;
+- `put` and `get` for a primitive field, `bytes` for a character array;
+- `group_header` for a group's header, then each entry's fields;
+- `data::<u8 | u16 | u32>` for length-prefixed data.
+
+`Reader::block(len)` returns a block's bytes as a reader of their own and moves past them, so
+fields a newer version added at the end of a block are skipped. Every read is checked against the
+end of the buffer and returns `SbeError::Truncated` instead of panicking. Both are little-endian by
+default, and `big_endian` gives the other byte order.
+
+```rust
+use turbofan_sbe::raw::{Header, Reader, Writer};
+
+let mut out = Vec::new();
+let mut w = Writer::new(&mut out);
+w.header(Header { block_length: 12, template_id: 1, schema_id: 7, version: 0 });
+w.put(42_u64);
+w.put(100_u32);
+w.data::<u16>(b"note")?;
+
+let mut r = Reader::new(&out);
+let header = r.header()?;
+let mut block = r.block(header.block_length.into())?;
+assert_eq!((block.get::<u64>()?, block.get::<u32>()?), (42, 100));
+assert_eq!(r.data::<u16>()?, b"note");
+```
+
 ## Tests
 
 `tests/sbe.rs` checks the codecs generated from SBE's example schema (the car) and from
