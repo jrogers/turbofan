@@ -16,7 +16,8 @@ writing code.
 - `crates/oms` is one service on it: the order book (`src/lib.rs`), its schema
   (`schema/oms.xml`), the `oms-node` binary, and `examples/gateway.rs` (a gateway and a venue
   that check every order's reports; `tests/failover.rs` runs it while killing nodes).
-- `scripts/check.sh` (fmt, clippy `-D warnings`, tests, rustdoc) before calling work done.
+- `scripts/check.sh` (fmt, clippy `-D warnings`, tests, rustdoc, `cargo deny`) before calling work
+  done.
   `SIM_SEEDS=1000 cargo test -p turbofan-cluster --release --test sim` for a longer simulation; a failure
   prints `SIM_SEED=<n>`, which replays it.
 - `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan-cluster/fuzz`,

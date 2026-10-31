@@ -1,0 +1,29 @@
+# cargo-deny: the licences, security advisories and sources of every dependency.
+# `scripts/check.sh` runs `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# A vulnerability or a yanked version fails the check. Unmaintained crates are reported only for
+# direct dependencies, where there's something to do about it.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Turbofan is Apache-2.0, so dependencies must be compatible with it. An expression with OR passes
+# if any choice is allowed.
+# Add a licence here only once a dependency needs it.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies between workspace crates carry no version by design.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

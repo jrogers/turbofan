@@ -22,9 +22,9 @@ cast_possible_wrap = "warn"
 cast_lossless = "warn"
 
 [workspace.dependencies]
-turbofan-cluster = { path = "crates/turbofan-cluster" }
+turbofan-cluster = { path = "crates/turbofan-cluster", version = "0.1.0" }
 # The SBE runtime the generated codecs call, and the generator their build.rs runs.
-turbofan-sbe = { path = "crates/turbofan-sbe" }
+turbofan-sbe = { path = "crates/turbofan-sbe", version = "0.1.0" }
 roxmltree = "0.21"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 tempfile = "3"

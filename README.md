@@ -17,7 +17,7 @@ thoroughly tested, and fast.
 ## Building and testing
 
 ```sh
-scripts/check.sh   # fmt, clippy -D warnings, tests, rustdoc
+scripts/check.sh   # fmt, clippy -D warnings, tests, rustdoc, cargo deny
 SIM_SEEDS=1000 cargo test -p turbofan-cluster --release --test sim   # a longer simulation
 scripts/fuzz.sh    # fuzz the cluster's network inputs (nightly and cargo-fuzz)
 ```
