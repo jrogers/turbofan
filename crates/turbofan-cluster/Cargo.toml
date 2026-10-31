@@ -8,10 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 tokio.workspace = true
-turbojet.workspace = true
+turbofan-sbe.workspace = true
 
 [build-dependencies]
-turbojet-codegen.workspace = true
+turbofan-sbe.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

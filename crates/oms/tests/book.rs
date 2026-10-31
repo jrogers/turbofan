@@ -4,7 +4,7 @@ use oms::Oms;
 use oms::wire::{self, ExecType, OrdStatus, Reason, Side};
 use turbofan_cluster::node::Effect;
 use turbofan_cluster::{Ctx, Service, SessionId};
-use turbojet::sbe::Encode;
+use turbofan_sbe::Encode;
 
 const VENUE: SessionId = 1;
 const ALICE: SessionId = 2;

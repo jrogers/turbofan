@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use turbojet::sbe::{Encode, SbeError};
+use turbofan_sbe::{Encode, SbeError};
 
 use crate::wire;
 

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use oms::wire::{self, ExecType, OrdStatus, Side};
 use turbofan_cluster::ClusterClient;
 use turbofan_cluster::client::{Event, SendError};
-use turbojet::sbe::Encode;
+use turbofan_sbe::Encode;
 
 /// Orders sent but not yet filled: the gateway stops sending at this many.
 const MAX_OPEN_ORDERS: u64 = 1000;

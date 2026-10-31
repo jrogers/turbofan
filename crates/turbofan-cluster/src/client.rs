@@ -271,7 +271,7 @@ impl Client {
         }
     }
 
-    fn frame(&mut self, message: &impl turbojet::sbe::Encode) {
+    fn frame(&mut self, message: &impl turbofan_sbe::Encode) {
         let mut frame = Vec::new();
         codec::encode_frame(message, &mut frame).expect("client messages are within their limits");
         self.frames.push(frame);

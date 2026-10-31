@@ -13,6 +13,7 @@ use libfuzzer_sys::fuzz_target;
 use turbofan_cluster::meta::Meta;
 use turbofan_cluster::node::{self, ConnId, Node};
 use turbofan_cluster::{CloseReason, Ctx, Service, SessionId, codec, raft, wire};
+use turbofan_sbe::Encode;
 
 const MS: u64 = 1_000_000;
 
@@ -74,14 +75,10 @@ impl Service for Checker {
     }
 }
 
-/// A message as one frame. A macro, as naming the `Encode` the messages implement would mean
-/// depending on turbojet.
-macro_rules! frame {
-    ($message:expr) => {{
-        let mut frame = Vec::new();
-        codec::encode_frame(&$message, &mut frame).unwrap();
-        frame
-    }};
+fn frame(message: &impl Encode) -> Vec<u8> {
+    let mut frame = Vec::new();
+    codec::encode_frame(message, &mut frame).unwrap();
+    frame
 }
 
 /// Carries out the outputs as the driver does, a lone member's writes durable at once.
@@ -120,26 +117,26 @@ fuzz_target!(|steps: Vec<Step>| {
             node.on_client(ConnId::from(conn), &message, now);
         };
         match step {
-            Step::Connect { conn } => client(&mut node, conn, frame!(wire::Connect {}), now),
+            Step::Connect { conn } => client(&mut node, conn, frame(&wire::Connect {}), now),
             Step::Reattach { conn, session, last_egress_seq } => {
                 let session = u64::from(session);
-                client(&mut node, conn, frame!(wire::Reattach { session, last_egress_seq }), now);
+                client(&mut node, conn, frame(&wire::Reattach { session, last_egress_seq }), now);
             }
             Step::Message { conn, session, client_seq, op, arg } => {
                 let mut payload = client_seq.to_le_bytes().to_vec();
                 payload.extend([op, arg]);
                 let message = wire::Message { session: u64::from(session), client_seq, payload: &payload };
-                client(&mut node, conn, frame!(message), now);
+                client(&mut node, conn, frame(&message), now);
             }
             Step::KeepAlive { conn, session } => {
-                client(&mut node, conn, frame!(wire::KeepAlive { session: u64::from(session) }), now);
+                client(&mut node, conn, frame(&wire::KeepAlive { session: u64::from(session) }), now);
             }
             Step::Close { conn, session } => {
-                client(&mut node, conn, frame!(wire::Close { session: u64::from(session) }), now);
+                client(&mut node, conn, frame(&wire::Close { session: u64::from(session) }), now);
             }
             Step::Disconnect { conn } => node.on_disconnect(ConnId::from(conn)),
             Step::Snapshot { conn, request_id } => {
-                let frame = frame!(wire::SnapshotRequest { request_id: u64::from(request_id) });
+                let frame = frame(&wire::SnapshotRequest { request_id: u64::from(request_id) });
                 node.on_admin(ConnId::from(conn), &codec::decode_frame(&frame).unwrap().unwrap().0, now);
             }
             Step::Tick { ms } => {

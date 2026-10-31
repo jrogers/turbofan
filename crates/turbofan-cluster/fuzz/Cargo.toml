@@ -17,6 +17,8 @@ members = ["."]
 arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 turbofan-cluster = { path = ".." }
+# For `Encode`, which the generated messages implement.
+turbofan-sbe = { path = "../../turbofan-sbe" }
 
 # Symbols in stack traces.
 [profile.release]

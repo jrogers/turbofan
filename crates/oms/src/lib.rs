@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use turbofan_cluster::{CloseReason, Ctx, Service, SessionId};
-use turbojet::sbe::Encode;
+use turbofan_sbe::Encode;
 use wire::{ExecType, OrdStatus, Reason, Side};
 
 /// This cluster's `Hello.service_id`.

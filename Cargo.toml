@@ -24,8 +24,8 @@ cast_lossless = "warn"
 [workspace.dependencies]
 turbofan-cluster = { path = "crates/turbofan-cluster" }
 # The SBE runtime the generated codecs call, and the generator their build.rs runs.
-turbojet = { version = "0.8", default-features = false }
-turbojet-codegen = "0.7"
+turbofan-sbe = { path = "crates/turbofan-sbe" }
+roxmltree = "0.21"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 tempfile = "3"
 

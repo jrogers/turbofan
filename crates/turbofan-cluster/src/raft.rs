@@ -758,7 +758,7 @@ impl Raft {
         self.send(to, &ack);
     }
 
-    fn send(&mut self, to: NodeId, message: &impl turbojet::sbe::Encode) {
+    fn send(&mut self, to: NodeId, message: &impl turbofan_sbe::Encode) {
         let mut frame = Vec::new();
         codec::encode_frame(message, &mut frame).expect("Raft's messages are within their limits");
         self.out.sends.push((to, frame));

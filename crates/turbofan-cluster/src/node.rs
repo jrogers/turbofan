@@ -503,7 +503,7 @@ impl<S: Service> Node<S> {
         }
     }
 
-    fn propose(&mut self, entry: &impl turbojet::sbe::Encode) -> Option<u64> {
+    fn propose(&mut self, entry: &impl turbofan_sbe::Encode) -> Option<u64> {
         self.scratch.clear();
         entry.encode_into(&mut self.scratch).expect("entries are within their limits");
         self.raft.propose(&self.scratch)
@@ -655,7 +655,7 @@ impl<S: Service> Node<S> {
         self.local.sends.push((conn, frame));
     }
 
-    fn send_client(&mut self, conn: ConnId, message: &impl turbojet::sbe::Encode) {
+    fn send_client(&mut self, conn: ConnId, message: &impl turbofan_sbe::Encode) {
         let mut frame = Vec::new();
         codec::encode_frame(message, &mut frame).expect("client messages are within their limits");
         self.local.sends.push((conn, frame));
@@ -810,7 +810,7 @@ mod tests {
             .collect()
     }
 
-    fn client(node: &mut Node<Recorder>, conn: ConnId, message: &impl turbojet::sbe::Encode, now: u64) -> Vec<String> {
+    fn client(node: &mut Node<Recorder>, conn: ConnId, message: &impl turbofan_sbe::Encode, now: u64) -> Vec<String> {
         let mut frame = Vec::new();
         codec::encode_frame(message, &mut frame).unwrap();
         node.on_client(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, now);

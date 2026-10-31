@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A schema at version 2 that has grown since version 0, in big-endian, for the tests of
+     sinceVersion and byte order. -->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="versioned" id="7" version="2"
+                   byteOrder="bigEndian">
+    <types>
+        <composite name="messageHeader">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="groupSizeEncoding">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+        <composite name="shortData">
+            <type name="length" primitiveType="uint16" maxValue="8"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+    </types>
+    <sbe:message name="Order" id="1">
+        <field name="id" id="1" type="uint32"/>
+        <field name="qty" id="2" type="uint32" sinceVersion="1"/>
+        <field name="price" id="3" type="double" presence="optional" sinceVersion="2"/>
+        <group name="legs" id="4" sinceVersion="1">
+            <field name="ratio" id="5" type="int16"/>
+        </group>
+        <data name="note" id="6" type="shortData" sinceVersion="2"/>
+    </sbe:message>
+</sbe:messageSchema>

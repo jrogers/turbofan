@@ -1,0 +1,3 @@
+example-schema.xml and common-types.xml are SBE's example schema, and golden/car.bin the car
+real-logic's codecs encode from it, from https://github.com/real-logic/simple-binary-encoding,
+licensed under the Apache License, Version 2.0. Copied from Turbojet's dictionaries/sbe.
