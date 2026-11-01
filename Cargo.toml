@@ -1,0 +1,43 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.89"
+
+[workspace.lints.rust]
+# Deny rather than forbid, so a reviewed exception can `#[allow]` it locally with a reason.
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+missing_errors_doc = "warn"
+too_many_lines = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+cast_lossless = "warn"
+
+[workspace.dependencies]
+turbofan-cluster = { path = "crates/turbofan-cluster", version = "0.1.0" }
+# The SBE runtime the generated codecs call, and the generator their build.rs runs.
+turbofan-sbe = { path = "crates/turbofan-sbe", version = "0.1.0" }
+roxmltree = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tempfile = "3"
+# Log record and snapshot checksums, in hardware where the CPU has it.
+crc32c = "0.6"
+# What a node counts, for whichever recorder the binary installs.
+metrics = "0.24"
+# TLS, optional, on all three listeners: rustls on ring, so no C toolchain beyond a compiler.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# Certificates for the TLS tests.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
+# The simulator runs hundreds of thousands of events per seed: optimised, with debug assertions
+# and overflow checks still on.
+[profile.test]
+opt-level = 2

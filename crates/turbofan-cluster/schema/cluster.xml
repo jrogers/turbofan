@@ -1,0 +1,348 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The cluster's wire protocol: the handshake, peer (Raft), client, admin and log-entry messages.
+     Every frame is a u32 length and one of these messages. Services' own payloads are opaque
+     `payload` bytes here; each service has a schema of its own. Change it only as WIRE.md says:
+     old and new nodes run side by side. -->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="3"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="groupSizeEncoding">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+        <!-- A service payload: MAX_PAYLOAD_BYTES. -->
+        <composite name="payloadData">
+            <type name="length" primitiveType="uint32" maxValue="65536"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <!-- Log records shipped verbatim, or a snapshot chunk: bounded by MAX_FRAME_BYTES. -->
+        <composite name="bulkData">
+            <type name="length" primitiveType="uint32" maxValue="1048000"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <composite name="addrData">
+            <type name="length" primitiveType="uint8"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <composite name="tokenData">
+            <type name="length" primitiveType="uint8"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <enum name="Role" encodingType="uint8">
+            <validValue name="Peer">1</validValue>
+            <validValue name="Client">2</validValue>
+            <validValue name="Admin">3</validValue>
+        </enum>
+        <enum name="CloseReason" encodingType="uint8">
+            <validValue name="Client">1</validValue>
+            <validValue name="Timeout">2</validValue>
+            <validValue name="Service">3</validValue>
+            <!-- The cluster has no such session: never opened, or closed. -->
+            <validValue name="NoSession">4</validValue>
+            <!-- The service didn't accept the credentials. -->
+            <validValue name="Refused">5</validValue>
+        </enum>
+    </types>
+
+    <!-- Handshake: the first frame each way on every connection. `token`: an operator's, to the
+         admin listener of a node that requires one; the cluster's peer token, to a peer, if it has
+         one; empty otherwise, and from an older node. -->
+    <sbe:message name="Hello" id="1">
+        <field name="magic" id="1" type="uint32"/>
+        <field name="serviceId" id="2" type="uint32"/>
+        <field name="role" id="3" type="Role"/>
+        <field name="nodeId" id="4" type="uint8"/>
+        <data name="token" id="5" type="tokenData" sinceVersion="2"/>
+    </sbe:message>
+    <!-- The admin listener's answer to a hello without its token, instead of a hello; then it
+         closes the connection. An older operator's tool, not knowing it, sees no hello. -->
+    <sbe:message name="Unauthorized" id="2">
+    </sbe:message>
+
+    <!-- Peer to peer. -->
+    <sbe:message name="RequestVote" id="10">
+        <field name="term" id="1" type="uint64"/>
+        <field name="candidate" id="2" type="uint8"/>
+        <field name="lastIndex" id="3" type="uint64"/>
+        <field name="lastTerm" id="4" type="uint64"/>
+        <field name="preVote" id="5" type="uint8"/>
+    </sbe:message>
+    <!-- `doubt`: the voter's log dropped a damaged tail, which may have held entries it
+         acknowledged, and it hasn't caught up since: an election counting its vote needs one more.
+         Absent from an older node, which never doubts. -->
+    <sbe:message name="Vote" id="11">
+        <field name="term" id="1" type="uint64"/>
+        <field name="granted" id="2" type="uint8"/>
+        <field name="preVote" id="3" type="uint8"/>
+        <field name="doubt" id="4" type="uint8" sinceVersion="1"/>
+    </sbe:message>
+    <!-- `entries` is `count` log records, as stored. None is a heartbeat. `lastIndex`: the
+         leader's, so a follower in doubt knows when it has the leader's whole log. Absent from an
+         older leader. -->
+    <sbe:message name="AppendEntries" id="12">
+        <field name="term" id="1" type="uint64"/>
+        <field name="leader" id="2" type="uint8"/>
+        <field name="prevIndex" id="3" type="uint64"/>
+        <field name="prevTerm" id="4" type="uint64"/>
+        <field name="commit" id="5" type="uint64"/>
+        <field name="count" id="6" type="uint32"/>
+        <field name="lastIndex" id="8" type="uint64" sinceVersion="3"/>
+        <data name="entries" id="7" type="bulkData"/>
+    </sbe:message>
+    <!-- `index`: the durable last index on success, where to retry from on failure. -->
+    <!-- `protocol` and `serviceVersion`: the highest this node's code supports, for the leader to
+         know the lowest among the members. -->
+    <sbe:message name="AppendAck" id="13">
+        <field name="term" id="1" type="uint64"/>
+        <field name="success" id="2" type="uint8"/>
+        <field name="index" id="3" type="uint64"/>
+        <field name="snapshotIndex" id="4" type="uint64"/>
+        <field name="protocol" id="5" type="uint32"/>
+        <field name="serviceVersion" id="6" type="uint32"/>
+    </sbe:message>
+    <sbe:message name="InstallSnapshot" id="14">
+        <field name="term" id="1" type="uint64"/>
+        <field name="leader" id="2" type="uint8"/>
+        <field name="lastIndex" id="3" type="uint64"/>
+        <field name="lastTerm" id="4" type="uint64"/>
+        <field name="offset" id="5" type="uint64"/>
+        <field name="done" id="6" type="uint8"/>
+        <!-- Of the whole snapshot and its members, as the leader's file has it. -->
+        <field name="checksum" id="13" type="uint64"/>
+        <!-- The members as of `lastIndex`, as in `Members`. -->
+        <group name="member" id="8" dimensionType="groupSizeEncoding">
+            <field name="id" id="9" type="uint8"/>
+            <data name="peer" id="10" type="addrData"/>
+            <data name="client" id="11" type="addrData"/>
+            <data name="admin" id="12" type="addrData"/>
+        </group>
+        <data name="chunk" id="7" type="bulkData"/>
+    </sbe:message>
+    <sbe:message name="SnapshotAck" id="15">
+        <field name="term" id="1" type="uint64"/>
+        <field name="offset" id="2" type="uint64"/>
+    </sbe:message>
+    <!-- From a leader handing over to a follower whose log matches its own: stand for election
+         now, without a pre-vote. -->
+    <sbe:message name="TimeoutNow" id="16">
+        <field name="term" id="1" type="uint64"/>
+    </sbe:message>
+    <!-- From a leader shutting the cluster down: stop, once the snapshot of `index` is durable. -->
+    <sbe:message name="Stop" id="17">
+        <field name="term" id="1" type="uint64"/>
+        <field name="index" id="2" type="uint64"/>
+    </sbe:message>
+
+    <!-- Client to cluster. -->
+    <!-- `credentials` are the service's to check: see `Service::authenticate`. -->
+    <sbe:message name="Connect" id="20">
+        <data name="credentials" id="1" type="payloadData"/>
+    </sbe:message>
+    <!-- The same credentials: they must be the session's principal's. -->
+    <sbe:message name="Reattach" id="21">
+        <field name="session" id="1" type="uint64"/>
+        <field name="lastEgressSeq" id="2" type="uint64"/>
+        <data name="credentials" id="3" type="payloadData"/>
+    </sbe:message>
+    <sbe:message name="Message" id="22">
+        <field name="session" id="1" type="uint64"/>
+        <field name="clientSeq" id="2" type="uint64"/>
+        <data name="payload" id="3" type="payloadData"/>
+    </sbe:message>
+    <sbe:message name="KeepAlive" id="23">
+        <field name="session" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Close" id="24">
+        <field name="session" id="1" type="uint64"/>
+    </sbe:message>
+
+    <!-- Cluster to client (and admin, for Redirect). An empty addr: no leader yet, retry. -->
+    <sbe:message name="Redirect" id="30">
+        <field name="leader" id="1" type="uint8"/>
+        <data name="addr" id="2" type="addrData"/>
+    </sbe:message>
+    <sbe:message name="Opened" id="31">
+        <field name="session" id="1" type="uint64"/>
+        <field name="appliedSeq" id="2" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Egress" id="32">
+        <field name="session" id="1" type="uint64"/>
+        <field name="egressSeq" id="2" type="uint64"/>
+        <field name="appliedSeq" id="3" type="uint64"/>
+        <data name="payload" id="4" type="payloadData"/>
+    </sbe:message>
+    <sbe:message name="KeepAliveAck" id="33">
+        <field name="appliedSeq" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Closed" id="34">
+        <field name="session" id="1" type="uint64"/>
+        <field name="reason" id="2" type="CloseReason"/>
+    </sbe:message>
+
+    <!-- Admin. -->
+    <sbe:message name="SnapshotRequest" id="40">
+        <field name="requestId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="SnapshotTaken" id="41">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="index" id="2" type="uint64"/>
+        <field name="quorumAcked" id="3" type="uint8"/>
+    </sbe:message>
+    <!-- Add a member, reached at these addresses: it catches up, then joins. -->
+    <sbe:message name="AddMember" id="42">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="id" id="2" type="uint8"/>
+        <data name="peer" id="3" type="addrData"/>
+        <data name="client" id="4" type="addrData"/>
+        <data name="admin" id="5" type="addrData"/>
+    </sbe:message>
+    <sbe:message name="RemoveMember" id="43">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="id" id="2" type="uint8"/>
+    </sbe:message>
+    <!-- The change is committed, at `index`. -->
+    <sbe:message name="MembersChanged" id="44">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="index" id="2" type="uint64"/>
+    </sbe:message>
+    <!-- Refused: another change is under way, the member is already in (or isn't), there would
+         be too many or none, or a new member didn't catch up. -->
+    <sbe:message name="MembersRefused" id="45">
+        <field name="requestId" id="1" type="uint64"/>
+    </sbe:message>
+    <!-- Hand the leadership to member `to`, or, with 0, to the one most caught up. -->
+    <sbe:message name="TransferLeadership" id="46">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="to" id="2" type="uint8"/>
+    </sbe:message>
+    <!-- `leader` leads now; 0 if the transfer was refused or didn't happen in time. -->
+    <sbe:message name="LeadershipTransferred" id="47">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="leader" id="2" type="uint8"/>
+    </sbe:message>
+    <!-- Switch the cluster's protocol, and the service's behaviour, to these versions: refused
+         unless every member supports them, and they're no lower than now. -->
+    <sbe:message name="Activate" id="70">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="protocol" id="2" type="uint32"/>
+        <field name="serviceVersion" id="3" type="uint32"/>
+    </sbe:message>
+    <!-- Activated at `index`, or refused (0); and the lowest versions the members support. -->
+    <sbe:message name="Activation" id="71">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="index" id="2" type="uint64"/>
+        <field name="lowestProtocol" id="3" type="uint32"/>
+        <field name="lowestServiceVersion" id="4" type="uint32"/>
+    </sbe:message>
+    <!-- Snapshot every node at the next index, then stop them. -->
+    <sbe:message name="Shutdown" id="48">
+        <field name="requestId" id="1" type="uint64"/>
+    </sbe:message>
+    <!-- The members have the snapshot of `index` durable, and are stopping. -->
+    <sbe:message name="ShutDown" id="49">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="index" id="2" type="uint64"/>
+    </sbe:message>
+
+    <!-- Log-entry bodies: the payload of a log record. `timestamp` is the leader's clock in ns,
+         the only time the service sees. -->
+    <!-- The session's ID is this entry's log index; `principal`, who the service said it is. -->
+    <sbe:message name="SessionOpen" id="50">
+        <field name="timestamp" id="1" type="uint64"/>
+        <data name="principal" id="2" type="addrData"/>
+    </sbe:message>
+    <sbe:message name="SessionMessage" id="51">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="session" id="2" type="uint64"/>
+        <field name="clientSeq" id="3" type="uint64"/>
+        <data name="payload" id="4" type="payloadData"/>
+    </sbe:message>
+    <sbe:message name="SessionClose" id="52">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="session" id="2" type="uint64"/>
+        <field name="reason" id="3" type="CloseReason"/>
+    </sbe:message>
+    <sbe:message name="TimerFired" id="53">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="id" id="2" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="NewTerm" id="54">
+        <field name="timestamp" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Snapshot" id="55">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="requestId" id="2" type="uint64"/>
+    </sbe:message>
+    <!-- From this entry on, the cluster's protocol and the service's behaviour are these versions. -->
+    <sbe:message name="Activated" id="58">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="protocol" id="2" type="uint32"/>
+        <field name="serviceVersion" id="3" type="uint32"/>
+    </sbe:message>
+    <!-- A service's own message, from `Ctx::propose`: `id` is its place in the outbox. -->
+    <sbe:message name="ServiceProposal" id="57">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="id" id="2" type="uint64"/>
+        <data name="payload" id="3" type="payloadData"/>
+    </sbe:message>
+    <!-- The cluster's members from this entry on, taking effect on each node as it appends it. -->
+    <sbe:message name="Members" id="56">
+        <field name="timestamp" id="1" type="uint64"/>
+        <group name="member" id="2" dimensionType="groupSizeEncoding">
+            <field name="id" id="3" type="uint8"/>
+            <data name="peer" id="4" type="addrData"/>
+            <data name="client" id="5" type="addrData"/>
+            <data name="admin" id="6" type="addrData"/>
+        </group>
+    </sbe:message>
+
+    <!-- A snapshot's contents, each message framed as on the wire: NodeState; then, for each
+         session, its SessionState and its ring's EgressStates; then each TimerState; then each
+         ProposalState. The service's own bytes follow, and the file ends with SnapshotMembers. A
+         node must be able to read all of it: see WIRE.md. -->
+    <sbe:message name="NodeState" id="60">
+        <field name="applied" id="1" type="uint64"/>
+        <field name="time" id="2" type="uint64"/>
+        <field name="nextProposal" id="3" type="uint64"/>
+        <field name="sessions" id="4" type="uint32"/>
+        <field name="timers" id="5" type="uint64"/>
+        <field name="proposals" id="6" type="uint64"/>
+        <field name="protocol" id="7" type="uint32"/>
+        <field name="serviceVersion" id="8" type="uint32"/>
+    </sbe:message>
+    <!-- `ring` EgressStates follow it. -->
+    <sbe:message name="SessionState" id="61">
+        <field name="session" id="1" type="uint64"/>
+        <field name="lastSeq" id="2" type="uint64"/>
+        <field name="nextEgress" id="3" type="uint64"/>
+        <field name="ring" id="4" type="uint32"/>
+        <data name="principal" id="5" type="addrData"/>
+    </sbe:message>
+    <sbe:message name="EgressState" id="62">
+        <field name="egressSeq" id="1" type="uint64"/>
+        <data name="payload" id="2" type="payloadData"/>
+    </sbe:message>
+    <sbe:message name="TimerState" id="63">
+        <field name="id" id="1" type="uint64"/>
+        <field name="at" id="2" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="ProposalState" id="64">
+        <field name="id" id="1" type="uint64"/>
+        <data name="payload" id="2" type="payloadData"/>
+    </sbe:message>
+    <!-- The members as of the snapshot's index. -->
+    <sbe:message name="SnapshotMembers" id="65">
+        <group name="member" id="1" dimensionType="groupSizeEncoding">
+            <field name="id" id="2" type="uint8"/>
+            <data name="peer" id="3" type="addrData"/>
+            <data name="client" id="4" type="addrData"/>
+            <data name="admin" id="5" type="addrData"/>
+        </group>
+    </sbe:message>
+</sbe:messageSchema>

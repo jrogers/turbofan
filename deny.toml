@@ -1,0 +1,34 @@
+# cargo-deny: the licences, security advisories and sources of every dependency.
+# `scripts/check.sh` runs `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# A vulnerability or a yanked version fails the check. Unmaintained crates are reported only for
+# direct dependencies, where there's something to do about it.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Turbofan is Apache-2.0, so dependencies must be compatible with it. An expression with OR passes
+# if any choice is allowed.
+# Add a licence here only once a dependency needs it.
+# ISC and BSD-3-Clause: rustls, ring and their crypto dependencies.
+allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies between workspace crates carry no version by design.
+allow-wildcard-paths = true
+skip = [
+    # ring, the newest (0.17.14), pins 0.52; tokio and tempfile have 0.61. Windows only.
+    { crate = "windows-sys@0.52.0", reason = "ring pins it" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

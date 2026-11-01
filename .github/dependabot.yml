@@ -1,0 +1,25 @@
+# Version updates, grouped into one pull request per ecosystem a month.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      # Its refs name toolchains, not releases: @stable moves by itself.
+      - dependency-name: dtolnay/rust-toolchain
+
+  # The workspace, and the fuzz crate, which has its own Cargo.lock outside it.
+  - package-ecosystem: cargo
+    directories: ["/", "/crates/turbofan-cluster/fuzz"]
+    schedule:
+      interval: monthly
+    # Releases at least two weeks old, so a broken one is usually yanked or fixed first.
+    cooldown:
+      default-days: 14
+    groups:
+      cargo:
+        patterns: ["*"]
