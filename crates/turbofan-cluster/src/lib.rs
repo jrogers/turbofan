@@ -36,7 +36,7 @@ pub use node::{
     Service, SessionId, SnapshotWriter,
 };
 pub use raft::{Config as RaftConfig, MAX_MEMBERS, Member, NodeId};
-pub use remote::{ClusterClient, activate, add_member, remove_member, request_snapshot, shutdown, transfer_leadership};
+pub use remote::{Admin, AdminError, ClusterClient};
 pub use wire::CloseReason;
 
 /// The codecs generated from `schema/cluster.xml`.

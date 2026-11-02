@@ -156,6 +156,25 @@ pub struct Config {
     pub log_window_bytes: usize,
 }
 
+/// Where the log ended when a batch of outputs was taken ([`Raft::log_end`]), for
+/// [`Raft::on_persisted`] once the batch is durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogEnd {
+    /// The last index.
+    pub index: u64,
+    /// Its term.
+    pub term: u64,
+}
+
+/// Bytes of a snapshot to read, for [`Raft::on_snapshot_read`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SnapshotRead {
+    /// The index the snapshot is of.
+    pub index: u64,
+    /// Where in it to read from.
+    pub offset: u64,
+}
+
 /// A node's part in the current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -252,7 +271,7 @@ pub struct Outputs {
     /// Once `persist` is written, read the latest snapshot's bytes from each of these offsets: up
     /// to [`MAX_READ_BYTES`], or its end. Give them to [`Raft::on_snapshot_read`], then take
     /// outputs.
-    pub snapshot_reads: Vec<(u64, u64)>,
+    pub snapshot_reads: Vec<SnapshotRead>,
     /// This node became leader in this batch: the caller should propose an entry of the new
     /// term, so that the entries of earlier terms commit.
     pub became_leader: bool,
@@ -631,8 +650,8 @@ impl Raft {
     /// The last index in the log, and its term: note it on taking outputs, and give it to
     /// [`Raft::on_persisted`] once they're durable.
     #[must_use]
-    pub fn log_end(&self) -> (u64, u64) {
-        (self.last_index(), self.last_term())
+    pub fn log_end(&self) -> LogEnd {
+        LogEnd { index: self.last_index(), term: self.last_term() }
     }
 
     /// The term of the entry at `index`, if the log holds it (or a snapshot covers it).
@@ -839,10 +858,10 @@ impl Raft {
     /// The batches up to one taken when the log ended at `end` ([`Raft::log_end`]) are durable.
     /// If the entry there has been replaced since (truncated, or the log replaced by a snapshot),
     /// what's durable of the log now is unknown, and a later batch's will say.
-    pub fn on_persisted(&mut self, end: (u64, u64)) {
+    pub fn on_persisted(&mut self, end: LogEnd) {
         // Log matching: the same entry there, the same log up to it.
-        if self.term_at(end.0) == Some(end.1) {
-            self.durable = end.0;
+        if self.term_at(end.index) == Some(end.term) {
+            self.durable = end.index;
         }
         if self.role == Role::Leader {
             self.advance_commit();
@@ -1128,8 +1147,9 @@ impl Raft {
             else {
                 let mut offset = s.sent;
                 while offset < snapshot.len && offset < window(&s) {
-                    if !self.out.snapshot_reads.contains(&(snapshot.index, offset)) {
-                        self.out.snapshot_reads.push((snapshot.index, offset));
+                    let read = SnapshotRead { index: snapshot.index, offset };
+                    if !self.out.snapshot_reads.contains(&read) {
+                        self.out.snapshot_reads.push(read);
                     }
                     offset += MAX_READ_BYTES as u64;
                 }
@@ -1888,7 +1908,7 @@ mod tests {
             rafts[0].on_message(NodeId(2), &decode(&ack), now);
         }
         assert_eq!(rafts[0].commit_index(), committed, "node 2 alone is one of three");
-        assert_eq!(end.0, index);
+        assert_eq!(end.index, index);
         rafts[0].on_persisted(end);
         assert_eq!(rafts[0].commit_index(), index, "with node 1 durable, two of three");
     }
@@ -2280,11 +2300,11 @@ mod tests {
         deliver(&mut rafts, &[1, 2], 1, sends, now);
         let send_chunks = |raft: &mut Raft| {
             let out = raft.take_outputs();
-            for &(index, offset) in &out.snapshot_reads {
+            for &SnapshotRead { index, offset } in &out.snapshot_reads {
                 let start = usize::try_from(offset).unwrap();
                 raft.on_snapshot_read(index, offset, &bytes[start..(start + MAX_READ_BYTES).min(bytes.len())]);
             }
-            let reads = out.snapshot_reads.iter().map(|&(_, offset)| offset).collect::<Vec<_>>();
+            let reads = out.snapshot_reads.iter().map(|r| r.offset).collect::<Vec<_>>();
             (
                 reads,
                 raft.take_outputs()

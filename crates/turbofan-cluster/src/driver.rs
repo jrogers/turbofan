@@ -33,7 +33,7 @@ use crate::meta::MetaFile;
 use crate::metrics;
 use crate::node::{self, ConnId, Node, Service};
 use crate::pipeline::{self, Pipeline};
-use crate::raft::{Entries, MAX_READ_BYTES, Member, NodeId, Persist};
+use crate::raft::{Entries, MAX_READ_BYTES, Member, NodeId, Persist, SnapshotRead};
 use crate::tls::{self, Acceptor as TlsAcceptor, ClientTls, NodeTls};
 use crate::{snapshot, wire};
 
@@ -384,8 +384,8 @@ impl Storage {
                     reads.push(self.log.read(from, MAX_READ_BYTES)?);
                 }
             }
-            for &(index, offset) in &batch.snapshot_reads {
-                if offsets.insert((index, offset)) {
+            for &read @ SnapshotRead { index, offset } in &batch.snapshot_reads {
+                if offsets.insert(read) {
                     chunks.push((index, offset, snapshot::read(&self.snapshots, index, offset, MAX_READ_BYTES)?));
                 }
             }

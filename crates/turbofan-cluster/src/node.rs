@@ -30,7 +30,7 @@ use crate::client::MAX_UNACKED;
 use crate::codec::{self, MAX_PAYLOAD_BYTES};
 use crate::meta::Meta;
 use crate::metrics::Metrics;
-use crate::raft::{self, Entries, Member, NodeId, Persist, Raft, Role, Snapshot};
+use crate::raft::{self, Entries, LogEnd, Member, NodeId, Persist, Raft, Role, Snapshot, SnapshotRead};
 use crate::wire::{self, CloseReason};
 
 /// A client session's ID: the log index of the entry that opened it.
@@ -136,8 +136,13 @@ pub struct Ctx {
 pub enum Effect {
     /// [`Ctx::send`]: a payload for a session.
     Send(SessionId, Vec<u8>),
-    /// [`Ctx::schedule_timer`]: a timer ID and its deadline.
-    Schedule(u64, u64),
+    /// [`Ctx::schedule_timer`].
+    Schedule {
+        /// The timer's ID.
+        id: u64,
+        /// Its deadline, in cluster time.
+        at: u64,
+    },
     /// [`Ctx::cancel_timer`].
     Cancel(u64),
     /// [`Ctx::close_session`].
@@ -196,7 +201,7 @@ impl Ctx {
     /// Fires [`Service::on_timer`] with `id` at cluster time `at` or soon after, replacing a
     /// timer with that ID.
     pub fn schedule_timer(&mut self, id: u64, at: u64) {
-        self.effects.push(Effect::Schedule(id, at));
+        self.effects.push(Effect::Schedule { id, at });
     }
 
     /// Cancels the timer with `id`, if there is one.
@@ -310,7 +315,7 @@ pub struct Outputs {
     pub client_sends: Vec<(ConnId, Vec<u8>)>,
     /// Read the latest snapshot from these offsets, after `persist`: see
     /// [`raft::Outputs::snapshot_reads`]. Give each to [`Node::on_snapshot_read`].
-    pub snapshot_reads: Vec<(u64, u64)>,
+    pub snapshot_reads: Vec<SnapshotRead>,
     /// Write this snapshot, apart from the batches, and tell [`Node::on_snapshot_saved`] once
     /// it's durable. There's one at a time.
     pub save: Option<SaveSnapshot>,
@@ -641,7 +646,7 @@ impl<S: Service> Node<S> {
 
     /// The batches up to one taken when the log ended at `end` are durable: see
     /// [`Raft::on_persisted`].
-    pub fn on_persisted(&mut self, end: (u64, u64)) {
+    pub fn on_persisted(&mut self, end: LogEnd) {
         self.raft.on_persisted(end);
         self.apply();
         self.answer_snapshot_requests();
@@ -1109,7 +1114,7 @@ impl<S: Service> Node<S> {
         for effect in effects {
             match effect {
                 Effect::Send(session, payload) => self.egress(session, payload),
-                Effect::Schedule(id, at) => {
+                Effect::Schedule { id, at } => {
                     self.remove_timer(id);
                     self.state.timers.insert(id, at);
                     self.state.deadlines.insert((at, id));

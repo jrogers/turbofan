@@ -46,7 +46,9 @@ use turbofan_cluster::log::{Log, MAX_SEGMENT_BYTES};
 use turbofan_cluster::meta::{Meta, MetaFile};
 use turbofan_cluster::node::{self, ConnId, Node, SaveSnapshot};
 use turbofan_cluster::pipeline::{Batch, Pipeline};
-use turbofan_cluster::raft::{Config, Entries, MAX_MEMBERS, MAX_READ_BYTES, Member, NodeId, Persist, Role, Snapshot};
+use turbofan_cluster::raft::{
+    Config, Entries, MAX_MEMBERS, MAX_READ_BYTES, Member, NodeId, Persist, Role, Snapshot, SnapshotRead,
+};
 use turbofan_cluster::{Ctx, Service, SessionId, SnapshotWriter, snapshot};
 
 const MS: u64 = 1_000_000;
@@ -1066,12 +1068,14 @@ impl Sim {
         &mut self,
         id: NodeId,
         reads: &[u64],
-        chunks: &[(u64, u64)],
+        chunks: &[SnapshotRead],
     ) -> io::Result<(Vec<Vec<u8>>, Vec<(u64, u64, Vec<u8>)>)> {
         let disk = &mut self.nodes.get_mut(&id).unwrap().disk;
         let records = reads.iter().map(|&from| disk.read(from)).collect::<io::Result<_>>()?;
         let dir = disk.snapshots.path();
-        let chunks = chunks.iter().map(|&(i, o)| snapshot::read(dir, i, o, self.chunk).map(|b| (i, o, b)));
+        let chunks = chunks
+            .iter()
+            .map(|&SnapshotRead { index: i, offset: o }| snapshot::read(dir, i, o, self.chunk).map(|b| (i, o, b)));
         Ok((records, chunks.collect::<io::Result<_>>()?))
     }
 

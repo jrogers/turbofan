@@ -1,7 +1,7 @@
-//! Talking to a cluster over TCP: [`ClusterClient`] for gateways; [`request_snapshot`],
-//! [`add_member`], [`remove_member`], [`transfer_leadership`], [`activate`] and [`shutdown`] for
-//! operators. Each goes over TLS when given a [`ClientTls`].
+//! Talking to a cluster over TCP: [`ClusterClient`] for gateways, [`Admin`] for operators. Each
+//! goes over TLS when given a [`ClientTls`].
 
+use std::fmt;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -212,169 +212,242 @@ async fn handshake(
     Ok(stream)
 }
 
-/// Asks the cluster to snapshot every node at the next index, through the admin listener at
-/// `addr` (redirected to the leader's). Returns the index, once a quorum has it durable.
-///
-/// # Errors
-///
-/// If the node refuses `token`, the cluster's admin token (empty if it has none), or it's over
-/// [`MAX_TOKEN_BYTES`](crate::driver::MAX_TOKEN_BYTES). If no leader
-/// answers within `timeout`.
-pub async fn request_snapshot(
-    addr: &str,
+/// How long [`Admin`] waits for a leader's answer, unless [`Admin::with_timeout`] says otherwise.
+const ADMIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An operator's requests to a cluster, through the admin listener at an address and redirected
+/// to the leader's: snapshots, membership changes, upgrades, leadership transfers and shutdown.
+#[derive(Debug, Clone)]
+pub struct Admin {
+    addr: String,
     service_id: u32,
-    token: &[u8],
-    tls: Option<&ClientTls>,
+    token: Vec<u8>,
+    tls: Option<ClientTls>,
     timeout: Duration,
-) -> io::Result<u64> {
-    let request = |request_id| frame(&wire::SnapshotRequest { request_id });
-    admin(addr, service_id, token, tls, timeout, request, |reply, request_id| match reply {
-        wire::Decoded::SnapshotTaken(m) if m.request_id() == request_id => Some(Ok(m.index())),
-        _ => None,
-    })
-    .await
 }
 
-/// Adds `member` to the cluster, through the admin listener at `addr`: it catches up from the
-/// leader, then joins. Start it first, with `--join`. Returns the index of the change, once
-/// it's committed.
-///
-/// # Errors
-///
-/// If the node refuses `token`, the cluster's admin token (empty if it has none), or it's over
-/// [`MAX_TOKEN_BYTES`](crate::driver::MAX_TOKEN_BYTES). If the cluster
-/// refuses (another change is under way, `member` is one already, there are
-/// [`MAX_MEMBERS`](crate::MAX_MEMBERS), or it didn't catch up), or no leader answers within `timeout`.
-pub async fn add_member(
-    addr: &str,
-    service_id: u32,
-    token: &[u8],
-    tls: Option<&ClientTls>,
-    member: &Member,
-    timeout: Duration,
-) -> io::Result<u64> {
-    let request = |request_id| {
-        let (peer, client, admin) = (member.peer.as_bytes(), member.client.as_bytes(), member.admin.as_bytes());
-        frame(&wire::AddMember { request_id, id: member.id.0, peer, client, admin })
-    };
-    admin(addr, service_id, token, tls, timeout, request, changed).await
-}
+impl Admin {
+    /// Requests to the cluster of `service_id` through the admin listener at `addr`: with no
+    /// token, over plain TCP, waiting 30 s for an answer.
+    #[must_use]
+    pub fn new(addr: impl Into<String>, service_id: u32) -> Self {
+        Self { addr: addr.into(), service_id, token: Vec::new(), tls: None, timeout: ADMIN_TIMEOUT }
+    }
 
-/// Removes member `id` from the cluster, through the admin listener at `addr`. Returns the index
-/// of the change, once it's committed: stop the node then.
-///
-/// # Errors
-///
-/// If the node refuses `token`, the cluster's admin token (empty if it has none), or it's over
-/// [`MAX_TOKEN_BYTES`](crate::driver::MAX_TOKEN_BYTES). If the cluster
-/// refuses (another change is under way, `id` isn't a member, or it's the last), or no leader
-/// answers within `timeout`.
-pub async fn remove_member(
-    addr: &str,
-    service_id: u32,
-    token: &[u8],
-    tls: Option<&ClientTls>,
-    id: NodeId,
-    timeout: Duration,
-) -> io::Result<u64> {
-    let request = |request_id| frame(&wire::RemoveMember { request_id, id: id.0 });
-    admin(addr, service_id, token, tls, timeout, request, changed).await
-}
+    /// The same, with the cluster's admin token, at most [`MAX_TOKEN_BYTES`].
+    #[must_use]
+    pub fn with_token(mut self, token: impl Into<Vec<u8>>) -> Self {
+        self.token = token.into();
+        self
+    }
 
-/// Switches the cluster to `protocol` and version `service` of the service's behaviour, through
-/// the admin listener at `addr`, once a rolling upgrade has every member running code that has
-/// them. Returns the index they're active from.
-///
-/// # Errors
-///
-/// If the node refuses `token`, the cluster's admin token (empty if it has none), or it's over
-/// [`MAX_TOKEN_BYTES`](crate::driver::MAX_TOKEN_BYTES). If the cluster
-/// refuses (a member doesn't support them: the message says the lowest supported; or they're lower
-/// than what runs), or no leader answers within `timeout`.
-pub async fn activate(
-    addr: &str,
-    service_id: u32,
-    token: &[u8],
-    tls: Option<&ClientTls>,
-    protocol: u32,
-    service: u32,
-    timeout: Duration,
-) -> io::Result<u64> {
-    let request = |request_id| frame(&wire::Activate { request_id, protocol, service_version: service });
-    admin(addr, service_id, token, tls, timeout, request, |reply, request_id| match reply {
-        wire::Decoded::Activation(m) if m.request_id() == request_id && m.index() == 0 => {
-            Some(Err(io::Error::other(format!(
-                "refused: the members support protocol {} and service version {} at most, or that's a step back",
-                m.lowest_protocol(),
-                m.lowest_service_version()
-            ))))
+    /// The same, over TLS, with an operator's certificate: for a cluster with
+    /// [`driver::Config::tls`](crate::driver::Config::tls).
+    #[must_use]
+    pub fn with_tls(mut self, tls: ClientTls) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// The same, waiting `timeout` for a leader's answer. A new member may take a while to catch
+    /// up, so allow [`Admin::add_member`] longer.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Asks the cluster to snapshot every node at the next index. Returns the index, once a
+    /// quorum has it durable.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::TokenTooLong`], [`AdminError::Denied`] or [`AdminError::TimedOut`].
+    pub async fn request_snapshot(&self) -> Result<u64, AdminError> {
+        let request = |request_id| frame(&wire::SnapshotRequest { request_id });
+        self.ask(request, |reply, request_id| match reply {
+            wire::Decoded::SnapshotTaken(m) if m.request_id() == request_id => Some(Ok(m.index())),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Adds `member` to the cluster: it catches up from the leader, then joins. Start it first,
+    /// with `--join`. Returns the index of the change, once it's committed.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::MembersRefused`] if another change is under way, `member` is one already,
+    /// there are [`MAX_MEMBERS`](crate::MAX_MEMBERS), or it didn't catch up; or
+    /// [`AdminError::TokenTooLong`], [`AdminError::Denied`] or [`AdminError::TimedOut`].
+    pub async fn add_member(&self, member: &Member) -> Result<u64, AdminError> {
+        let request = |request_id| {
+            let (peer, client, admin) = (member.peer.as_bytes(), member.client.as_bytes(), member.admin.as_bytes());
+            frame(&wire::AddMember { request_id, id: member.id.0, peer, client, admin })
+        };
+        self.ask(request, changed).await
+    }
+
+    /// Removes member `id` from the cluster. Returns the index of the change, once it's
+    /// committed: stop the node then.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::MembersRefused`] if another change is under way, `id` isn't a member, or
+    /// it's the last; or [`AdminError::TokenTooLong`], [`AdminError::Denied`] or
+    /// [`AdminError::TimedOut`].
+    pub async fn remove_member(&self, id: NodeId) -> Result<u64, AdminError> {
+        let request = |request_id| frame(&wire::RemoveMember { request_id, id: id.0 });
+        self.ask(request, changed).await
+    }
+
+    /// Switches the cluster to `protocol` and `service_version` of the service's behaviour, once
+    /// a rolling upgrade has every member running code that has them. Returns the index they're
+    /// active from.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::ActivationRefused`] if a member doesn't support them, or they're lower than
+    /// what runs; or [`AdminError::TokenTooLong`], [`AdminError::Denied`] or
+    /// [`AdminError::TimedOut`].
+    pub async fn activate(&self, protocol: u32, service_version: u32) -> Result<u64, AdminError> {
+        let request = |request_id| frame(&wire::Activate { request_id, protocol, service_version });
+        self.ask(request, |reply, request_id| match reply {
+            wire::Decoded::Activation(m) if m.request_id() == request_id && m.index() == 0 => {
+                Some(Err(AdminError::ActivationRefused {
+                    lowest_protocol: m.lowest_protocol(),
+                    lowest_service_version: m.lowest_service_version(),
+                }))
+            }
+            wire::Decoded::Activation(m) if m.request_id() == request_id => Some(Ok(m.index())),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Shuts the cluster down: every member snapshots at the next index, so that a restart loads
+    /// the snapshot rather than replaying the log, then stops. Returns the index, once the members
+    /// have it durable.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::TokenTooLong`], [`AdminError::Denied`] or [`AdminError::TimedOut`].
+    pub async fn shutdown(&self) -> Result<u64, AdminError> {
+        let request = |request_id| frame(&wire::Shutdown { request_id });
+        self.ask(request, |reply, request_id| match reply {
+            wire::Decoded::ShutDown(m) if m.request_id() == request_id => Some(Ok(m.index())),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Hands the leadership to member `to`, or with `None` to the one most caught up: before
+    /// stopping the leader, so a restart costs a quick election rather than an election timeout.
+    /// Returns the new leader.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::NotTransferred`] if `to` isn't a member, the leader is transferring already,
+    /// or no new leader was elected in time; or [`AdminError::TokenTooLong`],
+    /// [`AdminError::Denied`] or [`AdminError::TimedOut`].
+    pub async fn transfer_leadership(&self, to: Option<NodeId>) -> Result<NodeId, AdminError> {
+        let request = |request_id| frame(&wire::TransferLeadership { request_id, to: NodeId::to_wire(to) });
+        let leader = self
+            .ask(request, |reply, request_id| match reply {
+                wire::Decoded::LeadershipTransferred(m) if m.request_id() == request_id => {
+                    Some(NodeId::from_wire(m.leader()).map(u64::from).ok_or(AdminError::NotTransferred))
+                }
+                _ => None,
+            })
+            .await?;
+        Ok(NodeId(u8::try_from(leader).expect("a node ID")))
+    }
+
+    /// Sends the `request` for a new request ID to the leader, following redirects from the
+    /// address, until `answer` makes something of a reply.
+    async fn ask(
+        &self,
+        request: impl Fn(u64) -> Vec<u8>,
+        answer: impl Fn(&wire::Decoded<'_>, u64) -> Option<Result<u64, AdminError>>,
+    ) -> Result<u64, AdminError> {
+        if self.token.len() > MAX_TOKEN_BYTES {
+            return Err(AdminError::TokenTooLong);
         }
-        wire::Decoded::Activation(m) if m.request_id() == request_id => Some(Ok(m.index())),
-        _ => None,
-    })
-    .await
+        let request_id = u64::try_from(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+        )
+        .unwrap_or_default();
+        let hello = Hello { service_id: self.service_id, node_id: None };
+        let (token, tls) = (&self.token[..], self.tls.as_ref());
+        let mut target = self.addr.clone();
+        let attempt = async {
+            loop {
+                match ask(&target, hello, token, tls, &request(request_id), |reply| answer(reply, request_id)).await {
+                    Some(Ok(answer)) => return answer,
+                    Some(Err(leader)) if !leader.is_empty() => target = leader,
+                    _ => tokio::time::sleep(RETRY * 4).await,
+                }
+            }
+        };
+        tokio::time::timeout(self.timeout, attempt).await.map_err(|_| AdminError::TimedOut)?
+    }
 }
 
-/// Shuts the cluster down, through the admin listener at `addr`: every member snapshots at the
-/// next index, so that a restart loads the snapshot rather than replaying the log, then stops.
-/// Returns the index, once the members have it durable.
-///
-/// # Errors
-///
-/// If the node refuses `token`, the cluster's admin token (empty if it has none), or it's over
-/// [`MAX_TOKEN_BYTES`](crate::driver::MAX_TOKEN_BYTES). If no leader
-/// answers within `timeout`.
-pub async fn shutdown(
-    addr: &str,
-    service_id: u32,
-    token: &[u8],
-    tls: Option<&ClientTls>,
-    timeout: Duration,
-) -> io::Result<u64> {
-    let request = |request_id| frame(&wire::Shutdown { request_id });
-    admin(addr, service_id, token, tls, timeout, request, |reply, request_id| match reply {
-        wire::Decoded::ShutDown(m) if m.request_id() == request_id => Some(Ok(m.index())),
-        _ => None,
-    })
-    .await
+/// Why an [`Admin`] request failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AdminError {
+    /// The admin token is over [`MAX_TOKEN_BYTES`].
+    TokenTooLong,
+    /// A node refused the token (`PermissionDenied`) or a certificate, either way
+    /// (`InvalidData`), or the address names no host a certificate can (`InvalidInput`). Every
+    /// node would, so no other is tried.
+    Denied(io::Error),
+    /// The cluster refused a membership change.
+    MembersRefused,
+    /// The cluster refused an activation: these are the highest its members all support.
+    ActivationRefused {
+        /// The highest protocol every member supports.
+        lowest_protocol: u32,
+        /// The highest service version every member supports.
+        lowest_service_version: u32,
+    },
+    /// The leadership wasn't transferred.
+    NotTransferred,
+    /// No leader answered in time.
+    TimedOut,
 }
 
-/// Hands the leadership to member `to`, or with `None` to the one most caught up, through the admin
-/// listener at `addr`: before stopping the leader, so a restart costs a quick election rather
-/// than an election timeout. Returns the new leader.
-///
-/// # Errors
-///
-/// If the node refuses `token`, the cluster's admin token (empty if it has none), or it's over
-/// [`MAX_TOKEN_BYTES`](crate::driver::MAX_TOKEN_BYTES). If the cluster
-/// refuses (`to` isn't a member, or the leader is transferring already), no new leader is elected
-/// in time, or no leader answers within `timeout`.
-pub async fn transfer_leadership(
-    addr: &str,
-    service_id: u32,
-    token: &[u8],
-    tls: Option<&ClientTls>,
-    to: Option<NodeId>,
-    timeout: Duration,
-) -> io::Result<NodeId> {
-    let request = |request_id| frame(&wire::TransferLeadership { request_id, to: NodeId::to_wire(to) });
-    let leader = admin(addr, service_id, token, tls, timeout, request, |reply, request_id| match reply {
-        wire::Decoded::LeadershipTransferred(m) if m.request_id() == request_id && m.leader() == 0 => {
-            Some(Err(io::Error::other("the leadership wasn't transferred")))
+impl fmt::Display for AdminError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TokenTooLong => write!(f, "the admin token is over {MAX_TOKEN_BYTES} bytes"),
+            Self::Denied(error) => write!(f, "refused: {error}"),
+            Self::MembersRefused => f.write_str("the cluster refused the change"),
+            Self::ActivationRefused { lowest_protocol, lowest_service_version } => write!(
+                f,
+                "refused: the members support protocol {lowest_protocol} and service version \
+                 {lowest_service_version} at most, or that's a step back"
+            ),
+            Self::NotTransferred => f.write_str("the leadership wasn't transferred"),
+            Self::TimedOut => f.write_str("no leader answered"),
         }
-        wire::Decoded::LeadershipTransferred(m) if m.request_id() == request_id => Some(Ok(u64::from(m.leader()))),
-        _ => None,
-    })
-    .await?;
-    Ok(NodeId(u8::try_from(leader).expect("a node ID")))
+    }
 }
 
-fn changed(reply: &wire::Decoded<'_>, request_id: u64) -> Option<io::Result<u64>> {
+impl std::error::Error for AdminError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Denied(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn changed(reply: &wire::Decoded<'_>, request_id: u64) -> Option<Result<u64, AdminError>> {
     match reply {
         wire::Decoded::MembersChanged(m) if m.request_id() == request_id => Some(Ok(m.index())),
-        wire::Decoded::MembersRefused(m) if m.request_id() == request_id => {
-            Some(Err(io::Error::other("the cluster refused the change")))
-        }
+        wire::Decoded::MembersRefused(m) if m.request_id() == request_id => Some(Err(AdminError::MembersRefused)),
         _ => None,
     }
 }
@@ -383,41 +456,6 @@ fn frame(message: &impl turbofan_sbe::Encode) -> Vec<u8> {
     let mut frame = Vec::new();
     codec::encode_frame(message, &mut frame).expect("admin requests are small");
     frame
-}
-
-/// Sends the `request` for a new request ID to the leader, following redirects from `addr`,
-/// until `answer` makes something of a reply.
-async fn admin(
-    addr: &str,
-    service_id: u32,
-    token: &[u8],
-    tls: Option<&ClientTls>,
-    timeout: Duration,
-    request: impl Fn(u64) -> Vec<u8>,
-    answer: impl Fn(&wire::Decoded<'_>, u64) -> Option<io::Result<u64>>,
-) -> io::Result<u64> {
-    if token.len() > MAX_TOKEN_BYTES {
-        let message = format!("the admin token is over {MAX_TOKEN_BYTES} bytes");
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
-    }
-    let request_id = u64::try_from(
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
-    )
-    .unwrap_or_default();
-    let hello = Hello { service_id, node_id: None };
-    let mut target = addr.to_owned();
-    let attempt = async {
-        loop {
-            match ask(&target, hello, token, tls, &request(request_id), |reply| answer(reply, request_id)).await {
-                Some(Ok(answer)) => return answer,
-                Some(Err(leader)) if !leader.is_empty() => target = leader,
-                _ => tokio::time::sleep(RETRY * 4).await,
-            }
-        }
-    };
-    tokio::time::timeout(timeout, attempt)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no leader answered"))?
 }
 
 /// Whether a node refused the token (`PermissionDenied`) or a certificate, either way
@@ -433,12 +471,12 @@ async fn ask(
     token: &[u8],
     tls: Option<&ClientTls>,
     request: &[u8],
-    answer: impl Fn(&wire::Decoded<'_>) -> Option<io::Result<u64>>,
-) -> Option<Result<io::Result<u64>, String>> {
+    answer: impl Fn(&wire::Decoded<'_>) -> Option<Result<u64, AdminError>>,
+) -> Option<Result<Result<u64, AdminError>, String>> {
     let mut stream = match handshake(addr, hello, wire::Role::Admin, token, tls).await {
         Ok(stream) => stream,
         // Every node has the same token and CAs: no use trying another.
-        Err(e) if refused(&e) => return Some(Ok(Err(e))),
+        Err(e) if refused(&e) => return Some(Ok(Err(AdminError::Denied(e)))),
         Err(_) => return None,
     };
     write_frames(&mut stream, [request]).await.ok()?;

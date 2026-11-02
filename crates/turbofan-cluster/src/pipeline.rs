@@ -17,7 +17,7 @@
 use std::io::{self, Read};
 
 use crate::node::{ConnId, Node, SaveSnapshot, Service};
-use crate::raft::{Member, NodeId, Persist};
+use crate::raft::{LogEnd, Member, NodeId, Persist, SnapshotRead};
 
 /// What a write does for one batch, in order: persist, then read.
 #[derive(Debug)]
@@ -27,7 +27,7 @@ pub struct Batch {
     /// Then read the log's records from these indices on: see [`crate::raft::Outputs::reads`].
     pub reads: Vec<u64>,
     /// And the latest snapshot from these offsets: see [`crate::raft::Outputs::snapshot_reads`].
-    pub snapshot_reads: Vec<(u64, u64)>,
+    pub snapshot_reads: Vec<SnapshotRead>,
 }
 
 /// What waits for a batch's write.
@@ -36,7 +36,7 @@ struct Waiting {
     restore: Option<u64>,
     peer_sends: Vec<(NodeId, Vec<u8>)>,
     /// [`crate::raft::Raft::log_end`] as the batch was taken.
-    log_end: (u64, u64),
+    log_end: LogEnd,
 }
 
 /// One take of the node's outputs: what to do at once.

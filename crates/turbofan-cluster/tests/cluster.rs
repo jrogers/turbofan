@@ -15,10 +15,7 @@ use turbofan_cluster::raft::{self, NodeId};
 #[cfg(feature = "tls")]
 use turbofan_cluster::tls::ClientTls;
 use turbofan_cluster::tls::NodeTls;
-use turbofan_cluster::{
-    CloseReason, ClusterClient, Ctx, Service, SessionId, SnapshotWriter, add_member, node, remove_member,
-    request_snapshot, shutdown, transfer_leadership,
-};
+use turbofan_cluster::{Admin, AdminError, CloseReason, ClusterClient, Ctx, Service, SessionId, SnapshotWriter, node};
 
 const SERVICE_ID: u32 = 7;
 /// The operators' token.
@@ -195,20 +192,25 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
     let event = tokio::time::timeout(Duration::from_secs(10), stranger.recv()).await.unwrap();
     assert!(matches!(event, Some(Event::Closed { reason: CloseReason::Refused, .. })), "{event:?}");
 
-    let admin = cluster.configs[0].admin_listen.to_string();
+    let anyone =
+        Admin::new(cluster.configs[0].admin_listen.to_string(), SERVICE_ID).with_timeout(Duration::from_secs(10));
     // Without the token, an operator is refused at once, not left to time out.
     for token in [&b""[..], b"let me out"] {
-        let refused = request_snapshot(&admin, SERVICE_ID, token, None, Duration::from_secs(10)).await.unwrap_err();
-        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{token:?}");
+        let refused = anyone.clone().with_token(token).request_snapshot().await.unwrap_err();
+        assert!(
+            matches!(&refused, AdminError::Denied(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{token:?}: {refused:?}"
+        );
     }
     // One too long for a hello is an error, not a panic.
-    let long = request_snapshot(&admin, SERVICE_ID, &[b'x'; 256], None, Duration::from_secs(10)).await.unwrap_err();
-    assert_eq!(long.kind(), std::io::ErrorKind::InvalidInput);
-    let index = request_snapshot(&admin, SERVICE_ID, TOKEN, None, Duration::from_secs(10)).await.unwrap();
+    let long = anyone.clone().with_token([b'x'; 256]).request_snapshot().await.unwrap_err();
+    assert!(matches!(long, AdminError::TokenTooLong), "{long:?}");
+    let admin = anyone.with_token(TOKEN);
+    let index = admin.request_snapshot().await.unwrap();
     assert!(index > 100, "a snapshot after the first hundred: {index}");
 
     // Handed over, the new leader answers at once.
-    let leader = transfer_leadership(&admin, SERVICE_ID, TOKEN, None, None, Duration::from_secs(10)).await.unwrap();
+    let leader = admin.transfer_leadership(None).await.unwrap();
     assert!((1..=3).contains(&leader.0));
     let mut next = 101;
     for i in 0..3 {
@@ -219,10 +221,10 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
     }
     // Everyone back: one more round, then a snapshot every node can take.
     exchange(&mut cluster, &mut client, next, next + 99).await;
-    request_snapshot(&admin, SERVICE_ID, TOKEN, None, Duration::from_secs(10)).await.unwrap();
+    admin.request_snapshot().await.unwrap();
 
     // Shut down, every node has the same snapshot and stops; started again, the session goes on.
-    let index = shutdown(&admin, SERVICE_ID, TOKEN, None, Duration::from_secs(10)).await.unwrap();
+    let index = admin.shutdown().await.unwrap();
     for i in 0..3 {
         let node = cluster.nodes[i].take().unwrap();
         tokio::time::timeout(Duration::from_secs(5), node).await.expect("stopped").unwrap().unwrap();
@@ -246,13 +248,16 @@ async fn a_member_joins_and_another_leaves() {
     exchange(&mut cluster, &mut client, 1, 100).await;
 
     cluster.start(3);
-    let admin = cluster.configs[1].admin_listen.to_string();
-    let (timeout, fourth) = (Duration::from_secs(20), member(&cluster.addrs, NodeId(4)));
-    add_member(&admin, SERVICE_ID, TOKEN, None, &fourth, timeout).await.unwrap();
+    let admin = Admin::new(cluster.configs[1].admin_listen.to_string(), SERVICE_ID)
+        .with_token(TOKEN)
+        .with_timeout(Duration::from_secs(20));
+    let fourth = member(&cluster.addrs, NodeId(4));
+    admin.add_member(&fourth).await.unwrap();
     exchange(&mut cluster, &mut client, 101, 200).await;
-    assert!(add_member(&admin, SERVICE_ID, TOKEN, None, &fourth, timeout).await.is_err(), "already a member");
+    let again = admin.add_member(&fourth).await.unwrap_err();
+    assert!(matches!(again, AdminError::MembersRefused), "already a member: {again:?}");
 
-    remove_member(&admin, SERVICE_ID, TOKEN, None, NodeId(1), timeout).await.unwrap();
+    admin.remove_member(NodeId(1)).await.unwrap();
     cluster.kill(0).await;
     exchange(&mut cluster, &mut client, 201, 300).await;
     // Two of the three that are left are a majority: one more can go down.
@@ -311,17 +316,19 @@ async fn a_cluster_over_tls_takes_only_who_it_should() {
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500));
     assert!(tokio::time::timeout(Duration::from_secs(2), plain.recv()).await.is_err(), "no session without TLS");
 
-    let admin = cluster.configs[0].admin_listen.to_string();
+    let admin = Admin::new(cluster.configs[0].admin_listen.to_string(), SERVICE_ID)
+        .with_token(TOKEN)
+        .with_timeout(Duration::from_secs(10));
     let operator =
         |cert: &str, key: &str| ClientTls::load(&file("node-ca.pem"), Some((&file(cert), &file(key)))).unwrap();
-    let timeout = Duration::from_secs(10);
     let ok = operator("operator.pem", "operator.key");
-    assert!(request_snapshot(&admin, SERVICE_ID, TOKEN, Some(&ok), timeout).await.unwrap() > 100);
+    assert!(admin.clone().with_tls(ok).request_snapshot().await.unwrap() > 100);
     // Refused at once, not left to time out.
     let refused = [ClientTls::load(&file("node-ca.pem"), None).unwrap(), operator("node.pem", "node.key")];
-    for tls in &refused {
+    for tls in refused {
         let started = std::time::Instant::now();
-        let error = request_snapshot(&admin, SERVICE_ID, TOKEN, Some(tls), timeout).await.unwrap_err();
+        let error = admin.clone().with_tls(tls).request_snapshot().await.unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(matches!(error, AdminError::Denied(_)), "{error:?}");
     }
 }

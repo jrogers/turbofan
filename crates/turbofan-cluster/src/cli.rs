@@ -39,10 +39,9 @@ use std::time::Duration;
 use crate::driver::{self, serve};
 use crate::node::{self, Service};
 use crate::raft::{self, Member, NodeId};
-use crate::remote::{activate, add_member, remove_member, request_snapshot, shutdown, transfer_leadership};
+use crate::remote::{Admin, AdminError};
 use crate::tls::{ClientTls, NodeTls};
 
-const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// A new member may take a while to catch up.
 const MEMBERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -95,33 +94,27 @@ pub fn run<S: Service + Send + 'static>(service_id: u32, service: S) -> ExitCode
 
 /// An operator's `command`, one of [`COMMANDS`], through the admin listener `--admin` names.
 fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String> {
-    let admin = flag(args, "--admin")?;
-    let token = &token(ADMIN_TOKEN)?.unwrap_or_default();
-    let tls = match tls_flags(args, ["--tls-ca", "--tls-cert", "--tls-key"])? {
-        Some([ca, cert, key]) => {
-            let tls = ClientTls::load(ca.as_ref(), Some((cert.as_ref(), key.as_ref())));
-            Some(tls.map_err(|e| format!("TLS: {e}"))?)
-        }
-        None => None,
-    };
-    let tls = tls.as_ref();
-    let failed = |e: std::io::Error| format!("{command}: {e}");
+    let mut admin = Admin::new(flag(args, "--admin")?, service_id).with_token(token(ADMIN_TOKEN)?.unwrap_or_default());
+    if let Some([ca, cert, key]) = tls_flags(args, ["--tls-ca", "--tls-cert", "--tls-key"])? {
+        let tls = ClientTls::load(ca.as_ref(), Some((cert.as_ref(), key.as_ref())));
+        admin = admin.with_tls(tls.map_err(|e| format!("TLS: {e}"))?);
+    }
+    let failed = |e: AdminError| format!("{command}: {e}");
     match command {
         "snapshot" => {
-            let request = request_snapshot(&admin, service_id, token, tls, SNAPSHOT_REQUEST_TIMEOUT);
-            let index = runtime()?.block_on(request).map_err(failed)?;
+            let index = runtime()?.block_on(admin.request_snapshot()).map_err(failed)?;
             println!("snapshot taken at index {index}");
         }
         "add-member" => {
             let member = member(&flag(args, "--member")?)?;
-            let request = add_member(&admin, service_id, token, tls, &member, MEMBERS_REQUEST_TIMEOUT);
-            let index = runtime()?.block_on(request).map_err(failed)?;
+            let admin = admin.with_timeout(MEMBERS_REQUEST_TIMEOUT);
+            let index = runtime()?.block_on(admin.add_member(&member)).map_err(failed)?;
             println!("member {} added at index {index}", member.id);
         }
         "remove-member" => {
             let id: NodeId = flag(args, "--id")?.parse().map_err(|_| "--id: a number from 1".to_owned())?;
-            let request = remove_member(&admin, service_id, token, tls, id, MEMBERS_REQUEST_TIMEOUT);
-            let index = runtime()?.block_on(request).map_err(failed)?;
+            let admin = admin.with_timeout(MEMBERS_REQUEST_TIMEOUT);
+            let index = runtime()?.block_on(admin.remove_member(id)).map_err(failed)?;
             println!("member {id} removed at index {index}: stop it");
         }
         "activate" => {
@@ -130,13 +123,11 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
                 Err(_) => Ok(0),
             };
             let (protocol, service) = (version("--protocol")?, version("--service")?);
-            let request = activate(&admin, service_id, token, tls, protocol, service, SNAPSHOT_REQUEST_TIMEOUT);
-            let index = runtime()?.block_on(request).map_err(failed)?;
+            let index = runtime()?.block_on(admin.activate(protocol, service)).map_err(failed)?;
             println!("protocol {protocol} and service version {service} active from index {index}");
         }
         "shutdown" => {
-            let request = shutdown(&admin, service_id, token, tls, SNAPSHOT_REQUEST_TIMEOUT);
-            let index = runtime()?.block_on(request).map_err(failed)?;
+            let index = runtime()?.block_on(admin.shutdown()).map_err(failed)?;
             println!("snapshot taken at index {index}: the members are stopping");
         }
         "transfer-leadership" => {
@@ -144,8 +135,7 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
                 Ok(to) => Some(to.parse().map_err(|_| "--to: a number from 1".to_owned())?),
                 Err(_) => None,
             };
-            let request = transfer_leadership(&admin, service_id, token, tls, to, SNAPSHOT_REQUEST_TIMEOUT);
-            let leader = runtime()?.block_on(request).map_err(failed)?;
+            let leader = runtime()?.block_on(admin.transfer_leadership(to)).map_err(failed)?;
             println!("node {leader} leads");
         }
         _ => unreachable!("one of COMMANDS"),
