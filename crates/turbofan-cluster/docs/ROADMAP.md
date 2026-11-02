@@ -18,6 +18,27 @@ down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report t
   node with it and one without can't talk.
 - **Backup.** Archive snapshots and closed log segments somewhere off the node, and restore a
   cluster from them.
+- **A standby in another region.** A cluster that can take over, in another region or cloud, if
+  the main one is lost. In order:
+  - *Learners:* members that take the log but don't vote, so the main cluster's commits never
+    wait on the other region. `catching_up` (`src/raft.rs`) is a temporary one. Left: marking
+    learners in the `Members` entry (a schema change, by `WIRE.md`'s rules), leaving them out of
+    the quorum, check-quorum and transfer targets, and letting them snapshot.
+  - *Promotion:* an admin `promote` on a learner makes it the one member of a new cluster, from
+    its log and snapshot as they are, to grow with `add-member`. Never automatic: from the other
+    region a dead cluster and a cut link look alike, and two clusters taking orders fill twice.
+    An operator fences the old one first.
+  - *A cluster epoch:* the hello carries the service ID and node ID only, so a node of the old
+    cluster coming back would talk to the promoted one. Promotion mints a new epoch that peers
+    and clients check.
+  - *Clients:* sessions are replicated, so clients reattach to the promoted cluster and resend
+    what it hasn't applied. What committed but never reached the learner is lost, and clients
+    can't always tell: a response they'd seen means its `egressSeq` is reused, and the new
+    response is dropped as seen. An operator can count the loss from the old leader's commit
+    index and the learner's last index.
+
+  A cluster stretched over three regions would fail over by itself and lose nothing, but every
+  commit would wait a round trip between regions.
 
 ## 2. The service API
 
