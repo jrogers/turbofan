@@ -1,7 +1,7 @@
 //! What a node reports through the [`metrics`] facade, to whichever recorder the binary installs
 //! (a Prometheus exporter, say): none, and they go nowhere. The core only counts, into
-//! [`Metrics`] from [`crate::node::Node::metrics`] and the commit latencies in
-//! [`crate::node::Outputs::commit_latencies`]; the driver publishes them.
+//! [`Metrics`] from `Node::metrics` and the commit latencies in
+//! `Outputs::commit_latencies`; the driver publishes them.
 //!
 //! | Name | Kind | |
 //! |---|---|---|
@@ -47,7 +47,7 @@ pub struct Metrics {
     pub snapshot_age_ns: u64,
     /// Client sessions open.
     pub sessions: usize,
-    /// It doubts its log ([`crate::raft::Entries::doubt`]).
+    /// It doubts its log (`Entries::doubt`).
     pub in_doubt: bool,
     /// As leader, how many entries each other member is behind its log.
     pub follower_lag: Vec<(NodeId, u64)>,

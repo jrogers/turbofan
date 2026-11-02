@@ -26,7 +26,7 @@ impl Service for Counter {
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, _payload: &[u8]) {
         let count = self.counts.entry(session).or_default();
         *count += 1;
-        ctx.send(session, count.to_string().as_bytes());
+        ctx.send(session, count.to_string().as_bytes()).expect("a count is a few bytes");
     }
 
     fn on_session_close(&mut self, _ctx: &mut Ctx, session: SessionId, _reason: CloseReason) {

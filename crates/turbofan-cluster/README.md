@@ -24,7 +24,7 @@ impl Service for Counter {
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, _payload: &[u8]) {
         let count = self.counts.entry(session).or_default();
         *count += 1;
-        ctx.send(session, count.to_string().as_bytes());
+        ctx.send(session, count.to_string().as_bytes()).expect("a count is a few bytes");
     }
     fn snapshot(&self) -> SnapshotWriter {
         let counts = self.counts.clone();
@@ -70,7 +70,7 @@ that nothing else that reaches the peer listener can act as a node. To turn it o
 cluster, restart the nodes with it one at a time: until the last, the ones that have it don't hear
 those that don't, which is like them being down, so wait for each to catch up before the next.
 For control over timeouts and the rest of the configuration, call `driver::serve` with a
-`driver::Config`.
+`driver::Config`, starting from `NodeConfig::new`'s defaults.
 
 The members change one at a time, while the cluster runs. To add a fourth node, start it with
 `--join` (its lists are then just where to find the cluster), and ask for it:

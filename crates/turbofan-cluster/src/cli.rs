@@ -42,13 +42,6 @@ use crate::raft::{self, Member, NodeId};
 use crate::remote::{activate, add_member, remove_member, request_snapshot, shutdown, transfer_leadership};
 use crate::tls::{ClientTls, NodeTls};
 
-const ELECTION_TIMEOUT: Duration = Duration::from_millis(300);
-const HEARTBEAT: Duration = Duration::from_millis(50);
-/// Applied log records kept in memory for followers that fall behind.
-const LOG_WINDOW_BYTES: usize = 64 << 20;
-const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
-const SNAPSHOT_EVERY_ENTRIES: u64 = 100_000;
-const EGRESS_RING_ENTRIES: usize = 8192;
 const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// A new member may take a while to catch up.
 const MEMBERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -189,21 +182,10 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
             })
             .collect()
     };
+    let mut node = node::Config::new(id, members);
+    node.raft.seed ^= nanos(std::time::UNIX_EPOCH.elapsed().unwrap_or_default());
     Ok(driver::Config {
-        node: node::Config {
-            raft: raft::Config {
-                id,
-                members,
-                election_timeout_ns: nanos(ELECTION_TIMEOUT),
-                heartbeat_ns: nanos(HEARTBEAT),
-                seed: u64::from(id) ^ nanos(std::time::UNIX_EPOCH.elapsed().unwrap_or_default()),
-                log_window_bytes: LOG_WINDOW_BYTES,
-            },
-            session_timeout_ns: nanos(SESSION_TIMEOUT),
-            snapshot_every_entries: SNAPSHOT_EVERY_ENTRIES,
-            egress_ring_entries: EGRESS_RING_ENTRIES,
-            protocol: node::PROTOCOL,
-        },
+        node,
         service_id,
         data_dir: flag(args, "--data")?.into(),
         client_listen: own(&clients),

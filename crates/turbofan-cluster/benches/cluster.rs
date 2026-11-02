@@ -30,7 +30,7 @@ struct Ack;
 
 impl Service for Ack {
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
-        ctx.send(session, payload.get(..8).unwrap_or(payload));
+        ctx.send(session, payload.get(..8).unwrap_or(payload)).expect("at most 8 bytes");
     }
 
     fn snapshot(&self) -> SnapshotWriter {

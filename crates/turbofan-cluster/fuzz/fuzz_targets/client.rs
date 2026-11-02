@@ -57,11 +57,11 @@ impl Service for Checker {
             2 => ctx.close_session(session),
             _ => {}
         }
-        ctx.send(session, payload);
+        ctx.send(session, payload).expect("echoes a client payload");
     }
     fn on_timer(&mut self, ctx: &mut Ctx, id: u64) {
         if let Some(&session) = self.last_seq.keys().next() {
-            ctx.send(session, &id.to_le_bytes());
+            ctx.send(session, &id.to_le_bytes()).expect("8 bytes");
         }
     }
     fn snapshot(&self) -> SnapshotWriter {

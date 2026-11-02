@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{self, Read};
+use std::time::Duration;
 
 use crate::client::MAX_UNACKED;
 use crate::codec::{self, MAX_PAYLOAD_BYTES};
@@ -174,12 +175,15 @@ impl Ctx {
 
     /// Sends `payload` to `session`. Delivered exactly once, in order, if the session is open.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If `payload` is over [`MAX_PAYLOAD_BYTES`].
-    pub fn send(&mut self, session: SessionId, payload: &[u8]) {
-        assert!(payload.len() <= MAX_PAYLOAD_BYTES, "payload of {} bytes is over MAX_PAYLOAD_BYTES", payload.len());
+    /// If `payload` is over [`MAX_PAYLOAD_BYTES`]: nothing is sent. It's an error rather than a
+    /// panic because every node applies the same entry, so a panic would stop them all, and
+    /// stop them again each time they replayed it.
+    pub fn send(&mut self, session: SessionId, payload: &[u8]) -> Result<(), PayloadTooLong> {
+        PayloadTooLong::check(payload)?;
         self.effects.push(Effect::Send(session, payload.to_vec()));
+        Ok(())
     }
 
     /// Fires [`Service::on_timer`] with `id` at cluster time `at` or soon after, replacing a
@@ -203,14 +207,36 @@ impl Ctx {
     /// replicated state until the leader, whichever node that is by then, has logged it, so it
     /// isn't lost to a failover, and it's applied once.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If `payload` is over [`MAX_PAYLOAD_BYTES`].
-    pub fn propose(&mut self, payload: &[u8]) {
-        assert!(payload.len() <= MAX_PAYLOAD_BYTES, "payload of {} bytes is over MAX_PAYLOAD_BYTES", payload.len());
+    /// If `payload` is over [`MAX_PAYLOAD_BYTES`]: nothing is proposed. As with [`Ctx::send`].
+    pub fn propose(&mut self, payload: &[u8]) -> Result<(), PayloadTooLong> {
+        PayloadTooLong::check(payload)?;
         self.effects.push(Effect::Propose(payload.to_vec()));
+        Ok(())
     }
 }
+
+/// A payload over [`MAX_PAYLOAD_BYTES`], which [`Ctx::send`] or [`Ctx::propose`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadTooLong {
+    /// Its length.
+    pub len: usize,
+}
+
+impl PayloadTooLong {
+    fn check(payload: &[u8]) -> Result<(), Self> {
+        if payload.len() > MAX_PAYLOAD_BYTES { Err(Self { len: payload.len() }) } else { Ok(()) }
+    }
+}
+
+impl fmt::Display for PayloadTooLong {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "payload of {} bytes is over MAX_PAYLOAD_BYTES ({MAX_PAYLOAD_BYTES})", self.len)
+    }
+}
+
+impl std::error::Error for PayloadTooLong {}
 
 /// A node's configuration.
 #[derive(Debug, Clone)]
@@ -229,6 +255,31 @@ pub struct Config {
     /// The highest protocol version this node runs: [`PROTOCOL`], or lower to run as an older
     /// node would.
     pub protocol: u32,
+}
+
+impl Config {
+    /// The defaults for node `id` of a cluster that starts with `members`, this node among them,
+    /// or of none to join a running one: a 300 ms election timeout, a 50 ms heartbeat, 64 MiB of
+    /// applied records kept in memory, a 10 s session timeout, a snapshot every 100,000 entries,
+    /// and 8192 responses kept per session. Change any field after.
+    #[must_use]
+    pub fn new(id: NodeId, members: Vec<Member>) -> Self {
+        let nanos = |d: Duration| u64::try_from(d.as_nanos()).expect("small");
+        Self {
+            raft: raft::Config {
+                id,
+                members,
+                election_timeout_ns: nanos(Duration::from_millis(300)),
+                heartbeat_ns: nanos(Duration::from_millis(50)),
+                seed: u64::from(id),
+                log_window_bytes: 64 << 20,
+            },
+            session_timeout_ns: nanos(Duration::from_secs(10)),
+            snapshot_every_entries: 100_000,
+            egress_ring_entries: 8192,
+            protocol: PROTOCOL,
+        }
+    }
 }
 
 /// What one batch of inputs produced. Send `peer_appends` and `client_sends` at once, note
@@ -1258,10 +1309,10 @@ mod tests {
             match text.split(' ').collect::<Vec<_>>()[..] {
                 ["at", id, ms] => ctx.schedule_timer(id.parse().unwrap(), ms.parse::<u64>().unwrap() * MS),
                 ["cancel", id] => ctx.cancel_timer(id.parse().unwrap()),
-                ["propose", what] => ctx.propose(what.as_bytes()),
+                ["propose", what] => ctx.propose(what.as_bytes()).expect("a client payload fits"),
                 _ => {}
             }
-            ctx.send(session, payload);
+            ctx.send(session, payload).expect("a client payload fits");
         }
         fn on_proposal(&mut self, _ctx: &mut Ctx, payload: &[u8]) {
             self.0.push(format!("proposal {}", std::str::from_utf8(payload).unwrap()));
@@ -1289,6 +1340,17 @@ mod tests {
 
     fn member(id: NodeId) -> Member {
         Member { id, peer: format!("p{id}"), client: format!("n{id}"), admin: format!("a{id}") }
+    }
+
+    /// A payload over the limit is refused, not sent or proposed, and not a panic.
+    #[test]
+    fn ctx_refuses_a_payload_over_the_limit() {
+        let mut ctx = Ctx::new(0);
+        let long = vec![0; MAX_PAYLOAD_BYTES + 1];
+        assert_eq!(ctx.send(1, &long), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
+        assert_eq!(ctx.propose(&long), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
+        assert_eq!(ctx.send(1, &long[1..]), Ok(()));
+        assert_eq!(ctx.take_effects(), [Effect::Send(1, long[1..].to_vec())]);
     }
 
     /// A lone member, elected and ready.

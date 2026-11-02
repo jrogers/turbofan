@@ -44,7 +44,7 @@ impl Service for Echo {
         let last = self.last.entry(session).or_default();
         assert_eq!(k, *last + 1, "applied out of order");
         *last = k;
-        ctx.send(session, payload);
+        ctx.send(session, payload).expect("echoes a client payload");
     }
 
     fn snapshot(&self) -> SnapshotWriter {

@@ -244,7 +244,7 @@ pub async fn request_snapshot(
 /// If the node refuses `token`, the cluster's admin token (empty if it has none), or it's over
 /// [`MAX_TOKEN_BYTES`](crate::driver::MAX_TOKEN_BYTES). If the cluster
 /// refuses (another change is under way, `member` is one already, there are
-/// [`crate::raft::MAX_MEMBERS`], or it didn't catch up), or no leader answers within `timeout`.
+/// [`MAX_MEMBERS`](crate::MAX_MEMBERS), or it didn't catch up), or no leader answers within `timeout`.
 pub async fn add_member(
     addr: &str,
     service_id: u32,

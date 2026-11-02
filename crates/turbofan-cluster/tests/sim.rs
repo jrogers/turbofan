@@ -165,9 +165,9 @@ impl Service for Echo {
         let last = self.last.entry(session).or_default();
         assert_eq!(k, *last + 1, "session {session}: message {k} applied after {last}");
         *last = k;
-        ctx.send(session, format!("a{k}").as_bytes());
+        ctx.send(session, format!("a{k}").as_bytes()).unwrap();
         if k.is_multiple_of(PROPOSE_EVERY) {
-            ctx.propose(format!("{session} {k}").as_bytes());
+            ctx.propose(format!("{session} {k}").as_bytes()).unwrap();
         }
         if k.is_multiple_of(TIMER_EVERY) {
             ctx.schedule_timer(session * TIMER_SPACE + k, ctx.now() + 30 * MS);
@@ -177,12 +177,12 @@ impl Service for Echo {
     fn on_proposal(&mut self, ctx: &mut Ctx, payload: &[u8]) {
         let text = std::str::from_utf8(payload).unwrap();
         let (session, k) = text.split_once(' ').unwrap();
-        ctx.send(session.parse().unwrap(), format!("p{k}").as_bytes());
+        ctx.send(session.parse().unwrap(), format!("p{k}").as_bytes()).unwrap();
     }
 
     fn on_timer(&mut self, ctx: &mut Ctx, id: u64) {
         self.fired += 1;
-        ctx.send(id / TIMER_SPACE, format!("t{}", id % TIMER_SPACE).as_bytes());
+        ctx.send(id / TIMER_SPACE, format!("t{}", id % TIMER_SPACE).as_bytes()).unwrap();
     }
 
     fn snapshot(&self) -> SnapshotWriter {
