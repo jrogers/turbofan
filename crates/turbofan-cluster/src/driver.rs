@@ -100,7 +100,7 @@ enum Input {
 /// If the data directory can't be opened (or another process has it), a listener can't bind,
 /// or the disk fails. A failed write or sync leaves the node's durable state unknown, so it
 /// stops; restart it, and it recovers from what's on disk.
-pub async fn serve<S: Service + Send + 'static>(config: Config, service: S) -> io::Result<()> {
+pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Result<()> {
     for (name, token) in [("admin_token", &config.admin_token), ("peer_token", &config.peer_token)] {
         if token.as_ref().is_some_and(|t| t.len() > MAX_TOKEN_BYTES) {
             let message = format!("{name}: at most {MAX_TOKEN_BYTES} bytes");
@@ -189,7 +189,7 @@ struct Core<S> {
     conns: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
 }
 
-impl<S: Service + Send + 'static> Core<S> {
+impl<S: Service + 'static> Core<S> {
     async fn run(mut self, mut rx: mpsc::Receiver<Input>) -> io::Result<()> {
         loop {
             self.flush();
@@ -284,7 +284,7 @@ impl<S: Service + Send + 'static> Core<S> {
             let (_, bytes) = loaded.ok_or_else(|| io::Error::other("the installed snapshot is gone"))?;
             snapshot = Some(bytes);
         }
-        let from = snapshot.as_mut().map(|b| b as &mut dyn io::Read);
+        let from = snapshot.as_mut().map(|b| -> &mut dyn io::Read { b });
         let sends = self.pipeline.written(&mut self.node, &reads, &chunks, from)?;
         self.send_peers(sends);
         Ok(())

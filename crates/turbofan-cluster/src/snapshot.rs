@@ -60,7 +60,7 @@ pub fn save(
 pub fn write_chunk(dir: &Path, offset: u64, bytes: &[u8]) -> io::Result<()> {
     let temp = dir.join(INCOMING);
     let mut file = if offset == 0 { File::create(&temp)? } else { OpenOptions::new().write(true).open(&temp)? };
-    file.seek(SeekFrom::Start(HEADER as u64 + offset))?;
+    file.seek(SeekFrom::Start(crate::widen(HEADER) + offset))?;
     file.write_all(bytes)
 }
 
@@ -79,9 +79,9 @@ pub fn install(dir: &Path, snapshot: &Snapshot, durable: bool) -> io::Result<()>
         let what = format!("snapshot {}: not the leader's, by its checksum", snapshot.index);
         return Err(io::Error::new(io::ErrorKind::InvalidData, what));
     }
-    file.seek(SeekFrom::Start(HEADER as u64 + snapshot.len))?;
+    file.seek(SeekFrom::Start(crate::widen(HEADER) + snapshot.len))?;
     file.write_all(&members)?;
-    file.set_len(HEADER as u64 + snapshot.len + members.len() as u64)?;
+    file.set_len(crate::widen(HEADER) + snapshot.len + crate::widen(members.len()))?;
     finish(dir, &temp, file, snapshot, durable)
 }
 
@@ -121,7 +121,7 @@ fn open_checked(dir: &Path, index: u64) -> io::Result<(Snapshot, File)> {
     if &header[..8] != MAGIC || stored_index != index {
         return Err(invalid("not a snapshot"));
     }
-    if file.metadata()?.len() < HEADER as u64 + len {
+    if file.metadata()?.len() < crate::widen(HEADER) + len {
         return Err(invalid("wrong length"));
     }
     let body_sum = sum_body(&mut file, len)?;
@@ -131,7 +131,7 @@ fn open_checked(dir: &Path, index: u64) -> io::Result<(Snapshot, File)> {
         return Err(invalid("checksum mismatch"));
     }
     let members = decode_members(&tail).ok_or_else(|| invalid("bad members"))?;
-    file.seek(SeekFrom::Start(HEADER as u64))?;
+    file.seek(SeekFrom::Start(crate::widen(HEADER)))?;
     Ok((Snapshot { index, term, len, checksum: sum, members }, file))
 }
 
@@ -150,9 +150,9 @@ pub fn read(dir: &Path, index: u64, offset: u64, max: usize) -> io::Result<Vec<u
     let mut header = [0; HEADER];
     file.read_exact(&mut header)?;
     let len = u64::from_le_bytes(header[24..32].try_into().expect("eight bytes"));
-    file.seek(SeekFrom::Start(HEADER as u64 + offset))?;
+    file.seek(SeekFrom::Start(crate::widen(HEADER) + offset))?;
     let mut out = Vec::new();
-    file.take((max as u64).min(len.saturating_sub(offset))).read_to_end(&mut out)?;
+    file.take(crate::widen(max).min(len.saturating_sub(offset))).read_to_end(&mut out)?;
     Ok(out)
 }
 
@@ -206,7 +206,7 @@ fn seal(sum: u64, index: u64, term: u64, len: u64) -> u64 {
 
 /// The checksum of the `len` bytes after the header, leaving the file after them.
 fn sum_body(file: &mut File, len: u64) -> io::Result<u64> {
-    file.seek(SeekFrom::Start(HEADER as u64))?;
+    file.seek(SeekFrom::Start(crate::widen(HEADER)))?;
     let mut reader = BufReader::new(&mut *file).take(len);
     let (mut sum, mut read) = (CHECKSUM_START, 0);
     loop {
@@ -214,7 +214,7 @@ fn sum_body(file: &mut File, len: u64) -> io::Result<u64> {
         if buf.is_empty() {
             break;
         }
-        (sum, read) = (checksum_on(sum, buf), read + buf.len() as u64);
+        (sum, read) = (checksum_on(sum, buf), read + crate::widen(buf.len()));
         let n = buf.len();
         reader.consume(n);
     }
@@ -222,7 +222,7 @@ fn sum_body(file: &mut File, len: u64) -> io::Result<u64> {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "snapshot cut short"));
     }
     drop(reader);
-    file.seek(SeekFrom::Start(HEADER as u64 + len))?;
+    file.seek(SeekFrom::Start(crate::widen(HEADER) + len))?;
     Ok(sum)
 }
 
@@ -236,7 +236,7 @@ struct Summed<W> {
 impl<W: Write> Write for Summed<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.out.write(buf)?;
-        self.len += n as u64;
+        self.len += crate::widen(n);
         self.sum = checksum_on(self.sum, &buf[..n]);
         Ok(n)
     }

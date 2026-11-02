@@ -75,7 +75,7 @@ impl MetaFile {
         slot[16..24].copy_from_slice(&meta.vote.map_or(0, |v| u64::from(v.0) + 1).to_le_bytes());
         let sum = checksum(&slot[..24]);
         slot[24..].copy_from_slice(&sum.to_le_bytes());
-        let at = if generation.is_multiple_of(2) { 0 } else { SLOT as u64 };
+        let at = if generation.is_multiple_of(2) { 0 } else { crate::widen(SLOT) };
         self.file.write_all_at(&slot, at)?;
         if self.sync {
             self.file.sync_data()?;

@@ -73,6 +73,26 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+/// Why a [`Client`] or [`ClusterClient`](crate::ClusterClient) couldn't be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientConfigError {
+    /// No members' addresses were given.
+    NoAddresses,
+    /// The credentials are over [`MAX_PAYLOAD_BYTES`].
+    CredentialsTooLong,
+}
+
+impl std::fmt::Display for ClientConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoAddresses => "no members' addresses",
+            Self::CredentialsTooLong => "credentials over MAX_PAYLOAD_BYTES",
+        })
+    }
+}
+
+impl std::error::Error for ClientConfigError {}
+
 /// One session with the cluster.
 #[derive(Debug)]
 pub struct Client {
@@ -100,14 +120,23 @@ impl Client {
     /// `keepalive` while idle (well under the cluster's session timeout). A cluster that
     /// refuses them closes the session: [`Event::Closed`] with [`CloseReason::Refused`].
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// If `addrs` is empty, or `credentials` are over [`MAX_PAYLOAD_BYTES`].
-    #[must_use]
-    pub fn new(addrs: Vec<String>, credentials: Vec<u8>, keepalive: Duration) -> Self {
-        assert!(!addrs.is_empty());
-        assert!(credentials.len() <= MAX_PAYLOAD_BYTES, "credentials fit a message");
-        Self {
+    pub fn new(
+        addrs: impl IntoIterator<Item = impl Into<String>>,
+        credentials: impl Into<Vec<u8>>,
+        keepalive: Duration,
+    ) -> Result<Self, ClientConfigError> {
+        let addrs: Vec<String> = addrs.into_iter().map(Into::into).collect();
+        let credentials = credentials.into();
+        if addrs.is_empty() {
+            return Err(ClientConfigError::NoAddresses);
+        }
+        if credentials.len() > MAX_PAYLOAD_BYTES {
+            return Err(ClientConfigError::CredentialsTooLong);
+        }
+        Ok(Self {
             addrs,
             credentials,
             target: 0,
@@ -122,7 +151,7 @@ impl Client {
             reconnect: None,
             frames: Vec::new(),
             events: VecDeque::new(),
-        }
+        })
     }
 
     /// Where to connect.
@@ -222,7 +251,8 @@ impl Client {
     /// # Errors
     ///
     /// If too many are waiting, the session closed, or the payload is too long.
-    pub fn send(&mut self, payload: &[u8]) -> Result<u64, SendError> {
+    pub fn send(&mut self, payload: impl Into<Vec<u8>>) -> Result<u64, SendError> {
+        let payload = payload.into();
         if self.closed {
             return Err(SendError::Closed);
         }
@@ -235,9 +265,9 @@ impl Client {
         let client_seq = self.next_seq;
         self.next_seq += 1;
         if let (true, Some(session)) = (self.open, self.session) {
-            self.frame(&wire::Message { session: session.0, client_seq, payload });
+            self.frame(&wire::Message { session: session.0, client_seq, payload: &payload });
         }
-        self.unacked.push_back((client_seq, payload.to_vec()));
+        self.unacked.push_back((client_seq, payload));
         Ok(client_seq)
     }
 

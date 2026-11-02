@@ -167,8 +167,10 @@ fn certify(dir: &Path) -> NodeTls {
 async fn connect(addrs: &[String], tls: Option<&ClientTls>) -> ClusterClient {
     let keepalive = Duration::from_millis(500);
     let mut client = match tls {
-        Some(tls) => ClusterClient::connect_tls(addrs.to_vec(), SERVICE_ID, Vec::new(), keepalive, tls.clone()),
-        None => ClusterClient::connect(addrs.to_vec(), SERVICE_ID, Vec::new(), keepalive),
+        Some(tls) => {
+            ClusterClient::connect_tls(addrs.to_vec(), SERVICE_ID, Vec::new(), keepalive, tls.clone()).unwrap()
+        }
+        None => ClusterClient::connect(addrs.to_vec(), SERVICE_ID, Vec::new(), keepalive).unwrap(),
     };
     match client.recv().await {
         Some(Event::Opened(_)) => client,

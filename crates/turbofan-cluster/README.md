@@ -115,7 +115,7 @@ exits, so a restart loads the snapshot instead of replaying the log.
 ## Clients
 
 ```rust
-let mut client = ClusterClient::connect(addrs, 1, credentials, Duration::from_millis(500));
+let mut client = ClusterClient::connect(addrs, 1, credentials, Duration::from_millis(500))?;
 client.send(b"hello".to_vec()).await?;
 while let Some(event) = client.recv().await { /* Event::Message(bytes), ... */ }
 ```

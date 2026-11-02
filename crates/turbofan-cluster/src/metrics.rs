@@ -55,7 +55,11 @@ pub struct Metrics {
 
 impl Metrics {
     /// Sets the gauges.
-    #[allow(clippy::cast_precision_loss, reason = "gauges are f64; indices that big don't happen")]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        reason = "gauges are f64; indices that big don't happen"
+    )]
     pub fn publish(&self) {
         for (role, name) in [
             (Role::Follower, "follower"),
@@ -86,7 +90,7 @@ pub fn record_commit_latency(ns: u64) {
     histogram!("turbofan_commit_latency_seconds").record(seconds(ns));
 }
 
-#[allow(clippy::cast_precision_loss, reason = "nanoseconds to seconds, for a metric")]
+#[allow(clippy::cast_precision_loss, clippy::as_conversions, reason = "nanoseconds to seconds, for a metric")]
 fn seconds(ns: u64) -> f64 {
     ns as f64 / 1e9
 }

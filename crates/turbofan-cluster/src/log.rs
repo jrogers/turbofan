@@ -100,7 +100,7 @@ impl Log {
             for record in crate::codec::records(&bytes[..valid]) {
                 each(record.expect("scanned"));
             }
-            file_len = valid as u64;
+            file_len = crate::widen(valid);
             if valid < bytes.len() && !doubt {
                 // Durably, before the tail goes.
                 File::create(dir.join("doubt"))?;
@@ -200,7 +200,7 @@ impl Log {
                 .flatten()
                 .expect("append is given whole, valid records by the node");
             assert_eq!(record.index, self.next_index + count, "records must continue the log");
-            if self.file_len + (at - run) as u64 >= self.segment_bytes {
+            if self.file_len + crate::widen(at - run) >= self.segment_bytes {
                 self.write_run(&records[run..at], count)?;
                 self.roll(record.index)?;
                 (run, count) = (at, 0);
@@ -214,7 +214,7 @@ impl Log {
     /// Writes `count` whole records, `bytes`, at the end of the current segment.
     fn write_run(&mut self, bytes: &[u8], count: u64) -> io::Result<()> {
         self.file.write_all(bytes)?;
-        self.file_len += bytes.len() as u64;
+        self.file_len += crate::widen(bytes.len());
         self.next_index += count;
         Ok(())
     }
@@ -268,7 +268,7 @@ impl Log {
                 }
             }
             index += 1;
-            offset += len as u64;
+            offset += crate::widen(len);
         }
         self.cursor = Some((segment, index, offset));
         Ok(out)
@@ -320,9 +320,9 @@ impl Log {
             at_index += 1;
         }
         self.file = OpenOptions::new().write(true).open(segment_path(&self.dir, first))?;
-        self.file.set_len(keep as u64)?;
+        self.file.set_len(crate::widen(keep))?;
         self.file.seek(SeekFrom::End(0))?;
-        self.file_len = keep as u64;
+        self.file_len = crate::widen(keep);
         self.next_index = index;
         if self.sync {
             self.file.sync_all()?;

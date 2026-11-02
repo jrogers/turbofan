@@ -6,6 +6,9 @@
 //! over its [`driver::Config`]. Gateways connect with [`ClusterClient`], or [`client::Client`]
 //! to do their own IO.
 #![warn(clippy::unwrap_used)]
+// Conversions go through `From`, `TryFrom` or `widen`, never `as`: the cast lints miss
+// `usize as u64`, which is lossless only on targets where usize fits.
+#![warn(clippy::as_conversions)]
 
 mod cli;
 pub mod client;
@@ -40,7 +43,23 @@ pub use remote::{Admin, AdminError, ClusterClient};
 pub use wire::CloseReason;
 
 /// The codecs generated from `schema/cluster.xml`.
-#[allow(dead_code, missing_docs, missing_debug_implementations, clippy::all, clippy::pedantic, reason = "generated")]
+#[allow(
+    dead_code,
+    missing_docs,
+    missing_debug_implementations,
+    clippy::all,
+    clippy::pedantic,
+    clippy::as_conversions,
+    reason = "generated"
+)]
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/wire.rs"));
+}
+
+const _: () = assert!(usize::BITS <= u64::BITS, "a length fits a u64");
+
+/// A length or count as a `u64`: lossless, as the assertion above guarantees.
+#[allow(clippy::as_conversions, reason = "lossless: usize is at most 64 bits")]
+pub(crate) const fn widen(n: usize) -> u64 {
+    n as u64
 }

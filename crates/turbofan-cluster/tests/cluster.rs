@@ -184,11 +184,11 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
     let dir = tempfile::tempdir().unwrap();
     let mut cluster = Cluster::new(dir.path(), None);
     let mut client =
-        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500));
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
     // A client with the wrong credentials gets no session.
     let mut stranger =
-        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"no".to_vec(), Duration::from_millis(500));
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"no".to_vec(), Duration::from_millis(500)).unwrap();
     let event = tokio::time::timeout(Duration::from_secs(10), stranger.recv()).await.unwrap();
     assert!(matches!(event, Some(Event::Closed { reason: CloseReason::Refused, .. })), "{event:?}");
 
@@ -244,7 +244,7 @@ async fn a_member_joins_and_another_leaves() {
     let dir = tempfile::tempdir().unwrap();
     let mut cluster = Cluster::new(dir.path(), None);
     let mut client =
-        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500));
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
 
     cluster.start(3);
@@ -310,10 +310,11 @@ async fn a_cluster_over_tls_takes_only_who_it_should() {
         b"ok".to_vec(),
         Duration::from_millis(500),
         gateway,
-    );
+    )
+    .unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
     let mut plain =
-        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500));
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(2), plain.recv()).await.is_err(), "no session without TLS");
 
     let admin = Admin::new(cluster.configs[0].admin_listen.to_string(), SERVICE_ID)

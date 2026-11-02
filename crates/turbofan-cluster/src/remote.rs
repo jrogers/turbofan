@@ -9,7 +9,7 @@ use tokio::io::WriteHalf;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::client::{Client, Event, Reconnect, SendError};
+use crate::client::{Client, ClientConfigError, Event, Reconnect, SendError};
 use crate::codec;
 use crate::driver::{Hello, MAX_TOKEN_BYTES, read_frame, write_frames};
 use crate::raft::{Member, NodeId};
@@ -41,41 +41,45 @@ pub struct ClusterClient {
 
 impl ClusterClient {
     /// A session with the cluster of `service_id` whose members take clients at `addrs`, with
-    /// `credentials` for the service to check.
+    /// `credentials` for the service to check, sending a keepalive every `keepalive` while idle.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::new`]: if `addrs` is empty, or the credentials are too long.
     ///
     /// # Panics
     ///
-    /// If `addrs` is empty, the credentials are too long, or this isn't called on a tokio runtime.
-    #[must_use]
-    pub fn connect(addrs: Vec<String>, service_id: u32, credentials: Vec<u8>, keepalive: Duration) -> Self {
-        Self::start(addrs, service_id, credentials, keepalive, None)
+    /// If this isn't called on a tokio runtime.
+    pub fn connect(
+        addrs: impl IntoIterator<Item = impl Into<String>>,
+        service_id: u32,
+        credentials: impl Into<Vec<u8>>,
+        keepalive: Duration,
+    ) -> Result<Self, ClientConfigError> {
+        Ok(Self::start(Client::new(addrs, credentials, keepalive)?, service_id, None))
     }
 
     /// As [`ClusterClient::connect`], over TLS: for a cluster with
     /// [`driver::Config::tls`](crate::driver::Config::tls).
     ///
+    /// # Errors
+    ///
+    /// As [`ClusterClient::connect`].
+    ///
     /// # Panics
     ///
     /// As [`ClusterClient::connect`].
-    #[must_use]
     pub fn connect_tls(
-        addrs: Vec<String>,
+        addrs: impl IntoIterator<Item = impl Into<String>>,
         service_id: u32,
-        credentials: Vec<u8>,
+        credentials: impl Into<Vec<u8>>,
         keepalive: Duration,
         tls: ClientTls,
-    ) -> Self {
-        Self::start(addrs, service_id, credentials, keepalive, Some(tls))
+    ) -> Result<Self, ClientConfigError> {
+        Ok(Self::start(Client::new(addrs, credentials, keepalive)?, service_id, Some(tls)))
     }
 
-    fn start(
-        addrs: Vec<String>,
-        service_id: u32,
-        credentials: Vec<u8>,
-        keepalive: Duration,
-        tls: Option<ClientTls>,
-    ) -> Self {
-        let client = Client::new(addrs, credentials, keepalive);
+    fn start(client: Client, service_id: u32, tls: Option<ClientTls>) -> Self {
         let (commands, rx) = mpsc::channel(64);
         let (tx, events) = mpsc::channel(MAX_QUEUED_EVENTS);
         let task = tokio::spawn(run(client, service_id, tls, rx, tx));
@@ -89,9 +93,9 @@ impl ClusterClient {
     ///
     /// If [`crate::client::MAX_UNACKED`] messages wait to be applied (read responses, then try
     /// again), the session closed, or the payload is too long.
-    pub async fn send(&self, payload: Vec<u8>) -> Result<u64, SendError> {
+    pub async fn send(&self, payload: impl Into<Vec<u8>>) -> Result<u64, SendError> {
         let (reply, rx) = oneshot::channel();
-        self.commands.send(Command::Send(payload, reply)).await.map_err(|_| SendError::Closed)?;
+        self.commands.send(Command::Send(payload.into(), reply)).await.map_err(|_| SendError::Closed)?;
         rx.await.map_err(|_| SendError::Closed)?
     }
 
@@ -144,7 +148,7 @@ async fn run(
             tokio::select! {
                 command = commands.recv() => match command {
                     None => return,
-                    Some(Command::Send(payload, reply)) => { let _ = reply.send(client.send(&payload)); }
+                    Some(Command::Send(payload, reply)) => { let _ = reply.send(client.send(payload)); }
                     Some(Command::Close) => client.close(),
                 },
                 frame = frames.recv() => {

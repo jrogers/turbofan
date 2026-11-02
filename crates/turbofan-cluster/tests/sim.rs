@@ -657,7 +657,7 @@ impl Sim {
         let addrs: Vec<String> = members.iter().map(|id| format!("n{id}")).collect();
         let clients = (0..CLIENTS)
             .map(|c| SimClient {
-                client: Client::new(addrs.clone(), format!("client {c}").into_bytes(), Duration::from_millis(500)),
+                client: Client::new(&addrs, format!("client {c}"), Duration::from_millis(500)).unwrap(),
                 conn: None,
                 dialing: false,
                 tick_at: None,

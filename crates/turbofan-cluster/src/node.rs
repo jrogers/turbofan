@@ -59,8 +59,8 @@ pub const MAX_PRINCIPAL_BYTES: usize = 255;
 ///
 /// It must depend only on what it's given, never on a clock, randomness, IO or iteration order
 /// of a hash map. Time comes from [`Ctx::now`], which is the leader's clock stamped into the
-/// log.
-pub trait Service {
+/// log. It's `Send`, as the driver runs it on a tokio task.
+pub trait Service: Send {
     /// Whether a client with `credentials` may open a session, or reattach to one, and who it
     /// is: its principal (a user name, say, at most [`MAX_PRINCIPAL_BYTES`]), or `None` to refuse
     /// it. Only the leader asks, before anything is logged, so the answer may depend on anything
@@ -192,9 +192,10 @@ impl Ctx {
     /// If `payload` is over [`MAX_PAYLOAD_BYTES`]: nothing is sent. It's an error rather than a
     /// panic because every node applies the same entry, so a panic would stop them all, and
     /// stop them again each time they replayed it.
-    pub fn send(&mut self, session: SessionId, payload: &[u8]) -> Result<(), PayloadTooLong> {
-        PayloadTooLong::check(payload)?;
-        self.effects.push(Effect::Send(session, payload.to_vec()));
+    pub fn send(&mut self, session: SessionId, payload: impl Into<Vec<u8>>) -> Result<(), PayloadTooLong> {
+        let payload = payload.into();
+        PayloadTooLong::check(&payload)?;
+        self.effects.push(Effect::Send(session, payload));
         Ok(())
     }
 
@@ -222,9 +223,10 @@ impl Ctx {
     /// # Errors
     ///
     /// If `payload` is over [`MAX_PAYLOAD_BYTES`]: nothing is proposed. As with [`Ctx::send`].
-    pub fn propose(&mut self, payload: &[u8]) -> Result<(), PayloadTooLong> {
-        PayloadTooLong::check(payload)?;
-        self.effects.push(Effect::Propose(payload.to_vec()));
+    pub fn propose(&mut self, payload: impl Into<Vec<u8>>) -> Result<(), PayloadTooLong> {
+        let payload = payload.into();
+        PayloadTooLong::check(&payload)?;
+        self.effects.push(Effect::Propose(payload));
         Ok(())
     }
 }
@@ -918,7 +920,7 @@ impl<S: Service> Node<S> {
         // already proposed will apply; a gap or a message past the window is dropped, for the
         // client to resend.
         let next = self.local.proposed.get(&session).map_or(last_seq, |&p| p.max(last_seq)) + 1;
-        if client_seq != next || client_seq - last_seq > MAX_UNACKED as u64 {
+        if client_seq != next || client_seq - last_seq > crate::widen(MAX_UNACKED) {
             return;
         }
         if self
@@ -1199,8 +1201,8 @@ fn encode_state(state: &State) -> Vec<u8> {
         time: state.time,
         next_proposal: state.next_proposal,
         sessions: u32::try_from(state.sessions.len()).expect("at most MAX_SESSIONS"),
-        timers: state.timers.len() as u64,
-        proposals: state.outbox.len() as u64,
+        timers: crate::widen(state.timers.len()),
+        proposals: crate::widen(state.outbox.len()),
         protocol: state.protocol,
         service_version: state.service_version,
     };
@@ -1367,9 +1369,9 @@ mod tests {
     #[test]
     fn ctx_refuses_a_payload_over_the_limit() {
         let mut ctx = Ctx::new(0);
-        let long = vec![0; MAX_PAYLOAD_BYTES + 1];
-        assert_eq!(ctx.send(SessionId(1), &long), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
-        assert_eq!(ctx.propose(&long), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
+        let long = vec![0_u8; MAX_PAYLOAD_BYTES + 1];
+        assert_eq!(ctx.send(SessionId(1), long.clone()), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
+        assert_eq!(ctx.propose(long.clone()), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
         assert_eq!(ctx.send(SessionId(1), &long[1..]), Ok(()));
         assert_eq!(ctx.take_effects(), [Effect::Send(SessionId(1), long[1..].to_vec())]);
     }
@@ -1407,7 +1409,7 @@ mod tests {
             sends.extend(out.client_sends);
             if let Some(save) = out.save {
                 let (index, term, members) = (save.index, save.term, save.members.clone());
-                let len = written(save).len() as u64;
+                let len = crate::widen(written(save).len());
                 node.on_snapshot_saved(Snapshot { index, term, len, checksum: 0, members });
                 continue;
             }
@@ -1481,14 +1483,14 @@ mod tests {
         };
         assert_eq!(submit(&mut node, 1), 1);
         assert_eq!(submit(&mut node, 1), 0, "a resend of what's in flight");
-        for client_seq in 2..=MAX_UNACKED as u64 {
+        for client_seq in 2..=crate::widen(MAX_UNACKED) {
             assert_eq!(submit(&mut node, client_seq), 1);
         }
-        assert_eq!(submit(&mut node, MAX_UNACKED as u64 + 1), 0, "past the window");
+        assert_eq!(submit(&mut node, crate::widen(MAX_UNACKED) + 1), 0, "past the window");
         drive(&mut node);
         assert_eq!(node.service.0.iter().filter(|e| e.starts_with("message")).count(), MAX_UNACKED);
         // Once they apply, the window moves on.
-        assert_eq!(submit(&mut node, MAX_UNACKED as u64 + 1), 1);
+        assert_eq!(submit(&mut node, crate::widen(MAX_UNACKED) + 1), 1);
     }
 
     /// A client the service refuses gets no session; one it accepts opens one as its principal,
@@ -1631,7 +1633,7 @@ mod tests {
         let bytes = written(save);
 
         let config = node.config.clone();
-        let snapshot = Snapshot { index, term, len: bytes.len() as u64, checksum: 0, members };
+        let snapshot = Snapshot { index, term, len: crate::widen(bytes.len()), checksum: 0, members };
         let mut restored =
             Node::new(config, Recorder::default(), Meta::default(), Some(snapshot), Entries::default(), 0);
         restored.restore(&mut &bytes[..]).unwrap();

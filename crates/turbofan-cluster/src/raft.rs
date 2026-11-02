@@ -116,12 +116,12 @@ const MAX_IN_FLIGHT: u64 = 4096;
 const CATCH_UP_TIMEOUTS: u64 = 100;
 /// How far a leader sends a snapshot to a peer ahead of its acks, as reads of up to
 /// [`MAX_READ_BYTES`].
-const MAX_SNAPSHOT_IN_FLIGHT: u64 = 8 * MAX_READ_BYTES as u64;
+const MAX_SNAPSHOT_IN_FLIGHT: u64 = 8 * crate::widen(MAX_READ_BYTES);
 /// The most record bytes one of [`Outputs::reads`] returns, past its first record.
 pub const MAX_READ_BYTES: usize = MAX_APPEND_BYTES;
 
 const _: () = assert!(MAX_APPEND_BYTES < codec::MAX_FRAME_BYTES - 1024);
-const _: () = assert!(MAX_IN_FLIGHT >= MAX_ENTRIES_PER_APPEND as u64);
+const _: () = assert!(MAX_IN_FLIGHT >= crate::widen(MAX_ENTRIES_PER_APPEND));
 
 /// The longest timeout a configuration may give: far beyond any sensible one, and far enough
 /// under `u64::MAX` nanoseconds that the cluster's clock plus one can't overflow.
@@ -741,7 +741,7 @@ impl Raft {
     pub fn on_read(&mut self, records: &[u8]) {
         let (mut first, mut run, mut at) = (None, Vec::new(), 0);
         while let Ok(Some((record, len))) = Record::decode(&records[at..]) {
-            let index = first.map_or(record.index, |f| f + run.len() as u64);
+            let index = first.map_or(record.index, |f| f + crate::widen(run.len()));
             let on_disk = index >= self.log.first && index < self.log.window_first;
             if record.index != index || !on_disk || self.log.term_at(index) != Some(record.term) {
                 break;
@@ -1080,7 +1080,7 @@ impl Raft {
         let mut bytes = Vec::new();
         let mut count = 0_u32;
         let mut index = next;
-        while index <= self.replicate_to() && (count as usize) < MAX_ENTRIES_PER_APPEND {
+        while index <= self.replicate_to() && u64::from(count) < crate::widen(MAX_ENTRIES_PER_APPEND) {
             let Some(record) = self.record(index) else { break };
             if !bytes.is_empty() && bytes.len() + record.len() > MAX_APPEND_BYTES {
                 break;
@@ -1151,7 +1151,7 @@ impl Raft {
                     if !self.out.snapshot_reads.contains(&read) {
                         self.out.snapshot_reads.push(read);
                     }
-                    offset += MAX_READ_BYTES as u64;
+                    offset += crate::widen(MAX_READ_BYTES);
                 }
                 self.peers[peer].chunk_wanted = true;
                 break;
@@ -1172,14 +1172,14 @@ impl Raft {
                 last_index: snapshot.index,
                 last_term: snapshot.term,
                 offset: s.sent,
-                done: u8::from(s.sent + chunk.len() as u64 >= snapshot.len),
+                done: u8::from(s.sent + crate::widen(chunk.len()) >= snapshot.len),
                 checksum: snapshot.checksum,
                 member: &addrs,
                 chunk,
             };
             let mut frame = Vec::new();
             codec::encode_frame(&message, &mut frame).expect("a chunk is within a frame");
-            s.sent += chunk.len() as u64;
+            s.sent += crate::widen(chunk.len());
             self.out.sends.push((self.peers[peer].id, frame));
         }
         self.peers[peer].sending = Some(s);
@@ -1239,10 +1239,10 @@ impl Raft {
         };
         if m.offset() == incoming.len {
             let bytes = m.chunk().to_vec();
-            incoming.len += bytes.len() as u64;
+            incoming.len += crate::widen(bytes.len());
             self.out.persist.push(Persist::SnapshotChunk { index: m.last_index(), offset: m.offset(), bytes });
         }
-        if m.done() == 1 && m.offset() + m.chunk().len() as u64 == incoming.len {
+        if m.done() == 1 && m.offset() + crate::widen(m.chunk().len()) == incoming.len {
             let incoming = self.incoming.take().expect("just matched");
             self.install(incoming);
             self.ack(from, true, self.commit);
@@ -1668,7 +1668,7 @@ impl Entries {
     }
 
     fn last(&self) -> u64 {
-        self.window_first + self.records.len() as u64 - 1
+        self.window_first + crate::widen(self.records.len()) - 1
     }
 
     /// Which of `terms` holds `index`, which is in the log.
@@ -1829,7 +1829,7 @@ mod tests {
     fn log(terms: &[u64]) -> Vec<u8> {
         let mut out = Vec::new();
         for (i, &term) in terms.iter().enumerate() {
-            Record { term, index: i as u64 + 1, payload: b"x" }.encode_into(&mut out);
+            Record { term, index: crate::widen(i) + 1, payload: b"x" }.encode_into(&mut out);
         }
         out
     }
@@ -2284,9 +2284,9 @@ mod tests {
     /// after a heartbeat with no progress.
     #[test]
     fn snapshot_chunks_are_pipelined_and_a_lost_one_is_sent_again() {
-        const CHUNK: u64 = MAX_READ_BYTES as u64;
+        const CHUNK: u64 = crate::widen(MAX_READ_BYTES);
         let len = 3 * CHUNK + 10;
-        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
         let snapshot = Snapshot { index: 10, term: 1, len, checksum: 0, members: vec![member(1), member(2)] };
         let mut rafts = vec![
             Raft::new(config(1, &[1, 2]), Meta { term: 1, vote: None }, Some(snapshot), Entries::default(), 0),

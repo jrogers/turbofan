@@ -65,7 +65,7 @@ an operator's command, over TLS: [--tls-ca <pem> --tls-cert <pem> --tls-key <pem
 
 /// Runs the command line for a node of `service`, which serves cluster `service_id`.
 #[must_use]
-pub fn run<S: Service + Send + 'static>(service_id: u32, service: S) -> ExitCode {
+pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("serve") => serve_config(&args[1..], service_id).and_then(|mut config| {
