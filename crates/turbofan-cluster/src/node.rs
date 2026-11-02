@@ -34,7 +34,14 @@ use crate::raft::{self, Entries, Member, NodeId, Persist, Raft, Role, Snapshot};
 use crate::wire::{self, CloseReason};
 
 /// A client session's ID: the log index of the entry that opened it.
-pub type SessionId = u64;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(pub u64);
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 /// A client connection's ID, which the driver assigns.
 pub type ConnId = u64;
 
@@ -244,7 +251,7 @@ pub struct Config {
     /// Identity and Raft timing.
     pub raft: raft::Config,
     /// A session the leader hears nothing from for this long is closed.
-    pub session_timeout_ns: u64,
+    pub session_timeout: Duration,
     /// Each node snapshots, and compacts its log, once this many entries follow its last snapshot.
     pub snapshot_every_entries: u64,
     /// How many responses each session keeps for a client that reattaches after a failover. A
@@ -264,17 +271,16 @@ impl Config {
     /// and 8192 responses kept per session. Change any field after.
     #[must_use]
     pub fn new(id: NodeId, members: Vec<Member>) -> Self {
-        let nanos = |d: Duration| u64::try_from(d.as_nanos()).expect("small");
         Self {
             raft: raft::Config {
                 id,
                 members,
-                election_timeout_ns: nanos(Duration::from_millis(300)),
-                heartbeat_ns: nanos(Duration::from_millis(50)),
+                election_timeout: Duration::from_millis(300),
+                heartbeat: Duration::from_millis(50),
                 seed: u64::from(id),
                 log_window_bytes: 64 << 20,
             },
-            session_timeout_ns: nanos(Duration::from_secs(10)),
+            session_timeout: Duration::from_secs(10),
             snapshot_every_entries: 100_000,
             egress_ring_entries: 8192,
             protocol: PROTOCOL,
@@ -359,7 +365,7 @@ struct Local {
     conns: BTreeMap<ConnId, Option<SessionId>>,
     attached: BTreeMap<SessionId, ConnId>,
     /// `SessionOpen` entries proposed, by index, for the connection that asked.
-    opening: BTreeMap<u64, ConnId>,
+    opening: BTreeMap<SessionId, ConnId>,
     /// When the leader last heard from each session.
     activity: BTreeMap<SessionId, u64>,
     closing: BTreeSet<SessionId>,
@@ -412,7 +418,8 @@ impl<S: Service> Node<S> {
     /// `service` new. With a snapshot, [`Node::restore`] from it next.
     #[must_use]
     pub fn new(config: Config, service: S, meta: Meta, snapshot: Option<Snapshot>, log: Entries, now: u64) -> Self {
-        assert!(config.session_timeout_ns > config.raft.election_timeout_ns * 2, "sessions outlive an election");
+        assert!(config.session_timeout > config.raft.election_timeout * 2, "sessions outlive an election");
+        assert!(config.session_timeout < raft::MAX_TIMEOUT, "times in nanoseconds can't overflow");
         assert!(config.snapshot_every_entries > 0);
         assert!((1..=MAX_EGRESS_RING).contains(&config.egress_ring_entries));
         let restoring = snapshot.as_ref().map(|s| s.index);
@@ -530,14 +537,18 @@ impl<S: Service> Node<S> {
             }
             wire::Decoded::AddMember(m) => {
                 let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-                let member =
-                    Member { id: m.id(), peer: text(m.peer()), client: text(m.client()), admin: text(m.admin()) };
+                let member = Member {
+                    id: NodeId(m.id()),
+                    peer: text(m.peer()),
+                    client: text(m.client()),
+                    admin: text(m.admin()),
+                };
                 let free = self.local.changing.is_none() && self.local.activating.is_none();
                 let started = free && self.raft.add_member(member);
                 self.start_change(conn, m.request_id(), started);
             }
             wire::Decoded::RemoveMember(m) => {
-                let started = self.local.changing.is_none() && self.raft.remove_member(m.id());
+                let started = self.local.changing.is_none() && self.raft.remove_member(NodeId(m.id()));
                 self.start_change(conn, m.request_id(), started);
             }
             wire::Decoded::Activate(m) => self.activate(conn, m.request_id(), m.protocol(), m.service_version()),
@@ -550,7 +561,7 @@ impl<S: Service> Node<S> {
             wire::Decoded::TransferLeadership(m) => {
                 let request_id = m.request_id();
                 let free = self.transferring.is_none() && self.local.shutting.is_none();
-                if free && self.raft.transfer_leadership(m.to()).is_some() {
+                if free && self.raft.transfer_leadership(NodeId::from_wire(m.to())).is_some() {
                     self.transferring = Some((conn, request_id));
                 } else {
                     self.send_client(conn, &wire::LeadershipTransferred { request_id, leader: 0 });
@@ -659,21 +670,23 @@ impl<S: Service> Node<S> {
         }
         match message {
             wire::Decoded::Connect(m) => self.open(conn, m.credentials()),
-            wire::Decoded::Reattach(m) => self.reattach(conn, m.session(), m.last_egress_seq(), m.credentials()),
+            wire::Decoded::Reattach(m) => {
+                self.reattach(conn, SessionId(m.session()), m.last_egress_seq(), m.credentials())
+            }
             wire::Decoded::Message(m) => {
-                if let Some(session) = self.check_attached(conn, m.session()) {
+                if let Some(session) = self.check_attached(conn, SessionId(m.session())) {
                     self.submit(conn, session, m.client_seq(), m.payload());
                 }
             }
             wire::Decoded::KeepAlive(m) => {
-                if let Some(session) = self.check_attached(conn, m.session()) {
+                if let Some(session) = self.check_attached(conn, SessionId(m.session())) {
                     self.local.activity.insert(session, now);
                     let applied_seq = self.state.sessions[&session].last_seq;
                     self.send_client(conn, &wire::KeepAliveAck { applied_seq });
                 }
             }
             wire::Decoded::Close(m) => {
-                if let Some(session) = self.check_attached(conn, m.session()) {
+                if let Some(session) = self.check_attached(conn, SessionId(m.session())) {
                     self.propose_close(session, CloseReason::Client);
                 }
             }
@@ -728,7 +741,7 @@ impl<S: Service> Node<S> {
             }
             let quiet = self.local.activity.iter().filter(|(s, _)| !self.local.closing.contains(s)).map(|(_, &at)| at);
             if let Some(at) = quiet.min() {
-                deadline = deadline.min(at + self.config.session_timeout_ns);
+                deadline = deadline.min(at + raft::nanos(self.config.session_timeout));
             }
         }
         deadline
@@ -757,7 +770,7 @@ impl<S: Service> Node<S> {
             let gave_up = self.raft.role() == Role::Leader && !self.raft.transferring();
             if other.is_some() || gave_up {
                 self.transferring = None;
-                self.send_client(conn, &wire::LeadershipTransferred { request_id, leader: other.unwrap_or(0) });
+                self.send_client(conn, &wire::LeadershipTransferred { request_id, leader: NodeId::to_wire(other) });
             }
         }
         self.answer_snapshot_requests();
@@ -845,7 +858,7 @@ impl<S: Service> Node<S> {
             return;
         };
         if let Some(index) = self.propose(&wire::SessionOpen { timestamp: self.now, principal: &principal }) {
-            self.local.opening.insert(index, conn);
+            self.local.opening.insert(SessionId(index), conn);
         }
     }
 
@@ -856,12 +869,12 @@ impl<S: Service> Node<S> {
 
     fn reattach(&mut self, conn: ConnId, session: SessionId, last_egress_seq: u64, credentials: &[u8]) {
         let Some(s) = self.state.sessions.get(&session) else {
-            self.send_client(conn, &wire::Closed { session, reason: CloseReason::NoSession });
+            self.send_client(conn, &wire::Closed { session: session.0, reason: CloseReason::NoSession });
             return;
         };
         // A session's ID is easy to guess: its owner proves it's still who opened it.
         if self.authenticate(credentials).as_ref() != Some(&s.principal) {
-            self.send_client(conn, &wire::Closed { session, reason: CloseReason::Refused });
+            self.send_client(conn, &wire::Closed { session: session.0, reason: CloseReason::Refused });
             return;
         }
         let s = &self.state.sessions[&session];
@@ -872,9 +885,9 @@ impl<S: Service> Node<S> {
         self.local.activity.insert(session, self.now);
         let applied_seq = s.last_seq;
         let replay: Vec<(u64, Vec<u8>)> = s.ring.iter().filter(|(seq, _)| *seq > last_egress_seq).cloned().collect();
-        self.send_client(conn, &wire::Opened { session, applied_seq });
+        self.send_client(conn, &wire::Opened { session: session.0, applied_seq });
         for (egress_seq, payload) in replay {
-            self.send_client(conn, &wire::Egress { session, egress_seq, applied_seq, payload: &payload });
+            self.send_client(conn, &wire::Egress { session: session.0, egress_seq, applied_seq, payload: &payload });
         }
     }
 
@@ -883,7 +896,7 @@ impl<S: Service> Node<S> {
         if self.local.conns.get(&conn) == Some(&Some(session)) && self.state.sessions.contains_key(&session) {
             return Some(session);
         }
-        self.send_client(conn, &wire::Closed { session, reason: CloseReason::NoSession });
+        self.send_client(conn, &wire::Closed { session: session.0, reason: CloseReason::NoSession });
         None
     }
 
@@ -903,19 +916,22 @@ impl<S: Service> Node<S> {
         if client_seq != next || client_seq - last_seq > MAX_UNACKED as u64 {
             return;
         }
-        if self.propose(&wire::SessionMessage { timestamp: self.now, session, client_seq, payload }).is_some() {
+        if self
+            .propose(&wire::SessionMessage { timestamp: self.now, session: session.0, client_seq, payload })
+            .is_some()
+        {
             self.local.proposed.insert(session, client_seq);
         }
     }
 
     fn propose_close(&mut self, session: SessionId, reason: CloseReason) {
         if self.local.closing.insert(session) {
-            self.propose(&wire::SessionClose { timestamp: self.now, session, reason });
+            self.propose(&wire::SessionClose { timestamp: self.now, session: session.0, reason });
         }
     }
 
     fn expire_sessions(&mut self, now: u64) {
-        let timeout = self.config.session_timeout_ns;
+        let timeout = raft::nanos(self.config.session_timeout);
         let expired: Vec<SessionId> =
             self.local.activity.iter().filter(|&(_, &at)| at + timeout <= now).map(|(&s, _)| s).collect();
         for session in expired {
@@ -1005,21 +1021,21 @@ impl<S: Service> Node<S> {
             }
             wire::Decoded::SessionOpen(e) => {
                 self.advance_time(e.timestamp());
-                self.apply_open(index, e.principal());
+                self.apply_open(SessionId(index), e.principal());
             }
             wire::Decoded::SessionMessage(e) => {
                 self.advance_time(e.timestamp());
-                let Some(s) = self.state.sessions.get_mut(&e.session()) else { return };
+                let Some(s) = self.state.sessions.get_mut(&SessionId(e.session())) else { return };
                 // Exactly once, in order: a resend or one after a gap the client will resend is dropped.
                 if e.client_seq() != s.last_seq + 1 {
                     return;
                 }
                 s.last_seq = e.client_seq();
-                self.call(|service, ctx| service.on_message(ctx, e.session(), e.payload()));
+                self.call(|service, ctx| service.on_message(ctx, SessionId(e.session()), e.payload()));
             }
             wire::Decoded::SessionClose(e) => {
                 self.advance_time(e.timestamp());
-                self.apply_close(e.session(), e.reason());
+                self.apply_close(SessionId(e.session()), e.reason());
             }
             wire::Decoded::TimerFired(e) => {
                 self.advance_time(e.timestamp());
@@ -1057,7 +1073,7 @@ impl<S: Service> Node<S> {
         if let Some(conn) = self.local.opening.remove(&session) {
             self.local.conns.insert(conn, Some(session));
             self.local.attached.insert(session, conn);
-            self.send_client(conn, &wire::Opened { session, applied_seq: 0 });
+            self.send_client(conn, &wire::Opened { session: session.0, applied_seq: 0 });
         }
         if self.local.was_leader {
             self.local.activity.insert(session, self.now);
@@ -1074,7 +1090,7 @@ impl<S: Service> Node<S> {
         }
         if let Some(conn) = self.local.attached.remove(&session) {
             self.local.conns.insert(conn, None);
-            self.send_client(conn, &wire::Closed { session, reason });
+            self.send_client(conn, &wire::Closed { session: session.0, reason });
         }
         self.call(|service, ctx| service.on_session_close(ctx, session, reason));
     }
@@ -1126,7 +1142,7 @@ impl<S: Service> Node<S> {
         let egress_seq = s.next_egress;
         s.next_egress += 1;
         if let Some(&conn) = self.local.attached.get(&session) {
-            let message = wire::Egress { session, egress_seq, applied_seq: s.last_seq, payload: &payload };
+            let message = wire::Egress { session: session.0, egress_seq, applied_seq: s.last_seq, payload: &payload };
             let mut frame = Vec::new();
             codec::encode_frame(&message, &mut frame).expect("payloads are within their limit");
             self.local.sends.push((conn, frame));
@@ -1153,7 +1169,7 @@ impl<S: Service> Node<S> {
         let leader = self.raft.leader().filter(|&l| l != self.raft.id());
         let member = leader.and_then(|l| self.raft.members().iter().find(|m| m.id == l));
         let addr = member.map_or(&[][..], |m| addr(m).as_bytes());
-        let message = wire::Redirect { leader: leader.unwrap_or(0), addr };
+        let message = wire::Redirect { leader: NodeId::to_wire(leader), addr };
         let mut frame = Vec::new();
         codec::encode_frame(&message, &mut frame).expect("addresses are short");
         self.local.sends.push((conn, frame));
@@ -1187,7 +1203,7 @@ fn encode_state(state: &State) -> Vec<u8> {
     for (&session, s) in &state.sessions {
         let ring = u32::try_from(s.ring.len()).expect("at most MAX_EGRESS_RING");
         let (last_seq, next_egress) = (s.last_seq, s.next_egress);
-        put(&mut out, &wire::SessionState { session, last_seq, next_egress, ring, principal: &s.principal });
+        put(&mut out, &wire::SessionState { session: session.0, last_seq, next_egress, ring, principal: &s.principal });
         for (egress_seq, payload) in &s.ring {
             put(&mut out, &wire::EgressState { egress_seq: *egress_seq, payload });
         }
@@ -1239,7 +1255,7 @@ fn decode_state(from: &mut dyn Read) -> io::Result<State> {
             let wire::Decoded::EgressState(e) = decoded(&frame)? else { return Err(bad("no EgressState")) };
             session.ring.push_back((e.egress_seq(), e.payload().to_vec()));
         }
-        state.sessions.insert(s.session(), session);
+        state.sessions.insert(SessionId(s.session()), session);
     }
     for _ in 0..timers {
         let frame = read_message(from)?;
@@ -1338,8 +1354,8 @@ mod tests {
         }
     }
 
-    fn member(id: NodeId) -> Member {
-        Member { id, peer: format!("p{id}"), client: format!("n{id}"), admin: format!("a{id}") }
+    fn member(id: u8) -> Member {
+        Member { id: NodeId(id), peer: format!("p{id}"), client: format!("n{id}"), admin: format!("a{id}") }
     }
 
     /// A payload over the limit is refused, not sent or proposed, and not a panic.
@@ -1347,24 +1363,24 @@ mod tests {
     fn ctx_refuses_a_payload_over_the_limit() {
         let mut ctx = Ctx::new(0);
         let long = vec![0; MAX_PAYLOAD_BYTES + 1];
-        assert_eq!(ctx.send(1, &long), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
+        assert_eq!(ctx.send(SessionId(1), &long), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
         assert_eq!(ctx.propose(&long), Err(PayloadTooLong { len: MAX_PAYLOAD_BYTES + 1 }));
-        assert_eq!(ctx.send(1, &long[1..]), Ok(()));
-        assert_eq!(ctx.take_effects(), [Effect::Send(1, long[1..].to_vec())]);
+        assert_eq!(ctx.send(SessionId(1), &long[1..]), Ok(()));
+        assert_eq!(ctx.take_effects(), [Effect::Send(SessionId(1), long[1..].to_vec())]);
     }
 
     /// A lone member, elected and ready.
     fn leader() -> Node<Recorder> {
         let config = Config {
             raft: raft::Config {
-                id: 1,
+                id: NodeId(1),
                 members: vec![member(1)],
-                election_timeout_ns: 150 * MS,
-                heartbeat_ns: 50 * MS,
+                election_timeout: Duration::from_millis(150),
+                heartbeat: Duration::from_millis(50),
                 seed: 1,
                 log_window_bytes: usize::MAX,
             },
-            session_timeout_ns: TIMEOUT,
+            session_timeout: Duration::from_nanos(TIMEOUT),
             snapshot_every_entries: 1000,
             egress_ring_entries: 1024,
             protocol: PROTOCOL,
@@ -1422,7 +1438,7 @@ mod tests {
     fn messages_apply_once_in_order_and_a_reattach_replays_responses() {
         let mut node = leader();
         let session = open(&mut node, 7, 0);
-        let message = |client_seq, payload| wire::Message { session, client_seq, payload };
+        let message = |client_seq, payload| wire::Message { session: session.0, client_seq, payload };
         assert!(client(&mut node, 7, &message(1, b"one"), 0)[0].contains("Egress"));
         // A resend of 1 is acknowledged, not applied; 3 before 2 is dropped for the client to resend.
         assert!(
@@ -1436,7 +1452,8 @@ mod tests {
 
         // After a failover the client reattaches on a new connection, having seen response 1.
         node.on_disconnect(7);
-        let sent = client(&mut node, 8, &wire::Reattach { session, last_egress_seq: 1, credentials: b"" }, 0);
+        let sent =
+            client(&mut node, 8, &wire::Reattach { session: session.0, last_egress_seq: 1, credentials: b"" }, 0);
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert!(sent[0].contains("Opened") && sent[0].contains("applied_seq: 2"));
         assert!(sent[1].contains("egress_seq: 2"));
@@ -1452,7 +1469,7 @@ mod tests {
         let session = open(&mut node, 7, 0);
         let submit = |node: &mut Node<Recorder>, client_seq: u64| {
             let mut frame = Vec::new();
-            codec::encode_frame(&wire::Message { session, client_seq, payload: b"m" }, &mut frame).unwrap();
+            codec::encode_frame(&wire::Message { session: session.0, client_seq, payload: b"m" }, &mut frame).unwrap();
             let before = node.raft().last_index();
             node.on_client(7, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
             node.raft().last_index() - before
@@ -1480,7 +1497,7 @@ mod tests {
         let session = node.local.attached.iter().find(|&(_, &c)| c == 2).map(|(&s, _)| s).unwrap();
         assert!(node.service.0.contains(&format!("open {session} alice")));
 
-        let reattach = |credentials| wire::Reattach { session, last_egress_seq: 0, credentials };
+        let reattach = |credentials| wire::Reattach { session: session.0, last_egress_seq: 0, credentials };
         assert!(client(&mut node, 3, &reattach(b"mallory"), 0)[0].contains("Refused"), "a guessed session");
         assert!(client(&mut node, 4, &reattach(b"alice"), 0)[0].contains("Opened"));
     }
@@ -1490,7 +1507,7 @@ mod tests {
         let mut node = leader();
         let quiet = open(&mut node, 1, 0);
         let kept = open(&mut node, 2, 0);
-        client(&mut node, 2, &wire::KeepAlive { session: kept }, TIMEOUT / 2);
+        client(&mut node, 2, &wire::KeepAlive { session: kept.0 }, TIMEOUT / 2);
         assert!(node.next_deadline() <= TIMEOUT);
         node.on_tick(TIMEOUT);
         let sent = drive(&mut node);
@@ -1504,11 +1521,11 @@ mod tests {
         let mut node = leader();
         let session = open(&mut node, 1, 0);
         for (client_seq, text) in [(1, "at 5 100"), (2, "at 6 100"), (3, "at 5 300"), (4, "cancel 6")] {
-            client(&mut node, 1, &wire::Message { session, client_seq, payload: text.as_bytes() }, 0);
+            client(&mut node, 1, &wire::Message { session: session.0, client_seq, payload: text.as_bytes() }, 0);
         }
         // A keepalive stops the session timing out over the wait.
         for now in [100, 200, 300, 400].map(|ms| ms * MS) {
-            client(&mut node, 1, &wire::KeepAlive { session }, now);
+            client(&mut node, 1, &wire::KeepAlive { session: session.0 }, now);
             node.on_tick(now);
             drive(&mut node);
         }
@@ -1520,14 +1537,14 @@ mod tests {
     fn a_follower_redirects_clients_to_the_leader() {
         let config = Config {
             raft: raft::Config {
-                id: 2,
+                id: NodeId(2),
                 members: vec![member(1), member(2), member(3)],
-                election_timeout_ns: 150 * MS,
-                heartbeat_ns: 50 * MS,
+                election_timeout: Duration::from_millis(150),
+                heartbeat: Duration::from_millis(50),
                 seed: 1,
                 log_window_bytes: usize::MAX,
             },
-            session_timeout_ns: TIMEOUT,
+            session_timeout: Duration::from_nanos(TIMEOUT),
             snapshot_every_entries: 1000,
             egress_ring_entries: 1024,
             protocol: PROTOCOL,
@@ -1545,7 +1562,7 @@ mod tests {
             last_index: 0,
         };
         codec::encode_frame(&append, &mut frame).unwrap();
-        node.on_peer(1, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
+        node.on_peer(NodeId(1), &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
         drive(&mut node);
         let sent = client(&mut node, 1, &wire::Connect { credentials: b"" }, 0);
         assert!(sent[0].contains("leader: 1, addr: [110, 49]"), "{sent:?}");
@@ -1567,7 +1584,7 @@ mod tests {
         assert!(refused.contains("index: 0, lowest_protocol: 0, lowest_service_version: 1"), "{refused}");
         assert!(!activate(&mut node, 0, 1).contains("index: 0"), "this node has version 1");
         assert!(node.service.0.contains(&"activate 1".to_owned()));
-        client(&mut node, 7, &wire::Message { session, client_seq: 1, payload: b"later" }, 0);
+        client(&mut node, 7, &wire::Message { session: session.0, client_seq: 1, payload: b"later" }, 0);
         assert!(node.service.0.contains(&"as version 1".to_owned()));
         assert!(activate(&mut node, 0, 0).contains("index: 0"), "not back");
 
@@ -1581,7 +1598,7 @@ mod tests {
     fn a_proposal_is_applied_once_through_the_log() {
         let mut node = leader();
         let session = open(&mut node, 7, 0);
-        client(&mut node, 7, &wire::Message { session, client_seq: 1, payload: b"propose hi" }, 0);
+        client(&mut node, 7, &wire::Message { session: session.0, client_seq: 1, payload: b"propose hi" }, 0);
         drive(&mut node);
         // As a leader before a failover would have: the same proposal, logged again.
         node.propose(&wire::ServiceProposal { timestamp: 0, id: 1, payload: b"hi" });
@@ -1598,14 +1615,14 @@ mod tests {
         let mut node = leader();
         let session = open(&mut node, 7, 0);
         for (client_seq, text) in [(1, "one"), (2, "at 9 500")] {
-            client(&mut node, 7, &wire::Message { session, client_seq, payload: text.as_bytes() }, 0);
+            client(&mut node, 7, &wire::Message { session: session.0, client_seq, payload: text.as_bytes() }, 0);
         }
         node.take_snapshot();
         let save = node.take_outputs().save.unwrap();
         let (index, term, members) = (save.index, save.term, save.members.clone());
         assert_eq!(index, node.applied());
         let (state, service) = (encode_state(&node.state), node.service.0.clone());
-        client(&mut node, 7, &wire::Message { session, client_seq: 3, payload: b"later" }, 0);
+        client(&mut node, 7, &wire::Message { session: session.0, client_seq: 3, payload: b"later" }, 0);
         let bytes = written(save);
 
         let config = node.config.clone();
@@ -1624,7 +1641,7 @@ mod tests {
     fn a_truncated_snapshot_is_refused() {
         let mut node = leader();
         let session = open(&mut node, 7, 0);
-        client(&mut node, 7, &wire::Message { session, client_seq: 1, payload: b"at 3 100" }, 0);
+        client(&mut node, 7, &wire::Message { session: session.0, client_seq: 1, payload: b"at 3 100" }, 0);
         node.state.outbox.insert(4, b"waiting".to_vec());
         node.state.next_proposal = 4;
         let bytes = encode_state(&node.state);
@@ -1640,7 +1657,7 @@ mod tests {
         let mut node = leader();
         let session = open(&mut node, 7, 0);
         let mut frame = Vec::new();
-        codec::encode_frame(&wire::Message { session, client_seq: 1, payload: b"one" }, &mut frame).unwrap();
+        codec::encode_frame(&wire::Message { session: session.0, client_seq: 1, payload: b"one" }, &mut frame).unwrap();
         node.on_client(7, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
         node.take_outputs();
         let now = node.next_deadline();

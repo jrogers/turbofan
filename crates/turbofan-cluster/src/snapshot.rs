@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::codec::{self, CHECKSUM_START, checksum_on};
 use crate::node::SnapshotWriter;
-use crate::raft::{Member, Snapshot};
+use crate::raft::{Member, NodeId, Snapshot};
 use crate::wire;
 
 const MAGIC: &[u8; 8] = b"CLSNAP01";
@@ -177,7 +177,7 @@ fn encode_members(members: &[Member]) -> Vec<u8> {
     let member: Vec<wire::SnapshotMembersMember<'_>> = members
         .iter()
         .map(|m| wire::SnapshotMembersMember {
-            id: m.id,
+            id: m.id.0,
             peer: m.peer.as_bytes(),
             client: m.client.as_bytes(),
             admin: m.admin.as_bytes(),
@@ -192,7 +192,7 @@ fn decode_members(bytes: &[u8]) -> Option<Vec<Member>> {
     let (wire::Decoded::SnapshotMembers(m), used) = codec::decode_frame(bytes).ok()?? else { return None };
     let text = |b: &[u8]| String::from_utf8(b.to_vec()).ok();
     let members = m.member().map(|a| {
-        Some(Member { id: a.id(), peer: text(a.peer())?, client: text(a.client())?, admin: text(a.admin())? })
+        Some(Member { id: NodeId(a.id()), peer: text(a.peer())?, client: text(a.client())?, admin: text(a.admin())? })
     });
     (used == bytes.len()).then_some(members.collect::<Option<Vec<_>>>()?)
 }
@@ -267,7 +267,8 @@ mod tests {
     use super::*;
 
     fn members() -> Vec<Member> {
-        let member = |id| Member { id, peer: format!("p{id}"), client: format!("c{id}"), admin: String::new() };
+        let member =
+            |id| Member { id: NodeId(id), peer: format!("p{id}"), client: format!("c{id}"), admin: String::new() };
         vec![member(1), member(2)]
     }
 

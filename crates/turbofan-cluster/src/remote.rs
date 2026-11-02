@@ -75,7 +75,7 @@ impl ClusterClient {
         keepalive: Duration,
         tls: Option<ClientTls>,
     ) -> Self {
-        let client = Client::new(addrs, credentials, u64::try_from(keepalive.as_nanos()).unwrap_or(u64::MAX));
+        let client = Client::new(addrs, credentials, keepalive);
         let (commands, rx) = mpsc::channel(64);
         let (tx, events) = mpsc::channel(MAX_QUEUED_EVENTS);
         let task = tokio::spawn(run(client, service_id, tls, rx, tx));
@@ -121,7 +121,7 @@ async fn run(
 ) {
     let start = Instant::now();
     let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let hello = Hello { service_id, node_id: 0 };
+    let hello = Hello { service_id, node_id: None };
     loop {
         let Ok(stream) = handshake(client.target(), hello, wire::Role::Client, &[], tls.as_ref()).await else {
             client.on_disconnected();
@@ -255,7 +255,7 @@ pub async fn add_member(
 ) -> io::Result<u64> {
     let request = |request_id| {
         let (peer, client, admin) = (member.peer.as_bytes(), member.client.as_bytes(), member.admin.as_bytes());
-        frame(&wire::AddMember { request_id, id: member.id, peer, client, admin })
+        frame(&wire::AddMember { request_id, id: member.id.0, peer, client, admin })
     };
     admin(addr, service_id, token, tls, timeout, request, changed).await
 }
@@ -277,7 +277,7 @@ pub async fn remove_member(
     id: NodeId,
     timeout: Duration,
 ) -> io::Result<u64> {
-    let request = |request_id| frame(&wire::RemoveMember { request_id, id });
+    let request = |request_id| frame(&wire::RemoveMember { request_id, id: id.0 });
     admin(addr, service_id, token, tls, timeout, request, changed).await
 }
 
@@ -339,7 +339,7 @@ pub async fn shutdown(
     .await
 }
 
-/// Hands the leadership to member `to`, or with 0 to the one most caught up, through the admin
+/// Hands the leadership to member `to`, or with `None` to the one most caught up, through the admin
 /// listener at `addr`: before stopping the leader, so a restart costs a quick election rather
 /// than an election timeout. Returns the new leader.
 ///
@@ -354,10 +354,10 @@ pub async fn transfer_leadership(
     service_id: u32,
     token: &[u8],
     tls: Option<&ClientTls>,
-    to: NodeId,
+    to: Option<NodeId>,
     timeout: Duration,
 ) -> io::Result<NodeId> {
-    let request = |request_id| frame(&wire::TransferLeadership { request_id, to });
+    let request = |request_id| frame(&wire::TransferLeadership { request_id, to: NodeId::to_wire(to) });
     let leader = admin(addr, service_id, token, tls, timeout, request, |reply, request_id| match reply {
         wire::Decoded::LeadershipTransferred(m) if m.request_id() == request_id && m.leader() == 0 => {
             Some(Err(io::Error::other("the leadership wasn't transferred")))
@@ -366,7 +366,7 @@ pub async fn transfer_leadership(
         _ => None,
     })
     .await?;
-    Ok(NodeId::try_from(leader).expect("a node ID"))
+    Ok(NodeId(u8::try_from(leader).expect("a node ID")))
 }
 
 fn changed(reply: &wire::Decoded<'_>, request_id: u64) -> Option<io::Result<u64>> {
@@ -404,7 +404,7 @@ async fn admin(
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
     )
     .unwrap_or_default();
-    let hello = Hello { service_id, node_id: 0 };
+    let hello = Hello { service_id, node_id: None };
     let mut target = addr.to_owned();
     let attempt = async {
         loop {

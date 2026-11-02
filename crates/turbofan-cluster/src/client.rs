@@ -8,9 +8,11 @@
 //! order, while the session lasts.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use crate::codec::{self, MAX_PAYLOAD_BYTES};
 use crate::node::SessionId;
+use crate::raft::MAX_TIMEOUT;
 use crate::wire::{self, CloseReason};
 
 /// The most messages sent but not yet known applied. [`Client::send`] refuses more.
@@ -95,14 +97,14 @@ pub struct Client {
 impl Client {
     /// A client of the cluster whose members clients reach at `addrs`, with `credentials` for
     /// the service to check (see [`crate::Service::authenticate`]), sending a keepalive every
-    /// `keepalive_ns` while idle (well under the cluster's session timeout). A cluster that
+    /// `keepalive` while idle (well under the cluster's session timeout). A cluster that
     /// refuses them closes the session: [`Event::Closed`] with [`CloseReason::Refused`].
     ///
     /// # Panics
     ///
     /// If `addrs` is empty, or `credentials` are over [`MAX_PAYLOAD_BYTES`].
     #[must_use]
-    pub fn new(addrs: Vec<String>, credentials: Vec<u8>, keepalive_ns: u64) -> Self {
+    pub fn new(addrs: Vec<String>, credentials: Vec<u8>, keepalive: Duration) -> Self {
         assert!(!addrs.is_empty());
         assert!(credentials.len() <= MAX_PAYLOAD_BYTES, "credentials fit a message");
         Self {
@@ -115,7 +117,7 @@ impl Client {
             next_seq: 1,
             unacked: VecDeque::new(),
             last_egress: 0,
-            keepalive_ns,
+            keepalive_ns: crate::raft::nanos(keepalive.min(MAX_TIMEOUT)),
             keepalive_at: 0,
             reconnect: None,
             frames: Vec::new(),
@@ -149,8 +151,11 @@ impl Client {
         match self.session {
             None => push_frame(&mut self.frames, &wire::Connect { credentials: &self.credentials }),
             Some(session) => {
-                let reattach =
-                    wire::Reattach { session, last_egress_seq: self.last_egress, credentials: &self.credentials };
+                let reattach = wire::Reattach {
+                    session: session.0,
+                    last_egress_seq: self.last_egress,
+                    credentials: &self.credentials,
+                };
                 push_frame(&mut self.frames, &reattach);
             }
         }
@@ -179,16 +184,16 @@ impl Client {
                 };
             }
             wire::Decoded::Opened(m) => {
-                self.session = Some(m.session());
+                self.session = Some(SessionId(m.session()));
                 self.open = true;
                 self.trim(m.applied_seq());
-                self.events.push_back(Event::Opened(m.session()));
+                self.events.push_back(Event::Opened(SessionId(m.session())));
                 let resend: Vec<(u64, Vec<u8>)> = self.unacked.iter().cloned().collect();
                 for (client_seq, payload) in resend {
                     self.frame(&wire::Message { session: m.session(), client_seq, payload: &payload });
                 }
             }
-            wire::Decoded::Egress(m) if Some(m.session()) == self.session => {
+            wire::Decoded::Egress(m) if Some(SessionId(m.session())) == self.session => {
                 self.trim(m.applied_seq());
                 if m.egress_seq() <= self.last_egress {
                     return;
@@ -200,7 +205,7 @@ impl Client {
                 self.events.push_back(Event::Message(m.payload().to_vec()));
             }
             wire::Decoded::KeepAliveAck(m) => self.trim(m.applied_seq()),
-            wire::Decoded::Closed(m) if self.session.is_none_or(|s| s == m.session()) => {
+            wire::Decoded::Closed(m) if self.session.is_none_or(|s| s == SessionId(m.session())) => {
                 self.open = false;
                 self.closed = true;
                 let unapplied = self.unacked.len();
@@ -230,7 +235,7 @@ impl Client {
         let client_seq = self.next_seq;
         self.next_seq += 1;
         if let (true, Some(session)) = (self.open, self.session) {
-            self.frame(&wire::Message { session, client_seq, payload });
+            self.frame(&wire::Message { session: session.0, client_seq, payload });
         }
         self.unacked.push_back((client_seq, payload.to_vec()));
         Ok(client_seq)
@@ -239,7 +244,7 @@ impl Client {
     /// Closes the session.
     pub fn close(&mut self) {
         if let (true, Some(session)) = (self.open, self.session) {
-            self.frame(&wire::Close { session });
+            self.frame(&wire::Close { session: session.0 });
         }
     }
 
@@ -248,7 +253,7 @@ impl Client {
         if now >= self.keepalive_at {
             self.keepalive_at = now + self.keepalive_ns;
             if let (true, Some(session)) = (self.open, self.session) {
-                self.frame(&wire::KeepAlive { session });
+                self.frame(&wire::KeepAlive { session: session.0 });
             }
         }
     }

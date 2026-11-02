@@ -25,7 +25,6 @@ const SERVICE_ID: u32 = 7;
 const TOKEN: &[u8] = b"let me in";
 /// The nodes' token, to each other.
 const PEER_TOKEN: &[u8] = b"one of us";
-const MS: u64 = 1_000_000;
 
 /// Answers each message with its own text, and checks they come once each, in order.
 #[derive(Debug, Default)]
@@ -51,7 +50,7 @@ impl Service for Echo {
         let last = self.last.clone();
         Box::new(move |out| {
             for (session, last) in &last {
-                out.write_all(&session.to_le_bytes())?;
+                out.write_all(&session.0.to_le_bytes())?;
                 out.write_all(&last.to_le_bytes())?;
             }
             Ok(())
@@ -62,7 +61,7 @@ impl Service for Echo {
         let mut bytes = Vec::new();
         from.read_to_end(&mut bytes)?;
         let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
-        self.last = words.as_chunks::<2>().0.iter().map(|&[session, last]| (session, last)).collect();
+        self.last = words.as_chunks::<2>().0.iter().map(|&[session, last]| (SessionId(session), last)).collect();
         Ok(())
     }
 }
@@ -84,7 +83,7 @@ impl Cluster {
     /// Three members started, and a fourth that can join.
     fn new(dir: &Path, tls: Option<NodeTls>) -> Self {
         let addrs = ports(12);
-        let ids: Vec<NodeId> = vec![1, 2, 3, 4];
+        let ids: Vec<NodeId> = [1, 2, 3, 4].map(NodeId).into();
         let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
         let members: Vec<raft::Member> = ids[..3].iter().map(|&id| member(&addrs, id)).collect();
         let configs = ids
@@ -93,13 +92,13 @@ impl Cluster {
                 node: node::Config {
                     raft: raft::Config {
                         id,
-                        members: if id == 4 { Vec::new() } else { members.clone() },
-                        election_timeout_ns: 300 * MS,
-                        heartbeat_ns: 50 * MS,
+                        members: if id == NodeId(4) { Vec::new() } else { members.clone() },
+                        election_timeout: Duration::from_millis(300),
+                        heartbeat: Duration::from_millis(50),
                         seed: u64::from(id),
                         log_window_bytes: 64 << 20,
                     },
-                    session_timeout_ns: 10_000 * MS,
+                    session_timeout: Duration::from_millis(10_000),
                     snapshot_every_entries: 50,
                     egress_ring_entries: 1024,
                     protocol: node::PROTOCOL,
@@ -107,7 +106,7 @@ impl Cluster {
                 service_id: SERVICE_ID,
                 data_dir: dir.join(id.to_string()),
                 // The first three know nothing of the fourth until it's added.
-                peer_addrs: ids.iter().filter(|&&m| m <= id.max(3)).map(|&m| (m, addr(0, m))).collect(),
+                peer_addrs: ids.iter().filter(|&&m| m <= id.max(NodeId(3))).map(|&m| (m, addr(0, m))).collect(),
                 client_listen: addr(4, id),
                 admin_listen: addr(8, id),
                 admin_token: Some(TOKEN.to_vec()),
@@ -209,8 +208,8 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
     assert!(index > 100, "a snapshot after the first hundred: {index}");
 
     // Handed over, the new leader answers at once.
-    let leader = transfer_leadership(&admin, SERVICE_ID, TOKEN, None, 0, Duration::from_secs(10)).await.unwrap();
-    assert!((1..=3).contains(&leader));
+    let leader = transfer_leadership(&admin, SERVICE_ID, TOKEN, None, None, Duration::from_secs(10)).await.unwrap();
+    assert!((1..=3).contains(&leader.0));
     let mut next = 101;
     for i in 0..3 {
         cluster.kill(i).await;
@@ -248,12 +247,12 @@ async fn a_member_joins_and_another_leaves() {
 
     cluster.start(3);
     let admin = cluster.configs[1].admin_listen.to_string();
-    let (timeout, fourth) = (Duration::from_secs(20), member(&cluster.addrs, 4));
+    let (timeout, fourth) = (Duration::from_secs(20), member(&cluster.addrs, NodeId(4)));
     add_member(&admin, SERVICE_ID, TOKEN, None, &fourth, timeout).await.unwrap();
     exchange(&mut cluster, &mut client, 101, 200).await;
     assert!(add_member(&admin, SERVICE_ID, TOKEN, None, &fourth, timeout).await.is_err(), "already a member");
 
-    remove_member(&admin, SERVICE_ID, TOKEN, None, 1, timeout).await.unwrap();
+    remove_member(&admin, SERVICE_ID, TOKEN, None, NodeId(1), timeout).await.unwrap();
     cluster.kill(0).await;
     exchange(&mut cluster, &mut client, 201, 300).await;
     // Two of the three that are left are a majority: one more can go down.

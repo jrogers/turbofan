@@ -97,7 +97,7 @@ fn start(dir: &Path, tls: bool) -> (Vec<String>, Option<ClientTls>) {
     drop(listeners);
     // Peers, then clients, then operators.
     let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
-    let ids: [NodeId; 3] = [1, 2, 3];
+    let ids: [NodeId; 3] = [1, 2, 3].map(NodeId);
     let members: Vec<raft::Member> = ids
         .iter()
         .map(|&id| raft::Member {
@@ -113,12 +113,12 @@ fn start(dir: &Path, tls: bool) -> (Vec<String>, Option<ClientTls>) {
                 raft: raft::Config {
                     id,
                     members: members.clone(),
-                    election_timeout_ns: 300 * MS,
-                    heartbeat_ns: 50 * MS,
+                    election_timeout: Duration::from_millis(300),
+                    heartbeat: Duration::from_millis(50),
                     seed: u64::from(id),
                     log_window_bytes: 64 << 20,
                 },
-                session_timeout_ns: 10_000 * MS,
+                session_timeout: Duration::from_millis(10_000),
                 snapshot_every_entries: 100_000,
                 egress_ring_entries: 1024,
                 protocol: node::PROTOCOL,

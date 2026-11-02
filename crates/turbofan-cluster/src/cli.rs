@@ -141,8 +141,8 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
         }
         "transfer-leadership" => {
             let to = match flag(args, "--to") {
-                Ok(to) => to.parse().map_err(|_| "--to: a number from 1".to_owned())?,
-                Err(_) => 0,
+                Ok(to) => Some(to.parse().map_err(|_| "--to: a number from 1".to_owned())?),
+                Err(_) => None,
             };
             let request = transfer_leadership(&admin, service_id, token, tls, to, SNAPSHOT_REQUEST_TIMEOUT);
             let leader = runtime()?.block_on(request).map_err(failed)?;

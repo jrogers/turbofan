@@ -66,7 +66,7 @@ impl Metrics {
             gauge!("turbofan_role", "role" => name).set(f64::from(u8::from(self.role == role)));
         }
         gauge!("turbofan_term").set(self.term as f64);
-        gauge!("turbofan_leader").set(f64::from(self.leader.unwrap_or(0)));
+        gauge!("turbofan_leader").set(f64::from(NodeId::to_wire(self.leader)));
         gauge!("turbofan_members").set(self.members as f64);
         gauge!("turbofan_commit_index").set(self.commit as f64);
         gauge!("turbofan_applied_index").set(self.applied as f64);

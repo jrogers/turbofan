@@ -128,7 +128,7 @@ pub async fn serve<S: Service + Send + 'static>(config: Config, service: S) -> i
     let (inputs, rx) = mpsc::channel(MAX_QUEUED_INPUTS);
     // Every task is in here, so they all stop when `serve` does.
     let mut tasks = JoinSet::new();
-    let hello = Hello { service_id: config.service_id, node_id: id };
+    let hello = Hello { service_id: config.service_id, node_id: Some(id) };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
     let acceptor = |pick: fn(&tls::Loaded) -> &TlsAcceptor| tls.as_ref().map(|t| pick(t).clone());
     tasks.spawn(accept_peers(peer_listener, hello, peer_token.clone(), acceptor(|t| &t.peer), inputs.clone()));
@@ -306,7 +306,7 @@ impl<S: Service + Send + 'static> Core<S> {
     fn dial(&mut self, members: &[Member]) {
         let mut wanted: HashMap<NodeId, String> = self.contacts.iter().cloned().collect();
         wanted.extend(members.iter().map(|m| (m.id, m.peer.clone())));
-        wanted.remove(&self.hello.node_id);
+        wanted.retain(|&id, _| Some(id) != self.hello.node_id);
         self.peers.retain(|id, (addr, _, task)| {
             let keep = wanted.get(id) == Some(addr);
             if !keep {
@@ -479,7 +479,8 @@ fn wall_ns() -> u64 {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Hello {
     pub(crate) service_id: u32,
-    pub(crate) node_id: NodeId,
+    /// None for a client or an operator.
+    pub(crate) node_id: Option<NodeId>,
 }
 
 impl Hello {
@@ -490,7 +491,13 @@ impl Hello {
     /// If the token is over [`MAX_TOKEN_BYTES`].
     pub(crate) fn frame(self, role: wire::Role, token: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
-        let hello = wire::Hello { magic: MAGIC, service_id: self.service_id, role, node_id: self.node_id, token };
+        let hello = wire::Hello {
+            magic: MAGIC,
+            service_id: self.service_id,
+            role,
+            node_id: NodeId::to_wire(self.node_id),
+            token,
+        };
         codec::encode_frame(&hello, &mut frame).expect("a token of at most 255 bytes");
         frame
     }
@@ -571,8 +578,8 @@ async fn accept_peers(
             let Ok(Ok((mut stream, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else { return };
             let theirs = hello.check(&first, wire::Role::Peer);
             let theirs = theirs.filter(|h| token.as_ref().is_none_or(|token| same(h.token(), token)));
-            let from = theirs.map(|h| h.node_id());
-            let Some(from) = from.filter(|&p| p != 0 && p != hello.node_id) else {
+            let from = theirs.and_then(|h| NodeId::from_wire(h.node_id()));
+            let Some(from) = from.filter(|&p| Some(p) != hello.node_id) else {
                 return;
             };
             while let Ok(frame) = read_valid_frame(&mut stream).await {

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
+use std::time::Duration;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
@@ -68,7 +69,7 @@ impl Service for Checker {
         let last_seq = self.last_seq.clone();
         Box::new(move |out| {
             for (session, seq) in &last_seq {
-                out.write_all(&session.to_le_bytes())?;
+                out.write_all(&session.0.to_le_bytes())?;
                 out.write_all(&seq.to_le_bytes())?;
             }
             Ok(())
@@ -78,7 +79,7 @@ impl Service for Checker {
         let mut bytes = Vec::new();
         from.read_to_end(&mut bytes)?;
         let word = |c: &[u8]| u64::from_le_bytes(c.try_into().unwrap());
-        self.last_seq = bytes.chunks(16).map(|c| (word(&c[..8]), word(&c[8..]))).collect();
+        self.last_seq = bytes.chunks(16).map(|c| (SessionId(word(&c[..8])), word(&c[8..]))).collect();
         Ok(())
     }
 }
@@ -115,14 +116,14 @@ fn drive(node: &mut Node<Checker>) {
 fuzz_target!(|steps: Vec<Step>| {
     let config = node::Config {
         raft: raft::Config {
-            id: 1,
-            members: vec![raft::Member { id: 1, peer: "p1".into(), client: "n1".into(), admin: "a1".into() }],
-            election_timeout_ns: 150 * MS,
-            heartbeat_ns: 50 * MS,
+            id: raft::NodeId(1),
+            members: vec![raft::Member { id: raft::NodeId(1), peer: "p1".into(), client: "n1".into(), admin: "a1".into() }],
+            election_timeout: Duration::from_millis(150),
+            heartbeat: Duration::from_millis(50),
             seed: 1,
             log_window_bytes: usize::MAX,
         },
-        session_timeout_ns: 1000 * MS,
+        session_timeout: Duration::from_millis(1000),
         // Small, so snapshots and a full egress ring are within reach.
         snapshot_every_entries: 16,
         egress_ring_entries: 4,

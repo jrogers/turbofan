@@ -38,7 +38,7 @@ impl Service for Counter {
         let counts = self.counts.clone();
         Box::new(move |out| {
             for (session, count) in &counts {
-                out.write_all(&session.to_le_bytes())?;
+                out.write_all(&session.0.to_le_bytes())?;
                 out.write_all(&count.to_le_bytes())?;
             }
             Ok(())
@@ -49,7 +49,7 @@ impl Service for Counter {
         let mut bytes = Vec::new();
         from.read_to_end(&mut bytes)?;
         let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
-        self.counts = words.as_chunks::<2>().0.iter().map(|&[session, count]| (session, count)).collect();
+        self.counts = words.as_chunks::<2>().0.iter().map(|&[session, count]| (SessionId(session), count)).collect();
         Ok(())
     }
 }

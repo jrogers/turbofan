@@ -57,13 +57,54 @@
 //! crashes first, it comes back a follower without them, and can't lead that term again.
 
 use std::collections::VecDeque;
+use std::fmt;
+use std::time::Duration;
 
 use crate::codec::{self, MAX_ENTRIES_PER_APPEND, Record};
 use crate::meta::Meta;
 use crate::wire;
 
 /// A cluster member's ID, from 1.
-pub type NodeId = u8;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(pub u8);
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl NodeId {
+    /// An ID off the wire, where 0 means none.
+    pub(crate) fn from_wire(id: u8) -> Option<Self> {
+        (id != 0).then_some(Self(id))
+    }
+
+    /// An ID for the wire, where 0 means none.
+    pub(crate) fn to_wire(id: Option<Self>) -> u8 {
+        id.map_or(0, |id| id.0)
+    }
+}
+
+impl From<NodeId> for u64 {
+    fn from(id: NodeId) -> Self {
+        Self::from(id.0)
+    }
+}
+
+impl From<NodeId> for usize {
+    fn from(id: NodeId) -> Self {
+        Self::from(id.0)
+    }
+}
+
+impl std::str::FromStr for NodeId {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
 
 /// The most members a cluster can have.
 pub const MAX_MEMBERS: usize = 7;
@@ -82,6 +123,19 @@ pub const MAX_READ_BYTES: usize = MAX_APPEND_BYTES;
 const _: () = assert!(MAX_APPEND_BYTES < codec::MAX_FRAME_BYTES - 1024);
 const _: () = assert!(MAX_IN_FLIGHT >= MAX_ENTRIES_PER_APPEND as u64);
 
+/// The longest timeout a configuration may give: far beyond any sensible one, and far enough
+/// under `u64::MAX` nanoseconds that the cluster's clock plus one can't overflow.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// `duration` in nanoseconds, as the core keeps time.
+///
+/// # Panics
+///
+/// If it's over 584 years, which [`MAX_TIMEOUT`] rules out for a configured one.
+pub(crate) fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("under 584 years")
+}
+
 /// Timing and identity.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -92,9 +146,9 @@ pub struct Config {
     /// members, they're what counts.
     pub members: Vec<Member>,
     /// A follower stands for election after hearing nothing for between this and twice this.
-    pub election_timeout_ns: u64,
+    pub election_timeout: Duration,
     /// How often a leader heartbeats; well under the election timeout.
-    pub heartbeat_ns: u64,
+    pub heartbeat: Duration,
     /// Seeds the election-timeout jitter; make it differ between nodes.
     pub seed: u64,
     /// The most bytes of applied records kept in memory. Older ones are read back from disk
@@ -339,7 +393,8 @@ impl Raft {
             "a node starting a cluster is one of its members"
         );
         assert!(config.members.iter().all(Member::fits), "addresses fit the wire");
-        assert!(config.heartbeat_ns * 2 < config.election_timeout_ns);
+        assert!(config.heartbeat * 2 < config.election_timeout);
+        assert!(config.election_timeout < MAX_TIMEOUT, "times in nanoseconds can't overflow");
         let (base_index, base_term) = snapshot.as_ref().map_or((0, 0), |s| (s.index, s.term));
         let base_members = snapshot.as_ref().map_or_else(|| config.members.clone(), |s| s.members.clone());
         let doubt = log.doubt.then_some(meta.term);
@@ -415,7 +470,7 @@ impl Raft {
     /// change is dropped ([`Outputs::change_failed`]). Refused (false) unless this node leads,
     /// has committed an entry of its term, no other change is under way, and there's room.
     pub fn add_member(&mut self, member: Member) -> bool {
-        if !self.can_change() || member.id == 0 || self.is_member(member.id) || self.members().len() >= MAX_MEMBERS {
+        if !self.can_change() || member.id.0 == 0 || self.is_member(member.id) || self.members().len() >= MAX_MEMBERS {
             return false;
         }
         if !member.fits() {
@@ -427,20 +482,23 @@ impl Raft {
         true
     }
 
-    /// Starts handing the leadership to member `to`, or with 0 to the member most caught up,
+    /// Starts handing the leadership to member `to`, or with `None` to the member most caught up,
     /// returning which. It's sent `TimeoutNow` once it has the log as it is now; this node gives
     /// up after an election timeout ([`Raft::transferring`] goes false while it still leads).
     /// Refused (`None`) unless this node leads, isn't transferring already, and `to` is another
     /// member, heard from within an election timeout.
-    pub fn transfer_leadership(&mut self, to: NodeId) -> Option<NodeId> {
+    pub fn transfer_leadership(&mut self, to: Option<NodeId>) -> Option<NodeId> {
         if self.role != Role::Leader || self.transfer.is_some() || self.stop.is_some() {
             return None;
         }
-        let alive = self.now.saturating_sub(self.config.election_timeout_ns);
+        let alive = self.now.saturating_sub(nanos(self.config.election_timeout));
         let voters = self.peers.iter().filter(|p| self.is_member(p.id) && p.heard_at >= alive);
-        let target =
-            if to == 0 { voters.max_by_key(|p| p.matched)?.id } else { voters.map(|p| p.id).find(|&id| id == to)? };
-        let (by, upto) = (self.now + self.config.election_timeout_ns, self.last_index());
+        let target = if let Some(to) = to {
+            voters.map(|p| p.id).find(|&id| id == to)?
+        } else {
+            voters.max_by_key(|p| p.matched)?.id
+        };
+        let (by, upto) = (self.now + nanos(self.config.election_timeout), self.last_index());
         self.transfer = Some(Transfer { to: target, by, upto, sent: false });
         self.try_transfer();
         Some(target)
@@ -453,7 +511,7 @@ impl Raft {
         if self.role != Role::Leader || self.transfer.is_some() || self.snapshot_index() < index {
             return false;
         }
-        let alive = self.now.saturating_sub(self.config.election_timeout_ns);
+        let alive = self.now.saturating_sub(nanos(self.config.election_timeout));
         let members = self.peers.iter().filter(|p| self.is_member(p.id));
         let (mut have, mut missing) = (usize::from(self.is_member(self.config.id)), false);
         for p in members {
@@ -469,7 +527,7 @@ impl Raft {
     /// Stops this node once it has the snapshot of `index` durable; as leader, after telling its
     /// peers to stop too, with its next two heartbeats.
     pub fn stop(&mut self, index: u64) {
-        let until = self.now + 2 * self.config.heartbeat_ns;
+        let until = self.now + 2 * nanos(self.config.heartbeat);
         self.stop = Some((index, until));
         self.heartbeat_at = self.now;
     }
@@ -713,7 +771,7 @@ impl Raft {
         self.now = now;
         match self.role {
             Role::Leader if now >= self.heartbeat_at => {
-                let timeout = self.config.election_timeout_ns;
+                let timeout = nanos(self.config.election_timeout);
                 let peers = self.peers.iter().filter(|p| self.is_member(p.id) && p.heard_at + timeout >= now);
                 let heard = peers.count() + usize::from(self.is_member(self.config.id));
                 if heard < self.quorum() {
@@ -730,7 +788,7 @@ impl Raft {
                         self.send(self.peers[i].id, &wire::Stop { term: self.meta.term, index });
                     }
                 }
-                self.heartbeat_at = now + self.config.heartbeat_ns;
+                self.heartbeat_at = now + nanos(self.config.heartbeat);
                 if self.catching_up.as_ref().is_some_and(|c| now > c.started + CATCH_UP_TIMEOUTS * timeout) {
                     self.drop_change();
                 }
@@ -825,7 +883,7 @@ impl Raft {
         let pre_vote = m.pre_vote() == 1;
         let granted = if pre_vote {
             let leader_alive = self.role == Role::Leader
-                || self.leader_seen_at.is_some_and(|at| at + self.config.election_timeout_ns > now);
+                || self.leader_seen_at.is_some_and(|at| at + nanos(self.config.election_timeout) > now);
             m.term() > self.meta.term && up_to_date && !leader_alive
         } else {
             if m.term() > self.meta.term {
@@ -983,7 +1041,7 @@ impl Raft {
                 let prev = self.log.first - 1;
                 let heartbeat = wire::AppendEntries {
                     term: self.meta.term,
-                    leader: self.config.id,
+                    leader: self.config.id.0,
                     prev_index: prev,
                     prev_term: self.base_term,
                     commit: self.commit.min(prev),
@@ -1020,7 +1078,7 @@ impl Raft {
         }
         let append = wire::AppendEntries {
             term: self.meta.term,
-            leader: self.config.id,
+            leader: self.config.id.0,
             prev_index: next - 1,
             prev_term,
             commit: self.commit,
@@ -1082,7 +1140,7 @@ impl Raft {
                 .members
                 .iter()
                 .map(|m| wire::InstallSnapshotMember {
-                    id: m.id,
+                    id: m.id.0,
                     peer: m.peer.as_bytes(),
                     client: m.client.as_bytes(),
                     admin: m.admin.as_bytes(),
@@ -1090,7 +1148,7 @@ impl Raft {
                 .collect();
             let message = wire::InstallSnapshot {
                 term: self.meta.term,
-                leader: self.config.id,
+                leader: self.config.id.0,
                 last_index: snapshot.index,
                 last_term: snapshot.term,
                 offset: s.sent,
@@ -1150,7 +1208,7 @@ impl Raft {
         }
         // A first chunk starts a snapshot, unless it's one already arriving: then it's a resend.
         if m.offset() == 0 && self.incoming.as_ref().is_none_or(|s| s.index != m.last_index()) {
-            let members = m.member().map(|a| Member::read(a.id(), a.peer(), a.client(), a.admin())).collect();
+            let members = m.member().map(|a| Member::read(NodeId(a.id()), a.peer(), a.client(), a.admin())).collect();
             let (index, term, checksum) = (m.last_index(), m.last_term(), m.checksum());
             self.incoming = Some(Snapshot { index, term, len: 0, checksum, members });
         }
@@ -1289,7 +1347,7 @@ impl Raft {
         let Some(c) = self.catching_up.as_mut().filter(|c| c.member.id == id && matched >= c.round_end) else {
             return;
         };
-        if self.now - c.round_start > self.config.election_timeout_ns {
+        if self.now - c.round_start > nanos(self.config.election_timeout) {
             (c.round_start, c.round_end) = (self.now, self.log.last());
             return;
         }
@@ -1317,7 +1375,7 @@ impl Raft {
         let addrs: Vec<wire::MembersMember<'_>> = members
             .iter()
             .map(|m| wire::MembersMember {
-                id: m.id,
+                id: m.id.0,
                 peer: m.peer.as_bytes(),
                 client: m.client.as_bytes(),
                 admin: m.admin.as_bytes(),
@@ -1359,7 +1417,7 @@ impl Raft {
         self.reset_election(now);
         let request = wire::RequestVote {
             term: self.meta.term + 1,
-            candidate: self.config.id,
+            candidate: self.config.id.0,
             last_index: self.last_index(),
             last_term: self.last_term(),
             pre_vote: 1,
@@ -1382,7 +1440,7 @@ impl Raft {
         self.reset_election(now);
         let request = wire::RequestVote {
             term: self.meta.term,
-            candidate: self.config.id,
+            candidate: self.config.id.0,
             last_index: self.last_index(),
             last_term: self.last_term(),
             pre_vote: 0,
@@ -1520,7 +1578,7 @@ impl Raft {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
-        let timeout = self.config.election_timeout_ns;
+        let timeout = nanos(self.config.election_timeout);
         self.election_at = now + timeout + self.rng % timeout;
     }
 }
@@ -1614,7 +1672,7 @@ impl Entries {
             self.terms.push((record.index, record.term));
         }
         if let Ok((wire::Decoded::Members(m), _)) = wire::decode(record.payload) {
-            let members = m.member().map(|a| Member::read(a.id(), a.peer(), a.client(), a.admin())).collect();
+            let members = m.member().map(|a| Member::read(NodeId(a.id()), a.peer(), a.client(), a.admin())).collect();
             self.configs.push((record.index, members));
         }
         let mut bytes = Vec::with_capacity(codec::RECORD_HEADER + record.payload.len());
@@ -1704,16 +1762,16 @@ mod tests {
 
     const MS: u64 = 1_000_000;
 
-    fn member(id: NodeId) -> Member {
-        Member { id, peer: format!("p{id}"), client: format!("c{id}"), admin: format!("a{id}") }
+    fn member(id: u8) -> Member {
+        Member { id: NodeId(id), peer: format!("p{id}"), client: format!("c{id}"), admin: format!("a{id}") }
     }
 
-    fn config(id: NodeId, members: &[NodeId]) -> Config {
+    fn config(id: u8, members: &[u8]) -> Config {
         Config {
-            id,
+            id: NodeId(id),
             members: members.iter().map(|&m| member(m)).collect(),
-            election_timeout_ns: 150 * MS,
-            heartbeat_ns: 50 * MS,
+            election_timeout: Duration::from_millis(150),
+            heartbeat: Duration::from_millis(50),
             seed: u64::from(id),
             log_window_bytes: usize::MAX,
         }
@@ -1726,7 +1784,7 @@ mod tests {
         assert_eq!((raft.role(), raft.term()), (Role::Leader, 1));
         let out = raft.take_outputs();
         assert!(out.became_leader);
-        assert_eq!(out.persist, [Persist::Meta(Meta { term: 1, vote: Some(1) })]);
+        assert_eq!(out.persist, [Persist::Meta(Meta { term: 1, vote: Some(NodeId(1)) })]);
         assert_eq!(raft.propose(b"a"), Some(1));
         assert_eq!(raft.commit_index(), 0, "not durable yet");
         raft.on_persisted(raft.log_end());
@@ -1774,10 +1832,10 @@ mod tests {
     }
 
     /// Delivers `sends` from `from`, and everything they cause, between the nodes in `up`.
-    fn deliver(rafts: &mut [Raft], up: &[NodeId], from: NodeId, sends: Vec<(NodeId, Vec<u8>)>, now: u64) {
-        let mut queue: Vec<_> = sends.into_iter().map(|(to, frame)| (from, to, frame)).collect();
+    fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Vec<u8>)>, now: u64) {
+        let mut queue: Vec<_> = sends.into_iter().map(|(to, frame)| (NodeId(from), to, frame)).collect();
         while let Some((from, to, frame)) = queue.pop() {
-            if !up.contains(&to) {
+            if !up.contains(&to.0) {
                 continue;
             }
             let raft = &mut rafts[usize::from(to) - 1];
@@ -1789,7 +1847,7 @@ mod tests {
     /// Times `id` out from `now` and runs its election among `up`, retrying as a real node
     /// would: a stale leader first stands down, and a pre-vote refused for a stale term teaches
     /// it the term.
-    fn elect(rafts: &mut [Raft], up: &[NodeId], id: NodeId, now: u64) {
+    fn elect(rafts: &mut [Raft], up: &[u8], id: u8, now: u64) {
         let mut now = now;
         for _ in 0..3 {
             let raft = &mut rafts[usize::from(id) - 1];
@@ -1804,8 +1862,8 @@ mod tests {
         panic!("node {id} wasn't elected");
     }
 
-    fn cluster(n: NodeId) -> Vec<Raft> {
-        let members: Vec<NodeId> = (1..=n).collect();
+    fn cluster(n: u8) -> Vec<Raft> {
+        let members: Vec<u8> = (1..=n).collect();
         members
             .iter()
             .map(|&id| Raft::new(config(id, &members), Meta::default(), None, Entries::default(), 0))
@@ -1824,10 +1882,10 @@ mod tests {
         let out = rafts[0].take_outputs();
         let end = rafts[0].log_end();
         assert!(matches!(out.persist[..], [Persist::Append(_)]), "{:?}", out.persist);
-        let (_, append) = out.appends.into_iter().find(|&(to, _)| to == 2).expect("an append for node 2");
-        rafts[1].on_message(1, &decode(&append), now);
+        let (_, append) = out.appends.into_iter().find(|&(to, _)| to == NodeId(2)).expect("an append for node 2");
+        rafts[1].on_message(NodeId(1), &decode(&append), now);
         for (_, ack) in flush(&mut rafts[1]) {
-            rafts[0].on_message(2, &decode(&ack), now);
+            rafts[0].on_message(NodeId(2), &decode(&ack), now);
         }
         assert_eq!(rafts[0].commit_index(), committed, "node 2 alone is one of three");
         assert_eq!(end.0, index);
@@ -1877,9 +1935,9 @@ mod tests {
         let mut frame = Vec::new();
         let request = wire::RequestVote { term: 5, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0 };
         codec::encode_frame(&request, &mut frame).unwrap();
-        raft.on_message(2, &decode(&frame), 0);
+        raft.on_message(NodeId(2), &decode(&frame), 0);
         let out = raft.take_outputs();
-        assert_eq!(out.persist.last(), Some(&Persist::Meta(Meta { term: 5, vote: Some(2) })));
+        assert_eq!(out.persist.last(), Some(&Persist::Meta(Meta { term: 5, vote: Some(NodeId(2)) })));
         let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
         assert_eq!((vote.term(), vote.granted()), (5, 1));
 
@@ -1887,7 +1945,7 @@ mod tests {
         let request = wire::RequestVote { term: 5, candidate: 3, last_index: 1, last_term: 1, pre_vote: 0 };
         frame.clear();
         codec::encode_frame(&request, &mut frame).unwrap();
-        raft.on_message(3, &decode(&frame), 0);
+        raft.on_message(NodeId(3), &decode(&frame), 0);
         let out = raft.take_outputs();
         let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
         assert_eq!(vote.granted(), 0);
@@ -1903,7 +1961,7 @@ mod tests {
             let mut frame = Vec::new();
             let request = wire::RequestVote { term: 5, candidate: 1, last_index: 9, last_term: 4, pre_vote };
             codec::encode_frame(&request, &mut frame).unwrap();
-            raft.on_message(1, &decode(&frame), 0);
+            raft.on_message(NodeId(1), &decode(&frame), 0);
             let out = raft.take_outputs();
             let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
             assert_eq!(vote.granted(), 0, "pre-vote {pre_vote}");
@@ -1958,7 +2016,7 @@ mod tests {
             };
             let mut frame = Vec::new();
             codec::encode_frame(&append, &mut frame).unwrap();
-            raft.on_message(1, &decode(&frame), 0);
+            raft.on_message(NodeId(1), &decode(&frame), 0);
             raft.take_outputs();
             raft.in_doubt()
         };
@@ -1976,12 +2034,12 @@ mod tests {
         for (from, doubt) in [(2, 1), (3, 1), (4, 0)] {
             let mut frame = Vec::new();
             codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt }, &mut frame).unwrap();
-            raft.on_message(from, &decode(&frame), 0);
+            raft.on_message(NodeId(from), &decode(&frame), 0);
         }
         assert_eq!(raft.role(), Role::PreCandidate, "four of five, two in doubt");
         let mut frame = Vec::new();
         codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt: 0 }, &mut frame).unwrap();
-        raft.on_message(5, &decode(&frame), 0);
+        raft.on_message(NodeId(5), &decode(&frame), 0);
         assert_eq!(raft.role(), Role::Candidate, "every member");
     }
 
@@ -1994,7 +2052,7 @@ mod tests {
         let mut frame = Vec::new();
         let request = wire::RequestVote { term: 2, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0 };
         codec::encode_frame(&request, &mut frame).unwrap();
-        raft.on_message(2, &decode(&frame), 0);
+        raft.on_message(NodeId(2), &decode(&frame), 0);
         let out = raft.take_outputs();
         let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
         assert_eq!((vote.granted(), vote.doubt()), (1, Some(1)));
@@ -2018,7 +2076,7 @@ mod tests {
             let mut frame = Vec::new();
             let request = wire::RequestVote { term: 3, candidate: 2, last_index, last_term, pre_vote: 0 };
             codec::encode_frame(&request, &mut frame).unwrap();
-            raft.on_message(2, &decode(&frame), 0);
+            raft.on_message(NodeId(2), &decode(&frame), 0);
             let out = raft.take_outputs();
             let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
             assert_eq!(vote.granted(), 0, "({last_index}, {last_term})");
@@ -2042,7 +2100,7 @@ mod tests {
             last_index: 3,
         };
         codec::encode_frame(&append, &mut frame).unwrap();
-        raft.on_message(2, &decode(&frame), 0);
+        raft.on_message(NodeId(2), &decode(&frame), 0);
         let out = raft.take_outputs();
         let wire::Decoded::AppendAck(ack) = decode(&out.sends[0].1) else { panic!("not an ack") };
         assert_eq!((ack.success(), ack.index()), (1, 1));
@@ -2054,7 +2112,7 @@ mod tests {
     #[test]
     fn an_earlier_batch_durable_does_not_count_entries_that_replaced_its_own() {
         let mut raft = Raft::new(config(3, &[1, 2, 3]), Meta { term: 1, vote: None }, None, entries(&[1]), 0);
-        let mut append = |term: u64, leader: NodeId, records: &[(u64, u64)]| {
+        let mut append = |term: u64, leader: u8, records: &[(u64, u64)]| {
             let mut bytes = Vec::new();
             for &(index, term) in records {
                 Record { term, index, payload: b"x" }.encode_into(&mut bytes);
@@ -2072,7 +2130,7 @@ mod tests {
             };
             let mut frame = Vec::new();
             codec::encode_frame(&append, &mut frame).unwrap();
-            raft.on_message(leader, &decode(&frame), 0);
+            raft.on_message(NodeId(leader), &decode(&frame), 0);
             raft.take_outputs();
             raft.log_end()
         };
@@ -2102,7 +2160,7 @@ mod tests {
             };
             let mut frame = Vec::new();
             codec::encode_frame(&append, &mut frame).unwrap();
-            raft.on_message(1, &decode(&frame), 0);
+            raft.on_message(NodeId(1), &decode(&frame), 0);
             raft.take_outputs();
             raft.commit_index()
         };
@@ -2125,7 +2183,7 @@ mod tests {
         };
         let mut frame = Vec::new();
         codec::encode_frame(&chunk, &mut frame).unwrap();
-        raft.on_message(1, &decode(&frame), 0);
+        raft.on_message(NodeId(1), &decode(&frame), 0);
         raft.take_outputs()
     }
 
@@ -2188,10 +2246,10 @@ mod tests {
         let now = rafts[0].next_deadline();
         rafts[0].on_tick(now);
         let out = rafts[0].take_outputs();
-        let (_, heartbeat) = out.appends.into_iter().find(|&(to, _)| to == 3).expect("a heartbeat for node 3");
-        rafts[2].on_message(1, &decode(&heartbeat), now);
+        let (_, heartbeat) = out.appends.into_iter().find(|&(to, _)| to == NodeId(3)).expect("a heartbeat for node 3");
+        rafts[2].on_message(NodeId(1), &decode(&heartbeat), now);
         for (_, ack) in flush(&mut rafts[2]) {
-            rafts[0].on_message(3, &decode(&ack), now);
+            rafts[0].on_message(NodeId(3), &decode(&ack), now);
         }
         assert_eq!(rafts[0].take_outputs().reads, [1]);
         rafts[0].on_read(&disk);
@@ -2229,7 +2287,12 @@ mod tests {
             let reads = out.snapshot_reads.iter().map(|&(_, offset)| offset).collect::<Vec<_>>();
             (
                 reads,
-                raft.take_outputs().sends.into_iter().filter(|&(to, _)| to == 2).map(|(_, f)| f).collect::<Vec<_>>(),
+                raft.take_outputs()
+                    .sends
+                    .into_iter()
+                    .filter(|&(to, _)| to == NodeId(2))
+                    .map(|(_, f)| f)
+                    .collect::<Vec<_>>(),
             )
         };
         let (reads, chunks) = send_chunks(&mut rafts[0]);
@@ -2238,9 +2301,9 @@ mod tests {
 
         let deliver_chunks = |rafts: &mut [Raft], chunks: &[&Vec<u8>], now: u64| {
             for chunk in chunks {
-                rafts[1].on_message(1, &decode(chunk), now);
+                rafts[1].on_message(NodeId(1), &decode(chunk), now);
                 for (_, ack) in flush(&mut rafts[1]) {
-                    rafts[0].on_message(2, &decode(&ack), now);
+                    rafts[0].on_message(NodeId(2), &decode(&ack), now);
                 }
             }
         };
@@ -2264,12 +2327,12 @@ mod tests {
         assert_eq!(rafts[1].snapshot_index(), 10, "installed");
     }
 
-    fn ids(members: &[Member]) -> Vec<NodeId> {
-        members.iter().map(|m| m.id).collect()
+    fn ids(members: &[Member]) -> Vec<u8> {
+        members.iter().map(|m| m.id.0).collect()
     }
 
     /// Heartbeats from `id`, and all they cause, among `up`.
-    fn heartbeat(rafts: &mut [Raft], up: &[NodeId], id: NodeId) -> u64 {
+    fn heartbeat(rafts: &mut [Raft], up: &[u8], id: u8) -> u64 {
         let raft = &mut rafts[usize::from(id) - 1];
         let now = raft.next_deadline();
         raft.on_tick(now);
@@ -2339,7 +2402,7 @@ mod tests {
         rafts[0].propose(b"x");
         let sends = flush(&mut rafts[0]);
         deliver(&mut rafts, &all, 1, sends, 1000 * MS);
-        assert!(rafts[0].remove_member(1));
+        assert!(rafts[0].remove_member(NodeId(1)));
         let sends = flush(&mut rafts[0]);
         deliver(&mut rafts, &all, 1, sends, 1000 * MS);
         assert_eq!(rafts[0].role(), Role::Follower);
@@ -2359,16 +2422,16 @@ mod tests {
         rafts[0].propose(b"x");
         let sends = flush(&mut rafts[0]);
         deliver(&mut rafts, &[1, 2], 1, sends, 1000 * MS);
-        assert_eq!(rafts[0].transfer_leadership(1), None, "not to itself");
-        assert_eq!(rafts[0].transfer_leadership(9), None, "not to a node that isn't a member");
-        assert_eq!(rafts[0].transfer_leadership(0), Some(2), "the one with the log");
-        assert_eq!(rafts[0].transfer_leadership(3), None, "one at a time");
+        assert_eq!(rafts[0].transfer_leadership(Some(NodeId(1))), None, "not to itself");
+        assert_eq!(rafts[0].transfer_leadership(Some(NodeId(9))), None, "not to a node that isn't a member");
+        assert_eq!(rafts[0].transfer_leadership(None), Some(NodeId(2)), "the one with the log");
+        assert_eq!(rafts[0].transfer_leadership(Some(NodeId(3))), None, "one at a time");
         let sends = flush(&mut rafts[0]);
         deliver(&mut rafts, &all, 1, sends, 1000 * MS);
         assert_eq!((rafts[1].role(), rafts[1].term()), (Role::Leader, 2));
         assert_eq!(rafts[0].role(), Role::Follower);
         heartbeat(&mut rafts, &all, 2);
-        assert_eq!(rafts[0].leader(), Some(2), "the old leader hears from the new");
+        assert_eq!(rafts[0].leader(), Some(NodeId(2)), "the old leader hears from the new");
     }
 
     /// A `Members` entry takes effect when it's appended, and is undone if it's truncated.
@@ -2404,7 +2467,7 @@ mod tests {
         };
         let mut frame = Vec::new();
         codec::encode_frame(&append, &mut frame).unwrap();
-        raft.on_message(1, &decode(&frame), 0);
+        raft.on_message(NodeId(1), &decode(&frame), 0);
         assert_eq!(ids(raft.members()), [1, 3]);
         assert_eq!(raft.take_outputs().peers.map(|m| ids(&m)), Some(vec![1, 3]));
     }

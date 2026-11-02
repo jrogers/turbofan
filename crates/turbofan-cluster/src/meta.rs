@@ -9,6 +9,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::codec::checksum;
+use crate::raft::NodeId;
 
 /// generation · term · vote · checksum.
 const SLOT: usize = 32;
@@ -19,7 +20,7 @@ pub struct Meta {
     /// The latest term the node has seen.
     pub term: u64,
     /// The node it voted for in `term`, if any.
-    pub vote: Option<u8>,
+    pub vote: Option<NodeId>,
 }
 
 /// The file holding a [`Meta`].
@@ -71,7 +72,7 @@ impl MetaFile {
         let mut slot = [0; SLOT];
         slot[..8].copy_from_slice(&generation.to_le_bytes());
         slot[8..16].copy_from_slice(&meta.term.to_le_bytes());
-        slot[16..24].copy_from_slice(&meta.vote.map_or(0, |v| u64::from(v) + 1).to_le_bytes());
+        slot[16..24].copy_from_slice(&meta.vote.map_or(0, |v| u64::from(v.0) + 1).to_le_bytes());
         let sum = checksum(&slot[..24]);
         slot[24..].copy_from_slice(&sum.to_le_bytes());
         let at = if generation.is_multiple_of(2) { 0 } else { SLOT as u64 };
@@ -91,7 +92,7 @@ fn parse(slot: &[u8]) -> Option<(u64, Meta)> {
     }
     let vote = match word(2) {
         0 => None,
-        v => Some(u8::try_from(v - 1).ok()?),
+        v => Some(NodeId(u8::try_from(v - 1).ok()?)),
     };
     Some((word(0), Meta { term: word(1), vote }))
 }
@@ -106,7 +107,7 @@ mod tests {
         let path = dir.path().join("meta");
         let (mut file, meta) = MetaFile::open(&path).unwrap();
         assert_eq!(meta, Meta::default());
-        file.save(Meta { term: 3, vote: Some(2) }).unwrap();
+        file.save(Meta { term: 3, vote: Some(NodeId(2)) }).unwrap();
         file.save(Meta { term: 4, vote: None }).unwrap();
         drop(file);
         assert_eq!(MetaFile::open(&path).unwrap().1, Meta { term: 4, vote: None });
@@ -118,15 +119,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("meta");
         let (mut file, _) = MetaFile::open(&path).unwrap();
-        file.save(Meta { term: 3, vote: Some(2) }).unwrap();
-        file.save(Meta { term: 4, vote: Some(1) }).unwrap();
+        file.save(Meta { term: 3, vote: Some(NodeId(2)) }).unwrap();
+        file.save(Meta { term: 4, vote: Some(NodeId(1)) }).unwrap();
         let whole = std::fs::read(&path).unwrap();
         // Generation 2 went to slot 0. Tear it: any of its bytes left as zero.
         for byte in 0..SLOT {
             let mut torn = whole.clone();
             torn[byte] ^= 0xFF;
             std::fs::write(&path, &torn).unwrap();
-            assert_eq!(MetaFile::open(&path).unwrap().1, Meta { term: 3, vote: Some(2) }, "byte {byte}");
+            assert_eq!(MetaFile::open(&path).unwrap().1, Meta { term: 3, vote: Some(NodeId(2)) }, "byte {byte}");
         }
     }
 }

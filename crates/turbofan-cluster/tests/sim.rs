@@ -38,6 +38,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::io::{self, Read};
+use std::time::Duration;
 
 use turbofan_cluster::client::{self, Client};
 use turbofan_cluster::codec::{self, Record};
@@ -170,19 +171,19 @@ impl Service for Echo {
             ctx.propose(format!("{session} {k}").as_bytes()).unwrap();
         }
         if k.is_multiple_of(TIMER_EVERY) {
-            ctx.schedule_timer(session * TIMER_SPACE + k, ctx.now() + 30 * MS);
+            ctx.schedule_timer(session.0 * TIMER_SPACE + k, ctx.now() + 30 * MS);
         }
     }
 
     fn on_proposal(&mut self, ctx: &mut Ctx, payload: &[u8]) {
         let text = std::str::from_utf8(payload).unwrap();
         let (session, k) = text.split_once(' ').unwrap();
-        ctx.send(session.parse().unwrap(), format!("p{k}").as_bytes()).unwrap();
+        ctx.send(SessionId(session.parse().unwrap()), format!("p{k}").as_bytes()).unwrap();
     }
 
     fn on_timer(&mut self, ctx: &mut Ctx, id: u64) {
         self.fired += 1;
-        ctx.send(id / TIMER_SPACE, format!("t{}", id % TIMER_SPACE).as_bytes()).unwrap();
+        ctx.send(SessionId(id / TIMER_SPACE), format!("t{}", id % TIMER_SPACE).as_bytes()).unwrap();
     }
 
     fn snapshot(&self) -> SnapshotWriter {
@@ -191,7 +192,7 @@ impl Service for Echo {
             out.write_all(&fired.to_le_bytes())?;
             out.write_all(&as_new.to_le_bytes())?;
             for (session, last) in &last {
-                out.write_all(&session.to_le_bytes())?;
+                out.write_all(&session.0.to_le_bytes())?;
                 out.write_all(&last.to_le_bytes())?;
             }
             Ok(())
@@ -203,7 +204,7 @@ impl Service for Echo {
         from.read_to_end(&mut bytes)?;
         let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
         (self.fired, self.as_new) = (words[0], words[1]);
-        self.last = words[2..].as_chunks::<2>().0.iter().map(|&[session, last]| (session, last)).collect();
+        self.last = words[2..].as_chunks::<2>().0.iter().map(|&[session, last]| (SessionId(session), last)).collect();
         Ok(())
     }
 }
@@ -650,11 +651,11 @@ impl Sim {
         let window = [0, 2048, usize::MAX][usize::try_from(rng.below(3)).unwrap()];
         let chunk = if rng.one_in(2) { 4096 } else { MAX_READ_BYTES };
         let segment_bytes = if rng.one_in(4) { MAX_SEGMENT_BYTES } else { 4096 << rng.below(4) };
-        let members: Vec<NodeId> = (1..=7).collect();
+        let members: Vec<NodeId> = (1..=7).map(NodeId).collect();
         let addrs: Vec<String> = members.iter().map(|id| format!("n{id}")).collect();
         let clients = (0..CLIENTS)
             .map(|c| SimClient {
-                client: Client::new(addrs.clone(), format!("client {c}").into_bytes(), 500 * MS),
+                client: Client::new(addrs.clone(), format!("client {c}").into_bytes(), Duration::from_millis(500)),
                 conn: None,
                 dialing: false,
                 tick_at: None,
@@ -852,10 +853,10 @@ impl Sim {
         if members.len() < MAX_MEMBERS && (members.len() <= 3 || self.rng.one_in(2)) {
             let m = member(self.rng.pick(&others));
             let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
-            self.admin(&turbofan_cluster::wire::AddMember { request_id, id: m.id, peer, client, admin });
+            self.admin(&turbofan_cluster::wire::AddMember { request_id, id: m.id.0, peer, client, admin });
         } else {
             let id = self.rng.pick(&members);
-            self.admin(&turbofan_cluster::wire::RemoveMember { request_id, id });
+            self.admin(&turbofan_cluster::wire::RemoveMember { request_id, id: id.0 });
         }
     }
 
@@ -1379,8 +1380,8 @@ impl Sim {
         let members = self.final_members().unwrap_or_default();
         let to = match self.rng.below(4) {
             0 | 1 => 0,
-            2 if !members.is_empty() => self.rng.pick(&members),
-            _ => self.rng.pick(&self.members),
+            2 if !members.is_empty() => self.rng.pick(&members).0,
+            _ => self.rng.pick(&self.members).0,
         };
         let request_id = self.rng.next();
         self.admin(&turbofan_cluster::wire::TransferLeadership { request_id, to });
@@ -1469,7 +1470,7 @@ impl Sim {
         };
         if members.contains(&id) {
             let request_id = self.rng.next();
-            self.admin(&turbofan_cluster::wire::RemoveMember { request_id, id });
+            self.admin(&turbofan_cluster::wire::RemoveMember { request_id, id: id.0 });
             self.schedule(500 * MS, Event::Replace(id));
             return;
         }
@@ -1561,17 +1562,17 @@ impl Sim {
         let config = node::Config {
             raft: Config {
                 id,
-                members: if id <= self.initial && !sim_node.wiped {
-                    (1..=self.initial).map(member).collect()
+                members: if id.0 <= self.initial && !sim_node.wiped {
+                    (1..=self.initial).map(|id| member(NodeId(id))).collect()
                 } else {
                     Vec::new()
                 },
-                election_timeout_ns: 150 * MS,
-                heartbeat_ns: 50 * MS,
+                election_timeout: Duration::from_millis(150),
+                heartbeat: Duration::from_millis(50),
                 seed: self.seed ^ (u64::from(id) << 32) ^ sim_node.incarnation,
                 log_window_bytes: self.window,
             },
-            session_timeout_ns: 10_000 * MS,
+            session_timeout: Duration::from_millis(10_000),
             snapshot_every_entries: 300,
             // Covers a client's messages in flight, each with its response and some a timer's.
             egress_ring_entries: 2 * client::MAX_UNACKED,
