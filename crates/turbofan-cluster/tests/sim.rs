@@ -1575,6 +1575,7 @@ impl Sim {
                 heartbeat: Duration::from_millis(50),
                 seed: self.seed ^ (u64::from(id) << 32) ^ sim_node.incarnation,
                 log_window_bytes: self.window,
+                max_uncommitted_bytes: 64 << 20,
             },
             session_timeout: Duration::from_millis(10_000),
             snapshot_every_entries: 300,

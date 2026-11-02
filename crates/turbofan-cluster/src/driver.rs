@@ -37,7 +37,8 @@ use crate::raft::{Entries, MAX_READ_BYTES, Member, NodeId, Persist, SnapshotRead
 use crate::tls::{self, Acceptor as TlsAcceptor, ClientTls, NodeTls};
 use crate::{snapshot, wire};
 
-/// Inputs waiting for the node: past this, connections wait to hand theirs over.
+/// Inputs waiting for the node, from clients and from the rest: past this, connections wait to
+/// hand theirs over.
 const MAX_QUEUED_INPUTS: usize = 4096;
 /// Inputs taken into one batch before persisting it.
 const MAX_BATCH_INPUTS: usize = 1024;
@@ -126,6 +127,8 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
         TcpListener::bind(config.admin_listen).await?,
     );
     let (inputs, rx) = mpsc::channel(MAX_QUEUED_INPUTS);
+    // Clients' apart, so a backlogged leader can stop taking them and still take peers' acks.
+    let (client_inputs, client_rx) = mpsc::channel(MAX_QUEUED_INPUTS);
     // Every task is in here, so they all stop when `serve` does.
     let mut tasks = JoinSet::new();
     let hello = Hello { service_id: config.service_id, node_id: Some(id) };
@@ -134,7 +137,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     tasks.spawn(accept_peers(peer_listener, hello, peer_token.clone(), acceptor(|t| &t.peer), inputs.clone()));
     let next_conn = Arc::new(AtomicU64::new(1));
     let (role, tls_client) = (wire::Role::Client, acceptor(|t| &t.client));
-    tasks.spawn(accept(client_listener, role, hello, None, tls_client, next_conn.clone(), inputs.clone()));
+    tasks.spawn(accept(client_listener, role, hello, None, tls_client, next_conn.clone(), client_inputs));
     let token = config.admin_token.as_deref().map(Arc::from);
     let (role, tls_admin) = (wire::Role::Admin, acceptor(|t| &t.admin));
     tasks.spawn(accept(admin_listener, role, hello, token, tls_admin, next_conn, inputs.clone()));
@@ -158,7 +161,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     };
     let peers = core.node.raft().peers();
     core.dial(&peers);
-    core.run(rx).await
+    core.run(rx, client_rx).await
 }
 
 /// The node, and everything it sends through.
@@ -190,7 +193,7 @@ struct Core<S> {
 }
 
 impl<S: Service + 'static> Core<S> {
-    async fn run(mut self, mut rx: mpsc::Receiver<Input>) -> io::Result<()> {
+    async fn run(mut self, mut rx: mpsc::Receiver<Input>, mut client_rx: mpsc::Receiver<Input>) -> io::Result<()> {
         loop {
             self.flush();
             if self.published.elapsed() >= METRICS_EVERY {
@@ -214,6 +217,19 @@ impl<S: Service + 'static> Core<S> {
                     self.handle(input)?;
                     for _ in 1..MAX_BATCH_INPUTS {
                         let Ok(input) = rx.try_recv() else { break };
+                        self.handle(input)?;
+                    }
+                }
+                // A backlogged leader leaves clients waiting, so TCP holds them back, until what
+                // it has proposed commits.
+                input = client_rx.recv(), if take_inputs && !self.node.raft().backlogged() => {
+                    let Some(input) = input else { return Ok(()) };
+                    self.handle(input)?;
+                    for _ in 1..MAX_BATCH_INPUTS {
+                        if self.node.raft().backlogged() {
+                            break;
+                        }
+                        let Ok(input) = client_rx.try_recv() else { break };
                         self.handle(input)?;
                     }
                 }

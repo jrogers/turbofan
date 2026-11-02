@@ -122,6 +122,7 @@ fuzz_target!(|steps: Vec<Step>| {
             heartbeat: Duration::from_millis(50),
             seed: 1,
             log_window_bytes: usize::MAX,
+            max_uncommitted_bytes: usize::MAX,
         },
         session_timeout: Duration::from_millis(1000),
         // Small, so snapshots and a full egress ring are within reach.

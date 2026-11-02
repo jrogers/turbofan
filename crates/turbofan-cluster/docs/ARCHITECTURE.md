@@ -97,7 +97,7 @@ flowchart TB
     clients --> clientl
     clients --> adminl
     listeners -- "spawn" --> conns
-    conns -- "frames, over one bounded channel" --> driver
+    conns -- "frames, over two bounded channels" --> driver
     driver -- "frames for each peer" --> dials
     dials --> peers
     driver -- "frames for each connection" --> conns
@@ -108,8 +108,12 @@ flowchart TB
 ```
 
 - **One task owns the node** and does everything in order. Connection tasks only frame bytes and
-  check handshakes, and pass whole frames to it over one bounded channel (`MAX_QUEUED_INPUTS`).
-  It takes up to `MAX_BATCH_INPUTS` at a time.
+  check handshakes, and pass whole frames to it over bounded channels (`MAX_QUEUED_INPUTS`), one
+  for clients and one for the rest. It takes up to `MAX_BATCH_INPUTS` at a time.
+- **A backlogged leader holds clients back.** Once its proposals not yet committed come to
+  `max_uncommitted_bytes`, the node takes nothing more from clients until they commit: their
+  channel fills, their connection tasks wait, and TCP pushes back on them. Peers' acks still
+  come in, so the backlog clears.
 - **Peer connections go one way.** Each node dials every other to send to it, and reads what
   arrives on the connections dialled to it. A frame a slow or absent peer can't take is dropped:
   Raft sends it again.

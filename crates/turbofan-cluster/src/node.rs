@@ -274,8 +274,9 @@ pub struct Config {
 impl Config {
     /// The defaults for node `id` of a cluster that starts with `members`, this node among them,
     /// or of none to join a running one: a 300 ms election timeout, a 50 ms heartbeat, 64 MiB of
-    /// applied records kept in memory, a 10 s session timeout, a snapshot every 100,000 entries,
-    /// and 8192 responses kept per session. Change any field after.
+    /// applied records kept in memory, clients held back past 64 MiB of proposals uncommitted, a
+    /// 10 s session timeout, a snapshot every 100,000 entries, and 8192 responses kept per
+    /// session. Change any field after.
     #[must_use]
     pub fn new(id: NodeId, members: Vec<Member>) -> Self {
         Self {
@@ -286,6 +287,7 @@ impl Config {
                 heartbeat: Duration::from_millis(50),
                 seed: u64::from(id),
                 log_window_bytes: 64 << 20,
+                max_uncommitted_bytes: 64 << 20,
             },
             session_timeout: Duration::from_secs(10),
             snapshot_every_entries: 100_000,
@@ -1386,6 +1388,7 @@ mod tests {
                 heartbeat: Duration::from_millis(50),
                 seed: 1,
                 log_window_bytes: usize::MAX,
+                max_uncommitted_bytes: usize::MAX,
             },
             session_timeout: Duration::from_nanos(TIMEOUT),
             snapshot_every_entries: 1000,
@@ -1550,6 +1553,7 @@ mod tests {
                 heartbeat: Duration::from_millis(50),
                 seed: 1,
                 log_window_bytes: usize::MAX,
+                max_uncommitted_bytes: usize::MAX,
             },
             session_timeout: Duration::from_nanos(TIMEOUT),
             snapshot_every_entries: 1000,

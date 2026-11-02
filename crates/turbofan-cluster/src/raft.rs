@@ -154,6 +154,9 @@ pub struct Config {
     /// The most bytes of applied records kept in memory. Older ones are read back from disk
     /// when a lagging follower needs them.
     pub log_window_bytes: usize,
+    /// A leader with this many bytes of its proposals not yet committed is backlogged
+    /// ([`Raft::backlogged`]): its driver takes no more from clients until they commit.
+    pub max_uncommitted_bytes: usize,
 }
 
 /// Where the log ended when a batch of outputs was taken ([`Raft::log_end`]), for
@@ -367,8 +370,10 @@ pub struct Raft {
     stop: Option<(u64, u64)>,
     /// The latest input's time.
     now: u64,
-    /// As leader, when each of its entries not yet committed was proposed.
-    proposed_at: VecDeque<(u64, u64)>,
+    /// As leader, each of its entries not yet committed: its index, when it was proposed, and
+    /// its payload's length; and those lengths summed.
+    proposed_at: VecDeque<(u64, u64, usize)>,
+    uncommitted_bytes: usize,
     /// Records read back from disk, by the index of the first in each run, until the next
     /// [`Raft::take_outputs`].
     fetched: Vec<(u64, Vec<Vec<u8>>)>,
@@ -441,6 +446,7 @@ impl Raft {
             stop: None,
             now,
             proposed_at: VecDeque::new(),
+            uncommitted_bytes: 0,
             fetched: Vec::new(),
             durable: 0,
             commit: base_index,
@@ -641,6 +647,14 @@ impl Raft {
         self.commit
     }
 
+    /// As leader, whether its proposals not yet committed come to
+    /// [`Config::max_uncommitted_bytes`] or more. It still takes proposals: this is for the
+    /// driver, to stop taking more from clients until a quorum catches up.
+    #[must_use]
+    pub fn backlogged(&self) -> bool {
+        self.uncommitted_bytes >= self.config.max_uncommitted_bytes
+    }
+
     /// The last index in the log.
     #[must_use]
     pub fn last_index(&self) -> u64 {
@@ -778,7 +792,8 @@ impl Raft {
         }
         let index = self.last_index() + 1;
         self.append(Record { term: self.meta.term, index, payload });
-        self.proposed_at.push_back((index, self.now));
+        self.proposed_at.push_back((index, self.now, payload.len()));
+        self.uncommitted_bytes += payload.len();
         if !self.peers.iter().any(|p| self.is_member(p.id)) {
             self.advance_commit();
         }
@@ -1291,8 +1306,9 @@ impl Raft {
         // Only an entry of this term commits by counting; earlier ones commit beneath it.
         if candidate > self.commit && self.term_at(candidate) == Some(self.meta.term) {
             self.commit = candidate;
-            while let Some(&(index, at)) = self.proposed_at.front().filter(|&&(index, _)| index <= candidate) {
+            while let Some(&(index, at, len)) = self.proposed_at.front().filter(|&&(index, ..)| index <= candidate) {
                 self.proposed_at.pop_front();
+                self.uncommitted_bytes -= len;
                 debug_assert!(index <= self.commit);
                 self.out.commit_latencies.push(self.now.saturating_sub(at));
             }
@@ -1495,6 +1511,7 @@ impl Raft {
             self.drop_change();
             self.transfer = None;
             self.proposed_at.clear();
+            self.uncommitted_bytes = 0;
         }
         self.role = Role::Follower;
         self.votes.clear();
@@ -1794,6 +1811,7 @@ mod tests {
             heartbeat: Duration::from_millis(50),
             seed: u64::from(id),
             log_window_bytes: usize::MAX,
+            max_uncommitted_bytes: usize::MAX,
         }
     }
 
@@ -1911,6 +1929,33 @@ mod tests {
         assert_eq!(end.index, index);
         rafts[0].on_persisted(end);
         assert_eq!(rafts[0].commit_index(), index, "with node 1 durable, two of three");
+    }
+
+    /// A leader is backlogged while its uncommitted proposals reach the limit, and not once a
+    /// quorum has them; one that stands down forgets them.
+    #[test]
+    fn a_leader_is_backlogged_until_its_proposals_commit() {
+        let mut rafts = cluster(3);
+        rafts[0].config.max_uncommitted_bytes = 4;
+        let now = 1000 * MS;
+        elect(&mut rafts, &[1, 2, 3], 1, now);
+        rafts[0].propose(b"abc");
+        assert!(!rafts[0].backlogged(), "3 bytes of 4");
+        rafts[0].propose(b"d");
+        assert!(rafts[0].backlogged(), "4 bytes of 4");
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &[1, 2, 3], 1, sends, now);
+        assert!(!rafts[0].backlogged(), "committed");
+
+        rafts[0].propose(b"abcd");
+        assert!(rafts[0].backlogged());
+        elect(&mut rafts, &[2, 3], 2, 2 * now);
+        let heartbeat = rafts[1].next_deadline();
+        rafts[1].on_tick(heartbeat);
+        let sends = flush(&mut rafts[1]);
+        deliver(&mut rafts, &[1, 2, 3], 2, sends, heartbeat);
+        assert_eq!(rafts[0].role(), Role::Follower);
+        assert!(!rafts[0].backlogged(), "a follower proposes nothing");
     }
 
     /// Raft's figure 8: a leader can't commit an entry of an earlier term by counting replicas,
