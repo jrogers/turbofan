@@ -6,7 +6,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use tokio::io::WriteHalf;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::client::{Client, ClientConfigError, Event, Reconnect, SendError};
@@ -36,6 +36,7 @@ enum Command {
 pub struct ClusterClient {
     commands: mpsc::Sender<Command>,
     events: mpsc::Receiver<Event>,
+    applied: watch::Receiver<u64>,
     task: JoinHandle<()>,
 }
 
@@ -82,8 +83,9 @@ impl ClusterClient {
     fn start(client: Client, service_id: u32, tls: Option<ClientTls>) -> Self {
         let (commands, rx) = mpsc::channel(64);
         let (tx, events) = mpsc::channel(MAX_QUEUED_EVENTS);
-        let task = tokio::spawn(run(client, service_id, tls, rx, tx));
-        Self { commands, events, task }
+        let (applied_tx, applied) = watch::channel(0);
+        let task = tokio::spawn(run(client, service_id, tls, rx, tx, applied_tx));
+        Self { commands, events, applied, task }
     }
 
     /// Sends `payload`, returning its `client_seq`. It's resent after a failover until the
@@ -97,6 +99,14 @@ impl ClusterClient {
         let (reply, rx) = oneshot::channel();
         self.commands.send(Command::Send(payload.into(), reply)).await.map_err(|_| SendError::Closed)?;
         rx.await.map_err(|_| SendError::Closed)?
+    }
+
+    /// The highest `client_seq` (as [`ClusterClient::send`] returned) the cluster has applied,
+    /// as [`Client::applied`]: watch it to know when what was sent is in the cluster, to let go
+    /// of a message a gateway is forwarding, say.
+    #[must_use]
+    pub fn applied(&self) -> watch::Receiver<u64> {
+        self.applied.clone()
     }
 
     /// The next thing the cluster said, or `None` once the session is over.
@@ -122,6 +132,7 @@ async fn run(
     tls: Option<ClientTls>,
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
+    applied: watch::Sender<u64>,
 ) {
     let start = Instant::now();
     let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -165,6 +176,7 @@ async fn run(
                 }
                 () = tokio::time::sleep_until(wake.into()) => client.on_tick(now()),
             }
+            applied.send_if_modified(|seq| std::mem::replace(seq, client.applied()) != client.applied());
             while let Some(event) = client.poll_event() {
                 if events.send(event).await.is_err() {
                     read.abort();

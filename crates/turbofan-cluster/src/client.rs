@@ -106,6 +106,8 @@ pub struct Client {
     closed: bool,
     next_seq: u64,
     unacked: VecDeque<(u64, Vec<u8>)>,
+    /// The highest `client_seq` the cluster has said it applied.
+    applied: u64,
     last_egress: u64,
     keepalive_ns: u64,
     keepalive_at: u64,
@@ -145,6 +147,7 @@ impl Client {
             closed: false,
             next_seq: 1,
             unacked: VecDeque::new(),
+            applied: 0,
             last_egress: 0,
             keepalive_ns: crate::raft::nanos(keepalive.min(MAX_TIMEOUT)),
             keepalive_at: 0,
@@ -271,6 +274,14 @@ impl Client {
         Ok(client_seq)
     }
 
+    /// The highest `client_seq` (as [`Client::send`] returned) the cluster has applied: every
+    /// message up to it has been, exactly once. The cluster says so as it applies them, with a
+    /// response or without.
+    #[must_use]
+    pub fn applied(&self) -> u64 {
+        self.applied
+    }
+
     /// Closes the session.
     pub fn close(&mut self) {
         if let (true, Some(session)) = (self.open, self.session) {
@@ -311,6 +322,7 @@ impl Client {
     }
 
     fn trim(&mut self, applied_seq: u64) {
+        self.applied = self.applied.max(applied_seq);
         while self.unacked.front().is_some_and(|(seq, _)| *seq <= applied_seq) {
             self.unacked.pop_front();
         }

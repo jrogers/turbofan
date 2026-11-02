@@ -1690,6 +1690,7 @@ impl Sim {
             assert!(sim_client.sent > 100, "seed {seed}: client {c} sent only {}", sim_client.sent);
             assert_eq!(sim_client.answered, sim_client.sent, "seed {seed}: client {c} unanswered");
             assert_eq!(sim_client.client.unacked(), 0);
+            assert_eq!(sim_client.client.applied(), sim_client.sent, "seed {seed}: client {c} applied");
             let expected: BTreeSet<u64> = (1..=sim_client.sent).filter(|k| k.is_multiple_of(TIMER_EVERY)).collect();
             assert_eq!(sim_client.timers, expected, "seed {seed}: client {c} timers");
             let expected: BTreeSet<u64> = (1..=sim_client.sent).filter(|k| k.is_multiple_of(PROPOSE_EVERY)).collect();

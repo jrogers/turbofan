@@ -395,6 +395,11 @@ struct Local {
     shutting: Option<(ConnId, u64, Option<u64>)>,
     /// An activation asked for: the admin connection, the request ID, and its entry's index.
     activating: Option<(ConnId, u64, u64)>,
+    /// Sessions with messages applied since the last `Egress` to them, which carries their
+    /// `applied_seq`: told it in a `KeepAliveAck` once this batch of entries is applied, so a
+    /// client waiting on its messages being applied (to release what it forwarded) needn't wait
+    /// for its next keepalive.
+    unacked: BTreeSet<SessionId>,
     sends: Vec<(ConnId, Vec<u8>)>,
 }
 
@@ -988,6 +993,12 @@ impl<S: Service> Node<S> {
             }
         }
         self.raft.on_applied(self.state.applied);
+        for session in std::mem::take(&mut self.local.unacked) {
+            if let (Some(&conn), Some(s)) = (self.local.attached.get(&session), self.state.sessions.get(&session)) {
+                let applied_seq = s.last_seq;
+                self.send_client(conn, &wire::KeepAliveAck { applied_seq });
+            }
+        }
         self.log_outbox();
     }
 
@@ -1040,6 +1051,7 @@ impl<S: Service> Node<S> {
                     return;
                 }
                 s.last_seq = e.client_seq();
+                self.local.unacked.insert(SessionId(e.session()));
                 self.call(|service, ctx| service.on_message(ctx, SessionId(e.session()), e.payload()));
             }
             wire::Decoded::SessionClose(e) => {
@@ -1150,6 +1162,7 @@ impl<S: Service> Node<S> {
         let Some(s) = self.state.sessions.get_mut(&session) else { return };
         let egress_seq = s.next_egress;
         s.next_egress += 1;
+        self.local.unacked.remove(&session);
         if let Some(&conn) = self.local.attached.get(&session) {
             let message = wire::Egress { session: session.0, egress_seq, applied_seq: s.last_seq, payload: &payload };
             let mut frame = Vec::new();
@@ -1335,6 +1348,7 @@ mod tests {
                 ["at", id, ms] => ctx.schedule_timer(id.parse().unwrap(), ms.parse::<u64>().unwrap() * MS),
                 ["cancel", id] => ctx.cancel_timer(id.parse().unwrap()),
                 ["propose", what] => ctx.propose(what.as_bytes()).expect("a client payload fits"),
+                ["quiet"] => return,
                 _ => {}
             }
             ctx.send(session, payload).expect("a client payload fits");
@@ -1469,6 +1483,21 @@ mod tests {
         assert!(sent[1].contains("egress_seq: 2"));
         // The old connection is no longer the session's.
         assert!(client(&mut node, 7, &message(3, b"three"), 0)[0].contains("NoSession"));
+    }
+
+    /// A message the service doesn't answer is acknowledged as soon as it's applied, not at the
+    /// client's next keepalive; one it answers needs nothing but the `Egress`.
+    #[test]
+    fn an_applied_message_is_acknowledged_with_or_without_a_response() {
+        let mut node = leader();
+        let session = open(&mut node, 7, 0);
+        let message = |client_seq, payload| wire::Message { session: session.0, client_seq, payload };
+        let sent = client(&mut node, 7, &message(1, b"quiet"), 0);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("KeepAliveAck(KeepAliveAckRef { applied_seq: 1 })"), "{sent:?}");
+        let sent = client(&mut node, 7, &message(2, b"two"), 0);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("Egress") && sent[0].contains("applied_seq: 2"), "{sent:?}");
     }
 
     /// A resend of a message proposed but not yet applied, as a client reattaching to the same
