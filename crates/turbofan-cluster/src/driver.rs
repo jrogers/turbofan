@@ -46,8 +46,11 @@ const MAX_BATCH_INPUTS: usize = 1024;
 /// Frames waiting to go to one peer or connection. Past this a peer's are dropped (Raft resends)
 /// and a client too slow to read is disconnected.
 const MAX_QUEUED_FRAMES: usize = 4096;
-/// How long to wait before dialling a peer again.
+/// How long to wait before dialling a peer again, doubled each time it fails, up to
+/// [`MAX_REDIAL`], and back to this once it's connected.
 const REDIAL: Duration = Duration::from_millis(100);
+/// The longest wait before dialling an unreachable peer again.
+const MAX_REDIAL: Duration = Duration::from_secs(1);
 /// How long a node that has stopped waits, for what it sent last to go out.
 const STOP_GRACE: Duration = Duration::from_millis(200);
 /// How often the node's gauges are published.
@@ -716,7 +719,13 @@ async fn serve_connection(
     let _ = inputs.send(Input::Closed(conn)).await;
 }
 
-/// Keeps a connection to a peer and writes what the node sends it, redialling when it drops.
+/// The wait before dialling again after one of `redial` failed.
+fn backoff(redial: Duration) -> Duration {
+    (redial * 2).min(MAX_REDIAL)
+}
+
+/// Keeps a connection to a peer and writes what the node sends it, redialling when it drops,
+/// less often the longer it's unreachable.
 async fn dial_peer(
     addr: String,
     hello: Hello,
@@ -725,17 +734,21 @@ async fn dial_peer(
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut batch = Vec::new();
+    let mut redial = REDIAL;
     loop {
         let connected = tokio::time::timeout(HELLO_TIMEOUT, tls::connect(&addr, tls.as_ref())).await;
         let Ok(Ok(mut stream)) = connected else {
-            tokio::time::sleep(REDIAL).await;
+            tokio::time::sleep(redial).await;
+            redial = backoff(redial);
             continue;
         };
         let epoch = hello.epoch();
         if write_frames(&mut stream, [&hello.frame(wire::Role::Peer, &token)[..]]).await.is_err() {
-            tokio::time::sleep(REDIAL).await;
+            tokio::time::sleep(redial).await;
+            redial = backoff(redial);
             continue;
         }
+        redial = REDIAL;
         loop {
             let Some(frame) = rx.recv().await else { return };
             // Its epoch changed since its hello said: dialled again, for the peer to check the new
@@ -760,6 +773,14 @@ async fn dial_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unreachable peer is dialled less and less often, but at least once a [`MAX_REDIAL`].
+    #[test]
+    fn redials_back_off_to_a_ceiling() {
+        let waits: Vec<_> = std::iter::successors(Some(REDIAL), |&r| Some(backoff(r))).take(6).collect();
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(waits, [ms(100), ms(200), ms(400), ms(800), ms(1000), ms(1000)]);
+    }
 
     /// Peers are of one cluster unless both know its epoch, and they differ: a node that knows
     /// none yet (joining, or a new cluster's before its first leader names it) talks to any.

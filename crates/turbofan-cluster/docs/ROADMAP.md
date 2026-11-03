@@ -18,9 +18,10 @@ down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report t
   node with it and one without can't talk.
 - **Backup.** Archive snapshots and closed log segments somewhere off the node, and restore a
   cluster from them.
-- **Backing off an unreachable peer.** The driver dials one every `REDIAL` (100 ms) for as long
-  as it's down (`src/driver.rs`): harmless on a LAN, noise towards a standby region down for
-  hours. Back off, to a ceiling of a second or so, and start again on a connection.
+- **Durability.** The log isn't fsynced by default (`Fsync::Never`, `src/log.rs`): the other
+  nodes' copies are the redundancy, so a crashed process or a lost machine loses nothing, but a
+  majority losing power together may lose committed entries. Spread the nodes over power
+  domains, and cover a whole site with a standby (below) or `serve --fsync`.
 - **A standby in another region.** A cluster that can take over, in another region or cloud, if
   the main one is lost. Learners are in: members that take the log and snapshot but don't vote,
   so the main cluster's commits never wait on the other region (`add-member --learner`, or
