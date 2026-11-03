@@ -209,6 +209,7 @@ struct Core<S> {
 }
 
 impl<S: Service + 'static> Core<S> {
+    #[allow(clippy::too_many_lines, reason = "debug traces only")]
     async fn run(mut self, mut rx: mpsc::Receiver<Input>, mut client_rx: mpsc::Receiver<Input>) -> io::Result<()> {
         loop {
             let dbg_t0 = Instant::now();
@@ -466,6 +467,16 @@ impl Storage {
     /// longer than its sync.
     #[allow(clippy::type_complexity, reason = "the two kinds of read")]
     fn write(&mut self, batches: &[pipeline::Batch]) -> io::Result<(Vec<Vec<u8>>, Vec<(u64, u64, Vec<u8>)>)> {
+        let dbg_t = Instant::now();
+        let r = self.dbg_write(batches);
+        if dbg_t.elapsed() > Duration::from_millis(100) {
+            eprintln!("DBG disk {}: a write of {} batches took {:?}", self.dbg_dir(), batches.len(), dbg_t.elapsed());
+        }
+        r
+    }
+
+    #[allow(clippy::type_complexity, reason = "the two kinds of read")]
+    fn dbg_write(&mut self, batches: &[pipeline::Batch]) -> io::Result<(Vec<Vec<u8>>, Vec<(u64, u64, Vec<u8>)>)> {
         let (mut reads, mut chunks) = (Vec::new(), Vec::new());
         let (mut froms, mut offsets) = (HashSet::new(), HashSet::new());
         let mut appends = Vec::new();
@@ -493,20 +504,50 @@ impl Storage {
             }
         }
         self.append(&mut appends)?;
+        let t = Instant::now();
         self.log.sync()?;
+        if t.elapsed() > Duration::from_millis(100) {
+            eprintln!("DBG disk {}: sync took {:?}", self.dbg_dir(), t.elapsed());
+        }
         Ok((reads, chunks))
     }
 
     /// Writes the `records` gathered so far, if any, and empties them.
     fn append(&mut self, records: &mut Vec<u8>) -> io::Result<()> {
         if !records.is_empty() {
+            let t = Instant::now();
             self.log.append(records)?;
+            if t.elapsed() > Duration::from_millis(100) {
+                eprintln!("DBG disk {}: appending {} bytes took {:?}", self.dbg_dir(), records.len(), t.elapsed());
+            }
             records.clear();
         }
         Ok(())
     }
 
+    fn dbg_dir(&self) -> String {
+        self.snapshots.parent().map(|p| p.display().to_string()).unwrap_or_default()
+    }
+
     fn apply(&mut self, op: &Persist) -> io::Result<()> {
+        let t = Instant::now();
+        let kind = match op {
+            Persist::Meta(_) => "meta",
+            Persist::Append(_) => "append",
+            Persist::TruncateFrom(_) => "truncate",
+            Persist::Trust => "trust",
+            Persist::Compact { .. } => "compact",
+            Persist::SnapshotChunk { .. } => "snapshot chunk",
+            Persist::InstallSnapshot { .. } => "install snapshot",
+        };
+        self.dbg_apply(op)?;
+        if t.elapsed() > Duration::from_millis(100) {
+            eprintln!("DBG disk {}: {kind} took {:?}", self.dbg_dir(), t.elapsed());
+        }
+        Ok(())
+    }
+
+    fn dbg_apply(&mut self, op: &Persist) -> io::Result<()> {
         match op {
             Persist::Meta(meta) => self.meta.save(*meta)?,
             Persist::Append(records) => self.log.append(records)?,
