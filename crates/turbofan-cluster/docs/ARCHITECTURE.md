@@ -35,15 +35,15 @@ The cluster is built in layers, each tested on its own:
 | Layer | Where | What it does |
 |---|---|---|
 | Wire | `schema/cluster.xml`, `codec.rs` | Every message between nodes, clients and operators, and every log entry, as SBE; frames (a `u32` length, then a message) and log records (length, checksum, term, index, payload). |
-| Raft | `raft.rs` | Sans-IO Raft over opaque records: pre-vote elections, replication, commit, membership changes, leadership transfer, snapshots sent to followers. |
-| Node | `node.rs` | Raft plus what the log means: client sessions, de-duplication, egress rings, timers, the service's own proposals, admin requests, all applied to a `Service`. |
+| Raft | `raft/`: `election`, `replication`, `membership`, `snapshots`, `entries` | Sans-IO Raft over opaque records: pre-vote elections, replication, commit, membership changes, leadership transfer, snapshots sent to followers. |
+| Node | `node/`: `sessions`, `apply`, `state`, `admin`, `service` | Raft plus what the log means: client sessions, de-duplication, egress rings, timers, the service's own proposals, admin requests, all applied to a `Service`. |
 | Storage | `log.rs`, `meta.rs`, `snapshot.rs` | The log in segment files, the term and vote in two alternating slots, snapshot files written whole or not at all. |
 | Driver | `driver.rs` | Runs a `Node` on tokio: listeners for peers, clients and operators, the disk on blocking threads, the batch loop. |
 | Client | `client.rs`, `remote.rs` | A sans-IO gateway session (`Client`) that finds the leader and keeps a session across failovers, run over TCP by `ClusterClient`; operators' requests. |
 | Command line | `cli.rs` | `serve` and the operator commands, so a service's binary is one call to `run`. |
 | Metrics | `metrics.rs` | What a node counts, published by the driver through the `metrics` facade. |
 
-`raft.rs` replicates records and knows nothing of sessions or services; `node.rs` layers those on
+`raft/` replicates records and knows nothing of sessions or services; `node/` layers those on
 top. Only the driver, `remote.rs` and `cli.rs` do IO.
 
 ## The core is sans-IO
@@ -61,7 +61,7 @@ nanoseconds; outputs are taken back as plain data. For a `Node`:
   commit latencies.
 - **And** `raft().log_end()`, noted as outputs are taken, to give `on_persisted`.
 
-So every decision is in `raft.rs` and `node.rs`, tested without sockets, and simulated
+So every decision is in `raft/` and `node/`, tested without sockets, and simulated
 (`tests/sim.rs`) by a harness that drives the same `Node` over a model network and real files.
 How a driver carries out the outputs, what goes at once and what waits for which write, is in
 `pipeline.rs`, which the driver and the simulation both run. The driver decides only when to call
@@ -248,14 +248,14 @@ later term, or the whole log of the leader it follows.
 
 | To change | Look at |
 |---|---|
-| Elections, replication, commit, membership | `raft.rs`, with a unit test there and a run of the simulator. |
-| What an entry does, sessions, the service's API | `node.rs` (`Service`, `Ctx`, `apply_entry`). |
+| Elections, replication, commit, membership | `raft/` (`election.rs`, `replication.rs`, `membership.rs`), with a unit test in `raft/tests.rs` and a run of the simulator. |
+| What an entry does, sessions, the service's API | `node/`: `Service` and `Ctx` in `service.rs`, `apply_entry` in `apply.rs`, sessions in `sessions.rs`. |
 | A message on the wire or in the log | `schema/cluster.xml`, only as WIRE.md allows; never the generated code. |
 | When the driver persists, reads and sends | `Core::run` and `Core::flush` in `driver.rs`. |
 | Formats on disk | `codec.rs` (records), `log.rs`, `meta.rs`, `snapshot.rs`. |
 | How a gateway finds the leader and resends | `client.rs`, and `ClusterClient` in `remote.rs`. |
 | Settings | `raft::Config`, `node::Config` and `driver::Config`, and their defaults in `cli.rs`. |
-| Limits | The `MAX_` constants in `codec.rs`, `raft.rs`, `node.rs`, `client.rs` and `driver.rs`. |
+| Limits | The `MAX_` constants in `codec.rs`, `raft/mod.rs`, `node/mod.rs`, `client.rs`, `remote.rs`, `log.rs` and `driver.rs`. |
 | The generated codecs | `turbofan-sbe`'s `codegen/`; its checked-in test codecs are rewritten with `SBE_REGENERATE=1`. |
 
 ## How it's tested

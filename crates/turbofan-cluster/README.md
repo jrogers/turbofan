@@ -138,9 +138,9 @@ first response it missed. A session the leader hears nothing from for a while is
 The core is sans-IO: it takes inputs (messages, the time, notice that writes are durable) and
 returns outputs (what to persist, what to send). It does no IO and never reads a clock itself.
 
-- `raft.rs` replicates opaque log records: elections with pre-vote, log replication and
+- `raft/` replicates opaque log records: elections with pre-vote, log replication and
   snapshot install.
-- `node.rs` adds client sessions, timers and snapshots on top, and runs the service.
+- `node/` adds client sessions, timers and snapshots on top, and runs the service.
 - `pipeline.rs` is how a driver carries out a node's outputs without waiting on the disk: what
   goes at once, what waits for a write, and what's written together. The driver and the
   simulation both run it.
