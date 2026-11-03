@@ -82,8 +82,7 @@ to guess: a client reattaching after a failover sends its credentials again, and
 service gives the same principal may take the session back.
 
 Key what outlives a session by principal, not session. A gateway that restarts opens a new
-session, and should find its orders where it left them. The OMS keeps orders by principal for
-that reason.
+session, and should find its orders where it left them.
 
 A session closes when:
 
@@ -206,6 +205,6 @@ and check the two behave alike, and that snapshotting the copy writes the same b
 `Ctx::with_service_version` makes a context as if the cluster ran a given version, for testing
 an upgrade.
 
-The framework's own simulation tests a cluster under failures; it doesn't know your service. The
-OMS has a test of its own, `tests/failover.rs`, that kills and restarts nodes under load and
-checks nothing is lost or doubled: worth having for any service.
+The framework's own simulation tests a cluster under failures; it doesn't know your service. A
+test of your own that kills and restarts nodes under load, and checks nothing is lost or doubled,
+is worth having for any service: `tests/cluster.rs` does it for an echo service.

@@ -6,8 +6,7 @@ quorum of nodes makes each entry durable, and every node applies the log, in ord
 without losing or repeating a message.
 
 The framework never looks inside the service's messages: to it, they're opaque bytes. Encode them
-however you like; the [OMS](https://github.com/jrogers/oms), an order book on Turbofan, uses SBE
-from `turbofan-sbe`.
+however you like: `turbofan-sbe` generates SBE codecs from a schema, as the cluster's own are.
 
 ## Dependencies
 

@@ -12,7 +12,7 @@ flowchart LR
     sbe[turbofan-sbe<br/>SBE codegen and runtime]
     cluster[turbofan-cluster<br/>the framework]
     fuzz[turbofan-cluster/fuzz]
-    service[a service, in its own repository:<br/>the OMS, say]
+    service[a service, in its own repository:<br/>an order book, say]
 
     sbe -- "build.rs: cluster.xml" --> cluster
     cluster --> fuzz
@@ -24,8 +24,7 @@ An arrow points from a crate to one that depends on it. `turbofan-sbe` generates
 schemas in a `build.rs`, and is also the runtime those codecs call. `turbofan-cluster` is the
 reusable core: Raft, client sessions, the disk and the network. It knows nothing of what a
 service does: a service's messages are opaque bytes to it. Services live in repositories of their
-own, depending on both crates: the [OMS](https://github.com/jrogers/oms), an order book,
-is one. Here, `examples/counter.rs` is a service small enough to read whole. The fuzz crate sits
+own, depending on both crates. Here, `examples/counter.rs` is a service small enough to read whole. The fuzz crate sits
 outside the workspace, with a lock file of its own.
 
 ## Layers

@@ -46,7 +46,7 @@ Besides `on_message`, a service can handle sessions opening and closing, schedul
 close a session, and propose a message of its own (`Ctx::propose`), for work that follows from
 another: it comes back through the log to `on_proposal`, once, even across a failover. A snapshot is a frozen copy of the state, here a clone, which the node writes
 out on another thread while it goes on applying. `examples/counter.rs` is the whole of the example
-above, and the [OMS](https://github.com/jrogers/oms) is a full order book.
+above.
 
 ## Running a cluster
 
