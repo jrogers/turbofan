@@ -18,7 +18,7 @@
 //! removed one disrupts nothing: members refuse its pre-votes while they hear a leader.
 //!
 //! **Learners** ([`Member::learner`]) are members that take the log but don't vote: they're
-//! added and removed as members are, but never stand for election, and their acks don't count
+//! added and removed as members are, without catching up first, but never stand for election, and their acks don't count
 //! towards a commit, check-quorum or a snapshot's quorum, so a quorum never waits on one in
 //! another region. Nor is the leadership handed to one.
 //!
@@ -500,9 +500,10 @@ impl Raft {
 
     /// Starts adding `member`: it's sent the log, without a vote, until it has caught up, then
     /// the members with it are proposed ([`Outputs::change_proposed`]), or, if it doesn't, the
-    /// change is dropped ([`Outputs::change_failed`]). A learner ([`Member::learner`]) catches up
-    /// the same way. Refused (false) unless this node leads, has committed an entry of its term,
-    /// no other change is under way, and there's room.
+    /// change is dropped ([`Outputs::change_failed`]). A learner ([`Member::learner`]) needn't
+    /// catch up: it's proposed once it answers, new enough, and catches up as a member. Refused
+    /// (false) unless this node leads, has committed an entry of its term, no other change is
+    /// under way, and there's room.
     pub fn add_member(&mut self, member: Member) -> bool {
         if !self.can_change() || member.id.0 == 0 || self.is_member(member.id) || self.members().len() >= MAX_MEMBERS {
             return false;
@@ -1074,6 +1075,11 @@ impl Raft {
             p.next = m.index().clamp(p.matched + 1, last + 1);
             self.send_append(peer, true);
         }
+        // A learner joins once it's known new enough, caught up or not: the quorum doesn't wait
+        // on it, so neither does adding it. It catches up as a member.
+        if self.catching_up.as_ref().is_some_and(|c| c.member.id == id && c.member.learner) {
+            self.join();
+        }
     }
 
     /// Sends a peer the records from its `next`. If the first is on disk only, it's fetched and
@@ -1421,7 +1427,12 @@ impl Raft {
             self.drop_change();
             return;
         }
-        let member = self.catching_up.take().expect("just matched").member;
+        self.join();
+    }
+
+    /// Proposes the members with the one being added.
+    fn join(&mut self) {
+        let member = self.catching_up.take().expect("one is being added").member;
         let mut members = self.members().to_vec();
         members.push(member);
         members.sort_unstable_by_key(|m| m.id);
@@ -2470,6 +2481,40 @@ mod tests {
         }
         assert_eq!(rafts[3].commit_index(), rafts[0].commit_index());
         assert!(rafts[0].can_change(), "committed");
+    }
+
+    /// A learner is proposed as soon as it answers, new enough, before it has any of the log: the
+    /// quorum doesn't wait on it. It catches up as a member.
+    #[test]
+    fn a_learner_is_added_without_catching_up() {
+        let mut rafts = cluster(3);
+        rafts.push(Raft::new(config(4, &[]), Meta::default(), None, Entries::default(), 0));
+        let all = [1, 2, 3, 4];
+        elect(&mut rafts, &[1, 2, 3], 1, 1000 * MS);
+        rafts[0].propose(b"x");
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &[1, 2, 3], 1, sends, 1000 * MS);
+        assert!(rafts[0].add_member(Member { learner: true, ..member(4) }));
+
+        // Its answer to the first heartbeat, which sends it nothing of the log.
+        let now = rafts[0].next_deadline();
+        rafts[0].on_tick(now);
+        for (to, frame) in flush(&mut rafts[0]).into_iter().filter(|(to, _)| to.0 == 4) {
+            rafts[3].on_message(NodeId(1), &decode(&frame), now);
+            for (_, ack) in flush(&mut rafts[3]) {
+                rafts[0].on_message(to, &decode(&ack), now);
+            }
+        }
+        assert_eq!(rafts[3].last_index(), 0, "it has none of the log");
+        let learners: Vec<_> = rafts[0].members().iter().filter(|m| m.learner).map(|m| m.id.0).collect();
+        assert_eq!(learners, [4], "but is proposed");
+
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &all, 1, sends, now);
+        heartbeat(&mut rafts, &all, 1);
+        assert!(!rafts[0].changing_members(), "committed");
+        assert_eq!(rafts[3].commit_index(), rafts[0].commit_index(), "and it caught up");
+        assert!(rafts[3].members().iter().any(|m| m.id.0 == 4 && m.learner));
     }
 
     /// A node whose code is older than what the cluster runs isn't sent the log, which applying
