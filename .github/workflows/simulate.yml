@@ -1,0 +1,56 @@
+name: Simulate
+
+# Runs the simulation (crates/turbofan-cluster/tests/sim.rs) on fresh seeds each night, beyond the
+# fixed seeds every push runs. Run it by hand for more or fewer.
+on:
+  schedule:
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Seeds to run
+        default: "1000"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Seeds from the run's ID, new each run. Stops at the first failure, which prints
+      # SIM_SEED=<n>: replay it locally with `SIM_SEED=<n> cargo test -p turbofan-cluster --release
+      # --test sim`. `shell: bash` sets pipefail, so a failure survives the tee.
+      - name: Fresh seeds
+        shell: bash
+        run: cargo test -p turbofan-cluster --release --test sim -- --nocapture 2>&1 | tee sim.log
+        env:
+          SIM_SEEDS: ${{ inputs.seeds || 1000 }}
+          SIM_BASE: ${{ github.run_id }}0000
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: simulation-log
+          path: sim.log
+
+  # Opens an issue when a scheduled run fails (or comments on the open one), and closes it when one
+  # passes, so a failure doesn't go unnoticed for days. Manual runs are watched by whoever ran them.
+  report:
+    needs: simulate
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/nightly-report.sh "${{ github.workflow }}" "${{ needs.simulate.result }}" "$URL"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -1,4 +1,5 @@
-# scripts/check.sh, less the fuzz build and the simulation test.
+# scripts/check.sh, with the simulation's fixed seeds and the fuzz targets' build in jobs of their
+# own. Random seeds and fuzzing run nightly (simulate.yml, fuzz.yml).
 name: CI
 on:
   push:
@@ -25,6 +26,31 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The simulation's fixed seeds (crates/turbofan-cluster/tests/sim.rs), a release build: a failure
+  # prints SIM_SEED=<n>, which replays it.
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p turbofan-cluster --release --test sim
+
+  # The fuzz targets (crates/turbofan-cluster/fuzz) still build against the current API. They're
+  # outside the workspace, so the check job doesn't see them; fuzzing itself runs nightly (fuzz.yml).
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/turbofan-cluster/fuzz
+      - run: cargo fmt --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --check
+      - run: cargo clippy --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --bins --locked -- -D warnings
 
   # The cluster's throughput and latency, into the run's summary, compared with main's last run's,
   # which the cache keeps: a run well below it is flagged with a warning. See benches/cluster.rs.

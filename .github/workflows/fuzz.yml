@@ -1,0 +1,54 @@
+name: Fuzz
+
+# Fuzzes every target in crates/turbofan-cluster/fuzz for a while each night, rather than on every
+# push; CI only checks that they build. Run it by hand for a longer or shorter session.
+on:
+  schedule:
+    - cron: "7 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/turbofan-cluster/fuzz
+      - run: scripts/fuzz.sh ${{ inputs.seconds || 600 }}
+      # The inputs that failed, to replay locally: see scripts/fuzz.sh.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: crates/turbofan-cluster/fuzz/artifacts/
+
+  # Opens an issue when a scheduled run fails (or comments on the open one), and closes it when one
+  # passes, so a failure doesn't go unnoticed for days. Manual runs are watched by whoever ran them.
+  report:
+    needs: fuzz
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/nightly-report.sh "${{ github.workflow }}" "${{ needs.fuzz.result }}" "$URL"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

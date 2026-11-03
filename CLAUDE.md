@@ -26,3 +26,6 @@ before writing code.
   prints `SIM_SEED=<n>`, which replays it.
 - `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan-cluster/fuzz`,
   outside the workspace; nightly and cargo-fuzz). `check.sh` only checks it builds.
+- CI runs the simulation's fixed seeds and the fuzz targets' build in jobs of their own on every push;
+  fresh seeds (`simulate.yml`) and fuzzing (`fuzz.yml`) run nightly, and a failing night opens an issue
+  (`scripts/nightly-report.sh`).
