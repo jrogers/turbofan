@@ -40,10 +40,13 @@ jobs:
           path: bench-main.tsv
           key: bench-main-${{ github.run_id }}
           restore-keys: bench-main-
-      - run: cargo bench -p turbofan-cluster --bench cluster --features tls > bench.md
+      # Absolute paths: cargo runs the bench in the crate's directory. To the log too, so what ran
+      # before a failure shows; `shell: bash` sets pipefail, so a failure still fails the step.
+      - run: cargo bench -p turbofan-cluster --bench cluster --features tls | tee bench.md
+        shell: bash
         env:
-          BENCH_BASELINE: bench-main.tsv
-          BENCH_RESULTS: bench-new.tsv
+          BENCH_BASELINE: ${{ github.workspace }}/bench-main.tsv
+          BENCH_RESULTS: ${{ github.workspace }}/bench-new.tsv
       # The table to the summary; the warnings to the log, where they're annotations.
       - run: |
           grep -v '^::' bench.md >> "$GITHUB_STEP_SUMMARY"

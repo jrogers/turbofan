@@ -138,8 +138,14 @@ async fn main() {
             let (addrs, tls) = start(&dir, tls, fsync);
             // Once a client has a session, there's a leader.
             drop(connect(&addrs, tls.as_ref()).await);
-            for (name, msgs, row, stage_row) in bench(&addrs, tls.as_ref(), fsync, secs, &stages).await {
+            for (name, msgs, row, stage_row, reattached) in bench(&addrs, tls.as_ref(), fsync, secs, &stages).await {
                 stage_rows.push(stage_row);
+                if reattached > 0 {
+                    warnings.push(format!(
+                        "::warning title=Benchmark failover::{name}: clients reattached {reattached} times, after a \
+                         leader change or a dropped connection"
+                    ));
+                }
                 results.push_str(&format!("{name}\t{msgs}\n"));
                 let Some(baseline) = &baseline else {
                     println!("{row}");
@@ -177,24 +183,26 @@ async fn main() {
     }
 }
 
-/// Both runs on the cluster at `addrs`: each one's name, msgs/s, table row, and row of stages.
+/// Both runs on the cluster at `addrs`: each one's name, msgs/s, table row, row of stages, and
+/// how many times its clients reattached.
 async fn bench(
     addrs: &[String],
     tls: Option<&ClientTls>,
     fsync: driver::Fsync,
     secs: u64,
     stages: &Stages,
-) -> Vec<(String, u64, String, String)> {
+) -> Vec<(String, u64, String, String, usize)> {
     let mut rows = Vec::new();
     let over = if tls.is_some() { ", TLS" } else { "" };
     let over = if fsync == driver::Fsync::EachBatch { format!("{over}, fsync") } else { over.to_owned() };
     for (name, clients, window) in [("latency", 1, 1), ("throughput", 8, 256)] {
-        let (mut latencies, by_stage) = run(addrs, tls, clients, window, secs, stages).await;
+        let (mut latencies, by_stage, reattached) = run(addrs, tls, clients, window, secs, stages).await;
         latencies.sort_unstable();
         let at = |q: usize| per_mille(&latencies, q);
         let msgs = latencies.len() as u64 / secs;
+        let failover = if reattached > 0 { format!(" ⚠️ {reattached} reattached") } else { String::new() };
         let row = format!(
-            "| {name}{over} | {clients} × {window} | {msgs} | {} | {} | {} | {} |",
+            "| {name}{over}{failover} | {clients} × {window} | {msgs} | {} | {} | {} | {} |",
             at(500),
             at(990),
             at(999),
@@ -203,7 +211,7 @@ async fn bench(
         let both = |sorted: &[u64]| format!("{} / {}", per_mille(sorted, 500), per_mille(sorted, 990));
         let [persisted, committed, applied] = by_stage.each_ref().map(|s| both(s));
         let stage_row = format!("| {name}{over} | {persisted} | {committed} | {applied} | {} |", both(&latencies));
-        rows.push((format!("{name}{over}"), msgs, row, stage_row));
+        rows.push((format!("{name}{over}"), msgs, row, stage_row, reattached));
     }
     rows
 }
@@ -306,7 +314,8 @@ async fn connect(addrs: &[String], tls: Option<&ClientTls>) -> ClusterClient {
 
 /// `clients` sessions, each keeping `window` messages in flight, for a warm-up second then
 /// `secs`: the latency of each message sent after the warm-up and answered before the end, and
-/// what the leader timed of each stage meanwhile, in nanoseconds.
+/// what the leader timed of each stage meanwhile, in nanoseconds; and how many times the clients
+/// reattached.
 async fn run(
     addrs: &[String],
     tls: Option<&ClientTls>,
@@ -314,7 +323,7 @@ async fn run(
     window: usize,
     secs: u64,
     stages: &Stages,
-) -> (Vec<u64>, [Vec<u64>; 3]) {
+) -> (Vec<u64>, [Vec<u64>; 3], usize) {
     let mut sessions = Vec::new();
     for _ in 0..clients {
         sessions.push(connect(addrs, tls).await);
@@ -324,11 +333,13 @@ async fn run(
     let tasks: Vec<_> = sessions.into_iter().map(|c| tokio::spawn(keep_sending(c, window, warm, end))).collect();
     tokio::time::sleep_until(warm.into()).await;
     stages.take();
-    let mut latencies = Vec::new();
+    let (mut latencies, mut reattached) = (Vec::new(), 0);
     for task in tasks {
-        latencies.extend(task.await.unwrap());
+        let (some, times) = task.await.unwrap();
+        latencies.extend(some);
+        reattached += times;
     }
-    (latencies, stages.take())
+    (latencies, stages.take(), reattached)
 }
 
 /// The `q`th per mille of `sorted`; none (a leader change, a slow runner) shows as -.
@@ -336,21 +347,28 @@ fn per_mille(sorted: &[u64], q: usize) -> String {
     sorted.get(sorted.len().saturating_sub(1) * q / 1000).map_or("-".into(), |&ns| micros(ns))
 }
 
-/// Keeps `window` messages in flight until `end`, sending the next as each is answered.
-async fn keep_sending(mut client: ClusterClient, window: usize, warm: Instant, end: Instant) -> Vec<u64> {
+/// Keeps `window` messages in flight until `end`, sending the next as each is answered. Returns
+/// their latencies, and how many times the client reattached: its session goes on, each response
+/// still once and in order, so the timings hold.
+async fn keep_sending(mut client: ClusterClient, window: usize, warm: Instant, end: Instant) -> (Vec<u64>, usize) {
     let payload = vec![7; PAYLOAD_BYTES];
     let mut in_flight = VecDeque::new();
     for _ in 0..window {
         in_flight.push_back(Instant::now());
         client.send(payload.clone()).await.unwrap();
     }
-    let mut latencies = Vec::new();
+    let (mut latencies, mut reattached) = (Vec::new(), 0);
     loop {
         let event = client.recv().await.expect("the session lasts");
+        if let Event::Opened(session) = event {
+            eprintln!("session {session:?} reattached {:.1?} after the warm-up", Instant::now().duration_since(warm));
+            reattached += 1;
+            continue;
+        }
         let Event::Message(_) = event else { panic!("unexpected {event:?}") };
         let (sent, now) = (in_flight.pop_front().unwrap(), Instant::now());
         if now >= end {
-            return latencies;
+            return (latencies, reattached);
         }
         if sent >= warm {
             latencies.push(u64::try_from((now - sent).as_nanos()).unwrap());
