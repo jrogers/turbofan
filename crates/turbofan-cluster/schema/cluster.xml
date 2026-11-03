@@ -125,9 +125,12 @@
         </group>
         <data name="chunk" id="7" type="bulkData"/>
     </sbe:message>
+    <!-- `index`: of the snapshot it's of. The leader may move on to a newer one while acks of the
+         last are in flight. -->
     <sbe:message name="SnapshotAck" id="15">
         <field name="term" id="1" type="uint64"/>
         <field name="offset" id="2" type="uint64"/>
+        <field name="index" id="3" type="uint64"/>
     </sbe:message>
     <!-- From a leader handing over to a follower whose log matches its own: stand for election
          now, without a pre-vote. -->

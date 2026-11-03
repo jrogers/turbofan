@@ -1224,7 +1224,9 @@ impl Raft {
             return;
         }
         self.peers[peer].heard_at = now;
-        let Some(s) = &mut self.peers[peer].sending else { return };
+        // An ack of a snapshot this leader has moved on from says nothing of how much the peer has
+        // of this one.
+        let Some(s) = self.peers[peer].sending.as_mut().filter(|s| s.index == m.index()) else { return };
         if m.offset() > s.acked {
             s.acked = m.offset();
             s.sent = s.sent.max(s.acked);
@@ -1271,7 +1273,7 @@ impl Raft {
         }
         let Some(incoming) = self.incoming.as_mut().filter(|s| s.index == m.last_index()) else {
             // Restarted, say: the leader starts again.
-            self.send(from, &wire::SnapshotAck { term: self.meta.term, offset: 0 });
+            self.send(from, &wire::SnapshotAck { term: self.meta.term, offset: 0, index: m.last_index() });
             return;
         };
         if m.offset() == incoming.len {
@@ -1284,7 +1286,7 @@ impl Raft {
             self.install(incoming);
             self.ack(from, true, self.commit);
         } else {
-            let ack = wire::SnapshotAck { term: self.meta.term, offset: incoming.len };
+            let ack = wire::SnapshotAck { term: self.meta.term, offset: incoming.len, index: m.last_index() };
             self.send(from, &ack);
         }
     }
@@ -2440,6 +2442,35 @@ mod tests {
         assert_eq!(reads, [3 * CHUNK]);
         deliver_chunks(&mut rafts, &chunks.iter().collect::<Vec<_>>(), now);
         assert_eq!(rafts[1].snapshot_index(), 10, "installed");
+    }
+
+    /// An ack of a snapshot the leader has moved on from, in flight as it took a newer one,
+    /// isn't counted towards the newer: the peer has only what it acked of that.
+    #[test]
+    fn an_ack_of_an_older_snapshot_is_not_counted() {
+        let snapshot = Snapshot { index: 10, term: 1, len: 100, checksum: 0, members: vec![member(1), member(2)] };
+        let mut rafts = vec![
+            Raft::new(config(1, &[1, 2]), Meta { term: 1, vote: None }, Some(snapshot), Entries::default(), 0),
+            Raft::new(config(2, &[1, 2]), Meta::default(), None, Entries::default(), 0),
+        ];
+        let now = 1000 * MS;
+        elect(&mut rafts, &[1, 2], 1, now);
+        rafts[0].on_tick(now);
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &[1, 2], 1, sends, now);
+        let acked = |raft: &Raft| raft.peers[0].sending.map(|s| (s.index, s.acked));
+        assert_eq!(acked(&rafts[0]), Some((10, 0)), "sending node 2 the snapshot");
+
+        let ack = |offset, index| {
+            let mut frame = Vec::new();
+            codec::encode_frame(&wire::SnapshotAck { term: rafts[0].term(), offset, index }, &mut frame).unwrap();
+            frame
+        };
+        let (older, this) = (ack(60, 9), ack(40, 10));
+        rafts[0].on_message(NodeId(2), &decode(&older), now);
+        assert_eq!(acked(&rafts[0]), Some((10, 0)), "not of this snapshot");
+        rafts[0].on_message(NodeId(2), &decode(&this), now);
+        assert_eq!(acked(&rafts[0]), Some((10, 40)));
     }
 
     fn ids(members: &[Member]) -> Vec<u8> {
