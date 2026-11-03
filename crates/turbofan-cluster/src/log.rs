@@ -231,7 +231,10 @@ impl Log {
     /// If the log doesn't hold `from`.
     pub fn read(&mut self, from: u64, max_bytes: usize) -> io::Result<Vec<u8>> {
         assert!(from >= self.segments[0] && from < self.next_index, "the log holds {from}");
-        let segment = self.segments[self.segments.partition_point(|&first| first <= from) - 1];
+        let at = self.segments.partition_point(|&first| first <= from) - 1;
+        let segment = self.segments[at];
+        // Where its records end: the next segment's first, or the log's end.
+        let end = self.segments.get(at + 1).copied().unwrap_or(self.next_index);
         // A follower catching up reads on from where the last read stopped.
         let (mut index, mut offset) = match self.cursor {
             Some((s, index, offset)) if s == segment && index <= from => (index, offset),
@@ -243,6 +246,10 @@ impl Log {
         while index < self.next_index {
             let mut len = [0; 4];
             match file.read_exact(&mut len) {
+                // The file ends before its records do: a damaged length skipped past them.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && index < end => {
+                    return Err(invalid(format!("damaged record before {index} in segment {segment}")));
+                }
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 result => result?,
             }
@@ -562,6 +569,21 @@ mod tests {
         bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         fs::write(&path, bytes).unwrap();
         assert_eq!(log.read(1, usize::MAX).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A damaged length that skips the rest of the file is an error, not an empty read: the
+    /// records after it are there, damaged, not missing.
+    #[test]
+    fn a_damaged_length_skipped_over_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, _) = open(dir.path());
+        log.append(&test_records(1, 3)).unwrap();
+        let path = segment_path(dir.path(), 1);
+        let mut bytes = fs::read(&path).unwrap();
+        let to_end = u32::try_from(bytes.len() - 4).unwrap();
+        bytes[..4].copy_from_slice(&to_end.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(log.read(3, usize::MAX).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     /// Truncating reads the records it keeps: damage there is an error, not a panic.
