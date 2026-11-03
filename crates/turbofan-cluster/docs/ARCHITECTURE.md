@@ -2,8 +2,8 @@
 
 An overview of how Turbofan fits together, for working on it. Each crate's README says how to use
 it, [WIRE.md](WIRE.md) how the wire protocol may change,
-[ROADMAP.md](ROADMAP.md) what's left, and Turbojet's
-[STYLE.md](../../../../turbojet/docs/STYLE.md) the house style.
+[ROADMAP.md](ROADMAP.md) what's left, and
+[STYLE.md](../../../docs/STYLE.md) the house style.
 
 ## The crates
 

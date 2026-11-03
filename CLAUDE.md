@@ -1,8 +1,8 @@
 # Working on Turbofan
 
 Turbofan: a Raft-replicated state machine framework in Rust, and an OMS built on it.
-The house style is Turbojet's [STYLE.md](../turbojet/docs/STYLE.md) (Tiger Style): read it before
-writing code.
+The house style is [docs/STYLE.md](docs/STYLE.md) (Tiger Style, adapted from Turbojet's): read it
+before writing code.
 
 - `crates/turbofan-cluster` is the reusable core. It must never depend on a service or mention
   what one does: service payloads are opaque bytes. `raft/` replicates opaque records and knows nothing of
