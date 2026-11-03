@@ -35,6 +35,10 @@
 //! one member of a new cluster, of a new epoch, from its log as it is: fence the old cluster first.
 //! Its nodes can't talk to the new one, which grows with `add-member`.
 //!
+//! The log isn't synced to disk: the other nodes' copies are the redundancy, and a crashed
+//! process loses nothing, but a majority losing power together may lose committed entries.
+//! `serve --fsync` syncs it once a batch, before acknowledging it.
+//!
 //! TLS is optional. `serve --tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca
 //! <pem>` puts it on all three listeners and to peers (see [`crate::tls`]); the operators'
 //! commands then take `--tls-ca <pem> --tls-cert <pem> --tls-key <pem>`, a certificate the admin
@@ -45,6 +49,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::driver::{self, serve};
+
 use crate::node::{self, Service};
 use crate::raft::{self, Member, NodeId};
 use crate::remote::{Admin, AdminError};
@@ -201,6 +206,7 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
         node,
         service_id,
         data_dir: flag(args, "--data")?.into(),
+        log_fsync: if args.iter().any(|a| a == "--fsync") { driver::Fsync::EachBatch } else { driver::Fsync::Never },
         client_listen: own(&clients),
         admin_listen: own(&admins),
         peer_addrs: peers,

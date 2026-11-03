@@ -127,6 +127,7 @@ fn start(dir: &Path, tls: bool) -> (Vec<String>, Option<ClientTls>) {
             },
             service_id: SERVICE_ID,
             data_dir: dir.join(id.to_string()),
+            log_fsync: driver::Fsync::default(),
             peer_addrs: ids.iter().map(|&m| (m, addr(0, m))).collect(),
             client_listen: addr(3, id),
             admin_listen: addr(6, id),

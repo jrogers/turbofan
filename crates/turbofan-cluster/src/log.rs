@@ -1,7 +1,9 @@
 //! The log on disk: [`Record`]s appended to segment files named by their first index.
 //!
-//! Appends are written straight away and made durable by [`Log::sync`], which the driver calls
-//! once per batch (group commit). On open, the last segment's tail is scanned and a torn record
+//! Appends are written straight away and, with [`Fsync::EachBatch`], made durable by [`Log::sync`],
+//! which the driver calls once per batch (group commit). By default ([`Fsync::Never`]) the log
+//! isn't synced: a crashed process loses nothing, but a machine losing power may lose what it
+//! acknowledged, and the copies on the other nodes are what keep it. On open, the last segment's tail is scanned and a torn record
 //! (power lost mid-write) truncated: damage with nothing whole after it. Damage anywhere else is an
 //! error, since those records were synced and may be committed and acknowledged: a node with it
 //! refuses to start, to be replaced, rather than lose them.
@@ -23,6 +25,17 @@ use crate::raft::Entries;
 /// A segment is closed and a new one started once it holds this much.
 pub const MAX_SEGMENT_BYTES: u64 = 64 << 20;
 
+/// Whether the log is synced to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fsync {
+    /// Never: the OS writes it back when it will. The cluster's copies on other machines are the
+    /// redundancy; a majority losing power together may lose committed entries.
+    #[default]
+    Never,
+    /// Once a batch, before it's acknowledged: committed entries survive any crash.
+    EachBatch,
+}
+
 /// An open log directory, locked against a second process.
 #[derive(Debug)]
 pub struct Log {
@@ -33,7 +46,7 @@ pub struct Log {
     file_len: u64,
     /// A segment is closed once it holds this much: [`MAX_SEGMENT_BYTES`] unless simulated.
     segment_bytes: u64,
-    /// Syncs are made: unless simulated.
+    /// Syncs are made: with [`Fsync::EachBatch`], never simulated.
     sync: bool,
     /// A damaged tail was truncated, and the log hasn't been trusted since.
     doubt: bool,
@@ -54,8 +67,8 @@ impl Log {
     ///
     /// If the directory is locked by another process, can't be read, or holds damaged records
     /// before the last segment's tail.
-    pub fn open(dir: &Path, each: impl FnMut(Record<'_>)) -> io::Result<Self> {
-        Self::open_with(dir, MAX_SEGMENT_BYTES, true, each)
+    pub fn open(dir: &Path, fsync: Fsync, each: impl FnMut(Record<'_>)) -> io::Result<Self> {
+        Self::open_with(dir, MAX_SEGMENT_BYTES, fsync == Fsync::EachBatch, each)
     }
 
     /// [`Log::open`], for a simulation, whose crashes are modelled: segments close once they
@@ -281,7 +294,7 @@ impl Log {
         Ok(out)
     }
 
-    /// Makes everything appended so far durable.
+    /// Makes everything appended so far durable: a no-op with [`Fsync::Never`].
     ///
     /// # Errors
     ///
@@ -458,7 +471,7 @@ mod tests {
     /// Opens the log, with the indices of the records it holds.
     fn open(dir: &Path) -> (Log, Vec<u64>) {
         let mut found = Vec::new();
-        let log = Log::open(dir, |r| found.push(r.index)).unwrap();
+        let log = Log::open(dir, Fsync::EachBatch, |r| found.push(r.index)).unwrap();
         (log, found)
     }
 
@@ -491,7 +504,7 @@ mod tests {
     fn a_second_process_is_locked_out() {
         let dir = tempfile::tempdir().unwrap();
         let _log = open(dir.path());
-        assert_eq!(Log::open(dir.path(), |_| {}).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(Log::open(dir.path(), Fsync::EachBatch, |_| {}).unwrap_err().kind(), io::ErrorKind::WouldBlock);
     }
 
     /// Power lost mid-write leaves any prefix of the last record: it's dropped, and the log goes
@@ -539,7 +552,7 @@ mod tests {
         let mut records = test_records(1, 3);
         records[RECORD_HEADER + 2] ^= 1;
         fs::write(segment_path(dir.path(), 1), records).unwrap();
-        assert_eq!(Log::open(dir.path(), |_| {}).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(Log::open(dir.path(), Fsync::EachBatch, |_| {}).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     /// What's read back for a follower is checked: damage is an error, not served.
@@ -606,7 +619,7 @@ mod tests {
         first[10] ^= 1;
         fs::write(segment_path(dir.path(), 1), first).unwrap();
         fs::write(segment_path(dir.path(), 3), test_records(3, 1)).unwrap();
-        assert_eq!(Log::open(dir.path(), |_| {}).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(Log::open(dir.path(), Fsync::EachBatch, |_| {}).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::codec::{self, MAGIC, MAX_FRAME_BYTES};
+pub use crate::log::Fsync;
 use crate::log::Log;
 use crate::meta::MetaFile;
 use crate::metrics;
@@ -63,6 +64,9 @@ pub struct Config {
     pub service_id: u32,
     /// The log, meta and snapshots.
     pub data_dir: PathBuf,
+    /// Whether the log is synced: by default not, the other nodes' copies being the redundancy.
+    /// The term and vote, and snapshots, are synced regardless.
+    pub log_fsync: Fsync,
     /// Peers' addresses, this node's included: it listens on its own, and dials the others as
     /// well as the members.
     pub peer_addrs: Vec<(NodeId, SocketAddr)>,
@@ -110,7 +114,8 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     }
     let tls = config.tls.as_ref().map(tls::Loaded::load).transpose()?;
     let id = config.node.raft.id;
-    let (storage, meta, snapshot, log) = Storage::open(&config.data_dir, config.node.raft.log_window_bytes)?;
+    let (storage, meta, snapshot, log) =
+        Storage::open(&config.data_dir, config.log_fsync, config.node.raft.log_window_bytes)?;
     let mut clock = Clock::new();
     let mut node =
         Node::new(config.node.clone(), service, meta, snapshot.as_ref().map(|s| s.0.clone()), log, clock.now());
@@ -375,13 +380,14 @@ impl Storage {
     #[allow(clippy::type_complexity, reason = "the four parts of a node's durable state")]
     fn open(
         dir: &Path,
+        fsync: Fsync,
         window_bytes: usize,
     ) -> io::Result<(Self, crate::meta::Meta, Option<(crate::raft::Snapshot, impl io::Read + use<>)>, Entries)> {
         let snapshots = dir.join("snapshots");
         std::fs::create_dir_all(&snapshots)?;
         let snapshot = snapshot::load(&snapshots)?;
         let mut entries = Entries::default();
-        let mut log = Log::open(&dir.join("log"), |record| entries.recover(record, window_bytes))?;
+        let mut log = Log::open(&dir.join("log"), fsync, |record| entries.recover(record, window_bytes))?;
         log.resume(snapshot.as_ref().map(|(s, _)| s.index), &mut entries)?;
         let (meta_file, meta) = MetaFile::open(&dir.join("meta"))?;
         Ok((Self { log, meta: meta_file, snapshots }, meta, snapshot, entries))

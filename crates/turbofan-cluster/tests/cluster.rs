@@ -104,6 +104,7 @@ impl Cluster {
                 },
                 service_id: SERVICE_ID,
                 data_dir: dir.join(id.to_string()),
+                log_fsync: driver::Fsync::default(),
                 // The first three know nothing of the fourth until it's added.
                 peer_addrs: ids.iter().filter(|&&m| m <= id.max(NodeId(3))).map(|&m| (m, addr(0, m))).collect(),
                 client_listen: addr(4, id),
