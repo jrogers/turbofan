@@ -214,7 +214,7 @@ session lasts:
 
 | What | Where | How it survives a crash |
 |---|---|---|
-| The log | `log.rs` | Records in segment files named by their first index, not synced by default (`Fsync::Never`): a crashed process loses nothing, and the other nodes' copies cover a machine lost; a majority losing power together may lose committed entries. `Fsync::EachBatch` (`serve --fsync`) syncs once a batch. On open, a torn last record is truncated; damage anywhere else stops the node, to be replaced. |
+| The log | `log.rs` | Records in segment files named by their first index, not synced by default (`Fsync::Never`): a crashed process loses nothing, and the other nodes' copies cover a machine lost; a majority losing power together may lose committed entries. It's still synced behind the writes, every 4 MiB, on a thread nothing waits for: else the OS lets unwritten data pile up, then stalls every write for seconds while it writes it out. `Fsync::EachBatch` (`serve --fsync`) syncs once a batch. On open, a torn last record is truncated; damage anywhere else stops the node, to be replaced. |
 | Term and vote | `meta.rs` | Two fixed slots, written alternately and synced, each with a generation and a checksum: a torn write leaves the other whole. |
 | Snapshots | `snapshot.rs` | Written to a temporary file, synced, renamed, then the directory synced: the old one or the new one, whole. A checksum covers the bytes and the members. |
 
