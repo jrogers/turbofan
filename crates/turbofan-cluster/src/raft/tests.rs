@@ -14,6 +14,7 @@ fn config(id: u8, members: &[u8]) -> Config {
         heartbeat: Duration::from_millis(50),
         seed: u64::from(id),
         log_window_bytes: usize::MAX,
+        log_tail_entries: 0,
         max_uncommitted_bytes: usize::MAX,
     }
 }
@@ -507,6 +508,49 @@ fn a_follower_behind_the_window_is_sent_records_read_back() {
     deliver(&mut rafts, &[1, 3], 1, sends, now);
     assert_eq!((rafts[2].last_index(), rafts[2].entry(2)), (3, Some(&b"b"[..])));
     assert_eq!(rafts[0].entry(1), None, "read records are kept for one round");
+}
+
+/// A follower behind the leader's snapshot, but within the tail it keeps before it, is sent the
+/// log; without a tail, the snapshot. Restarted, the leader keeps the tail it has on disk.
+#[test]
+fn a_follower_within_the_tail_is_sent_the_log_not_the_snapshot() {
+    for tail in [3, 0] {
+        let mut rafts = cluster(3);
+        rafts[0].config.log_tail_entries = tail;
+        let now = 1000 * MS;
+        elect(&mut rafts, &[1, 2, 3], 1, now);
+        for (payload, up) in [(b"a", &[1, 2, 3][..]), (b"b", &[1, 2, 3]), (b"c", &[1, 2]), (b"d", &[1, 2])] {
+            rafts[0].propose(payload);
+            let sends = flush(&mut rafts[0]);
+            deliver(&mut rafts, up, 1, sends, now);
+        }
+        assert_eq!((rafts[0].commit_index(), rafts[2].last_index()), (4, 2), "node 3 missed 3 and 4");
+        let members = rafts[0].members_at(4);
+        let term = rafts[0].term_at(4).unwrap();
+        rafts[0].on_snapshot_saved(Snapshot { index: 4, term, len: 1, checksum: 0, members });
+        let out = rafts[0].take_outputs();
+        let kept = if tail == 3 { 1 } else { 4 };
+        assert_eq!(out.persist, [Persist::Compact { log: kept, snapshot: 4 }]);
+        assert_eq!((rafts[0].snapshot_index(), rafts[0].term_at(kept)), (4, Some(term)));
+
+        heartbeat(&mut rafts, &[1, 2, 3], 1);
+        let sending = rafts[0].peers.iter().find(|p| p.id == NodeId(3)).unwrap().sending.is_some();
+        if tail == 3 {
+            assert!(!sending, "sent the log");
+            assert_eq!((rafts[2].last_index(), rafts[2].entry(4)), (4, Some(&b"d"[..])));
+        } else {
+            assert!(sending, "sent the snapshot");
+            assert_eq!(rafts[2].last_index(), 2);
+        }
+    }
+
+    // Restarted with the whole log on disk, it keeps a tail of 3, its first entry's term known.
+    let snapshot = Snapshot { index: 4, term: 2, len: 1, checksum: 0, members: vec![member(1)] };
+    let mut config = config(1, &[1]);
+    config.log_tail_entries = 3;
+    let raft = Raft::new(config, Meta { term: 2, vote: None }, Some(snapshot), entries(&[1, 1, 2, 2, 2]), 0);
+    assert_eq!((raft.snapshot_index(), raft.commit_index(), raft.last_index()), (4, 4, 5));
+    assert_eq!((raft.term_at(0), raft.term_at(1), raft.term_at(3)), (None, Some(1), Some(2)), "kept from 2");
 }
 
 /// A leader sends a follower several chunks of a snapshot before hearing back, and sends

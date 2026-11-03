@@ -390,10 +390,10 @@ impl Disk {
                 log.truncate_from(*index)?;
                 self.log.truncate(usize::try_from(index - self.first).unwrap());
             }
-            Persist::Compact(index) => {
-                let first = log.compact_to(*index)?;
+            Persist::Compact { log: to, snapshot } => {
+                let first = log.compact_to(*to)?;
                 self.compact_to(first);
-                snapshot::remove_older(self.snapshots.path(), *index).unwrap();
+                snapshot::remove_older(self.snapshots.path(), *snapshot).unwrap();
             }
             Persist::SnapshotChunk { offset, bytes, .. } => {
                 snapshot::write_chunk(self.snapshots.path(), *offset, bytes).unwrap();
@@ -1591,6 +1591,8 @@ impl Sim {
                 heartbeat: Duration::from_millis(50),
                 seed: self.seed ^ (u64::from(id) << 32) ^ sim_node.incarnation,
                 log_window_bytes: self.window,
+                // None, some, or more than a snapshot's interval.
+                log_tail_entries: [0, 50, 1000][usize::try_from(self.seed % 3).unwrap()],
                 max_uncommitted_bytes: 64 << 20,
             },
             session_timeout: Duration::from_millis(10_000),

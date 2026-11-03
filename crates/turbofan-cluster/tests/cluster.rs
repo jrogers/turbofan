@@ -95,6 +95,7 @@ impl Cluster {
                         heartbeat: Duration::from_millis(50),
                         seed: u64::from(id),
                         log_window_bytes: 64 << 20,
+                        log_tail_entries: 100_000,
                         max_uncommitted_bytes: 64 << 20,
                     },
                     session_timeout: Duration::from_millis(10_000),

@@ -138,6 +138,14 @@ impl Entries {
         }
     }
 
+    /// Where to compact to for a snapshot of `index`, keeping as many as `tail` entries before
+    /// it: never before the log's first entry, whose term is known, nor before a change of members
+    /// at or before `index`, so the members before what's kept are the snapshot's.
+    pub(super) fn compact_point(&self, index: u64, tail: u64) -> u64 {
+        let config = self.configs.iter().rev().map(|&(at, _)| at).find(|&at| at <= index).unwrap_or(0);
+        self.first.max(index.saturating_sub(tail)).max(config).min(index)
+    }
+
     /// Lets the records up to `index` leave memory, oldest first, while there are more than
     /// `max_bytes`.
     pub(super) fn evict(&mut self, index: u64, max_bytes: usize) {

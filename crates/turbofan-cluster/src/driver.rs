@@ -427,9 +427,9 @@ impl Storage {
             Persist::Append(records) => self.log.append(records)?,
             Persist::TruncateFrom(index) => self.log.truncate_from(*index)?,
             Persist::Trust => self.log.trust()?,
-            Persist::Compact(index) => {
-                self.log.compact_to(*index)?;
-                snapshot::remove_older(&self.snapshots, *index)?;
+            Persist::Compact { log, snapshot } => {
+                self.log.compact_to(*log)?;
+                snapshot::remove_older(&self.snapshots, *snapshot)?;
             }
             Persist::SnapshotChunk { offset, bytes, .. } => snapshot::write_chunk(&self.snapshots, *offset, bytes)?,
             Persist::InstallSnapshot { snapshot, replace_log } => {

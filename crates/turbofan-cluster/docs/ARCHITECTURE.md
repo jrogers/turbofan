@@ -122,7 +122,9 @@ flowchart TB
   and the batches it gives are queued, to be written next, together, with one sync: that's the
   group commit. Only a restore from a snapshot waits for the disk.
 - **Snapshots are taken off the apply path.** `Service::snapshot` returns a frozen copy, which a
-  thread writes out while the node goes on applying. The log is compacted once it's durable.
+  thread writes out while the node goes on applying. The log is compacted once it's durable,
+  but for a tail before it (`log_tail_entries`, 100,000 by default): a follower that's behind
+  the snapshot but within the tail is sent the log, not the whole snapshot.
 
 ## One batch
 

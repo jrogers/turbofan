@@ -35,12 +35,8 @@ are a snapshot. Nodes report through the
   automatic: from the other region a dead cluster and a cut link look alike, and two clusters
   taking orders fill twice, so an operator fences the old one first. Nothing waits for a learner
   to catch up, but `status` shows how far behind it is, and `add-member --learner --wait <n>`
-  returns once it's within `n` entries. Left:
-  - *A log tail past the snapshot:* a snapshot trims the log to its index (`on_snapshot_saved`,
-    `src/raft/snapshots.rs`), so a follower one entry behind it is sent the whole snapshot: over
-    a WAN, a learner's brief cut costs a full transfer. Keep so many entries past it, and send a
-    follower within them the log instead. Compaction drops whole segments, so most of the tail is
-    on disk already.
+  returns once it's within `n` entries. A snapshot keeps a tail of the log before it, so a
+  learner briefly cut off is sent the entries it missed rather than the whole snapshot. Left:
   - *A member's role changed in place:* a learner made a voter, or a voter a learner, is one
     `Members` entry that adds or removes one voter, safe as a single-server change once the
     learner has caught up. Today it's `remove-member` then `add-member`, which ships the whole log

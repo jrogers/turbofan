@@ -41,7 +41,8 @@ impl Raft {
     }
 
     /// A snapshot of committed state this node took is durable: it replaces the log up to its
-    /// index. One no newer than the latest (a snapshot from the leader overtook it) is ignored.
+    /// index, but for a tail of [`Config::log_tail_entries`] before it. One no newer than the
+    /// latest (a snapshot from the leader overtook it) is ignored.
     ///
     /// # Panics
     ///
@@ -53,10 +54,12 @@ impl Raft {
         assert!(snapshot.index <= self.commit, "only committed state is snapshotted");
         assert_eq!(self.term_at(snapshot.index), Some(snapshot.term));
         assert_eq!(snapshot.members, self.members_at(snapshot.index), "a snapshot's members are those at its index");
-        self.log.trim_to(snapshot.index);
-        self.base_term = snapshot.term;
+        let to = self.log.compact_point(snapshot.index, self.config.log_tail_entries);
+        self.base_term = self.term_at(to).expect("the compaction point is in the log");
+        self.log.trim_to(to);
+        // No change of members after `to` and up to the snapshot: they're the snapshot's.
         self.base_members.clone_from(&snapshot.members);
-        self.out.persist.push(Persist::Compact(snapshot.index));
+        self.out.persist.push(Persist::Compact { log: to, snapshot: snapshot.index });
         self.use_snapshot(snapshot);
     }
 

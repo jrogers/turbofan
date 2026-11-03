@@ -4,7 +4,9 @@
 //! reads committed payloads back with [`Raft::entry`]. Inputs are `on_*` calls with the time;
 //! [`Raft::take_outputs`] returns what to persist and what to send.
 //!
-//! The log since the snapshot is on disk; memory holds every entry's term, and the records of
+//! The log since the snapshot is on disk, and a tail before it ([`Config::log_tail_entries`]), so
+//! a follower just behind the snapshot is sent the log rather than all of it; memory holds every
+//! entry's term, and the records of
 //! the entries not yet applied and of a window of the latest applied ([`Config::log_window_bytes`]).
 //! When a lagging follower or a restart needs older records, [`Outputs::reads`] asks for them,
 //! and the driver reads them back from disk and hands them to [`Raft::on_read`].
@@ -167,6 +169,11 @@ pub struct Config {
     /// The most bytes of applied records kept in memory. Older ones are read back from disk
     /// when a lagging follower needs them.
     pub log_window_bytes: usize,
+    /// Entries kept before a snapshot this node takes, so a follower that far behind it is sent
+    /// the log rather than the whole snapshot (a learner's brief cut over a WAN, say). Their terms
+    /// stay in memory, a few bytes a term; their records on disk. Fewer are kept past a change
+    /// of members: none before the latest at or before the snapshot.
+    pub log_tail_entries: u64,
     /// A leader with this many bytes of its proposals not yet committed is backlogged
     /// ([`Raft::backlogged`]): its driver takes no more from clients until they commit.
     pub max_uncommitted_bytes: usize,
@@ -241,8 +248,13 @@ pub struct Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Persist {
     /// A snapshot this node saved ([`Raft::on_snapshot_saved`]) is durable: drop the log up to
-    /// this index.
-    Compact(u64),
+    /// `log`, which is at or before it, and older snapshots than `snapshot`.
+    Compact {
+        /// The last index of the log to drop.
+        log: u64,
+        /// The snapshot's index.
+        snapshot: u64,
+    },
     /// Part of a snapshot arriving from the leader: write it at `offset`. Offset 0 starts it
     /// afresh.
     SnapshotChunk {
@@ -435,15 +447,23 @@ impl Raft {
         assert!(config.members.iter().all(Member::fits), "addresses fit the wire");
         assert!(config.heartbeat * 2 < config.election_timeout);
         assert!(config.election_timeout < MAX_TIMEOUT, "times in nanoseconds can't overflow");
-        let (base_index, base_term) = snapshot.as_ref().map_or((0, 0), |s| (s.index, s.term));
+        let (base_index, mut base_term) = snapshot.as_ref().map_or((0, 0), |s| (s.index, s.term));
         let base_members = snapshot.as_ref().map_or_else(|| config.members.clone(), |s| s.members.clone());
         let doubt = log.doubt.then_some(meta.term);
         let mut log = log;
-        log.trim_to(base_index);
+        // What's on disk of the tail before the snapshot is kept, as when the snapshot was taken.
+        let to = if log.terms.is_empty() { base_index } else { log.compact_point(base_index, config.log_tail_entries) };
+        if to < base_index {
+            base_term = log.term_at(to).expect("the compaction point is in the log");
+        }
+        log.trim_to(to);
         if log.terms.is_empty() {
             log = Entries::starting_at(base_index + 1);
         }
-        assert_eq!(log.first, base_index + 1, "the log continues from the snapshot");
+        assert!(
+            log.first == base_index + 1 || (log.first <= base_index && log.last() >= base_index),
+            "the log continues from the snapshot, or a tail before it"
+        );
         // Mixed first: `seed | 1` alone makes seeds 2 and 3 the same, and two nodes with the same
         // jitter split every vote.
         let rng = config.seed.wrapping_add(0x9e37_79b9_7f4a_7c15).wrapping_mul(0xbf58_476d_1ce4_e5b9) | 1;
@@ -592,10 +612,11 @@ impl Raft {
         self.log.term_at(index)
     }
 
-    /// The index the latest snapshot covers to (0 for none). The log holds what follows it.
+    /// The index the latest snapshot covers to (0 for none). The log holds what follows it, and
+    /// may hold a tail before it ([`Config::log_tail_entries`]).
     #[must_use]
     pub fn snapshot_index(&self) -> u64 {
-        self.log.first - 1
+        self.snapshot.as_ref().map_or(0, |s| s.index)
     }
 
     /// The latest snapshot.
