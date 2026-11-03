@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turbofan: replicated state machines in Rust</title>
+<meta name="description" content="Turbofan is a Raft-replicated state machine framework in Rust: write a deterministic service, and a cluster keeps it running through node failures without losing or repeating a message.">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<style>
+  :root {
+    --ink: #15171c;
+    --ink-2: #4a4f5a;
+    --ink-3: #737885;
+    --paper: #ffffff;
+    --tint: #f6f5f2;
+    --panel: #ffffff;
+    --rule: #e4e2dc;
+    --accent: #2f6fed;
+    --accent-ink: #1f56c7;
+    --accent-soft: #eaf1ff;
+    --code-bg: #15171c;
+    --code-ink: #e6e4de;
+    --code-c: #8b909c;
+    --code-s: #a5d6a7;
+    --code-k: #c3a6ff;
+    --code-t: #82b1ff;
+    --code-m: #f3c969;
+    --shadow: 0 1px 2px rgba(20, 22, 28, 0.06), 0 8px 24px rgba(20, 22, 28, 0.06);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #ecebe6;
+      --ink-2: #b9b8b2;
+      --ink-3: #8d8c87;
+      --paper: #0f1013;
+      --tint: #15171b;
+      --panel: #191b20;
+      --rule: #2a2d33;
+      --accent-ink: #7aa7ff;
+      --accent-soft: #121c2e;
+      --code-bg: #0b0c0f;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre { font-family: var(--mono); font-variant-ligatures: none; }
+  code { font-size: 0.88em; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+  /* Top bar */
+  .bar { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--paper) 86%, transparent); backdrop-filter: blur(10px); border-bottom: 1px solid var(--rule); }
+  .bar .wrap { display: flex; align-items: center; gap: 24px; height: 60px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); font-weight: 700; font-size: 1.05rem; letter-spacing: -0.01em; }
+  .brand:hover { text-decoration: none; }
+  .brand img { width: 28px; height: 28px; }
+  .bar nav { display: flex; gap: 22px; margin-left: auto; font-size: 0.94rem; }
+  .bar nav a { color: var(--ink-2); }
+  .bar nav a:hover { color: var(--ink); text-decoration: none; }
+  .pill { font: 600 0.75rem var(--mono); color: var(--ink-2); border: 1px solid var(--rule); border-radius: 999px; padding: 3px 9px; }
+
+  /* Hero */
+  .hero { padding: 72px 0 56px; }
+  .hero .wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr); gap: 56px; align-items: center; }
+  .hero .wrap > * { min-width: 0; }
+  .eyebrow { font: 600 0.78rem var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-ink); margin: 0 0 14px; }
+  h1 { font-size: clamp(2.1rem, 4.2vw, 3.2rem); line-height: 1.08; letter-spacing: -0.035em; margin: 0 0 18px; }
+  .lede { font-size: 1.12rem; color: var(--ink-2); margin: 0 0 28px; max-width: 34em; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }
+  .button { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 10px; font-weight: 600; font-size: 0.97rem; border: 1px solid var(--rule); color: var(--ink); background: var(--panel); }
+  .button:hover { text-decoration: none; border-color: var(--ink-3); }
+  .button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .button.primary:hover { filter: brightness(1.06); }
+  .install { display: flex; align-items: center; gap: 10px; font: 0.86rem var(--mono); background: var(--tint); border: 1px solid var(--rule); border-radius: 10px; padding: 10px 14px; max-width: 100%; overflow-x: auto; white-space: nowrap; }
+  .install .prompt { color: var(--ink-3); user-select: none; }
+
+  /* Code window */
+  .window { background: var(--code-bg); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; border: 1px solid #23262d; }
+  .window .title { display: flex; align-items: center; gap: 7px; padding: 11px 14px; border-bottom: 1px solid #23262d; font: 0.78rem var(--mono); color: var(--code-c); }
+  .window .dot { width: 11px; height: 11px; border-radius: 50%; background: #3a3d45; }
+  .window .title span:last-child { margin-left: 8px; }
+  .window pre { margin: 0; padding: 18px 20px; overflow-x: auto; color: var(--code-ink); font: 0.8rem/1.6 var(--mono); }
+  .hero .window pre { font-size: 0.9rem; padding: 22px 24px; }
+  .c { color: var(--code-c); font-style: italic; } .s { color: var(--code-s); } .k { color: var(--code-k); } .t { color: var(--code-t); } .m { color: var(--code-m); }
+
+  /* Sections */
+  section { padding: 72px 0 8px; }
+  .window pre.shell { white-space: pre; }
+  h2 { font-size: 1.85rem; letter-spacing: -0.025em; margin: 0 0 10px; }
+  .sub { color: var(--ink-2); margin: 0 0 32px; }
+  .status { display: flex; gap: 14px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); border-radius: 12px; padding: 16px 20px; color: var(--ink); font-size: 0.95rem; margin-top: 40px; }
+  .status b { white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 14px; padding: 22px; }
+  .card h3 { font-size: 1.05rem; margin: 12px 0 6px; letter-spacing: -0.01em; }
+  .card p { margin: 0; color: var(--ink-2); font-size: 0.94rem; }
+  .icon { width: 36px; height: 36px; border-radius: 9px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-ink); }
+  .icon svg { width: 20px; height: 20px; }
+
+  /* Crates */
+  .crate { display: block; color: var(--ink); }
+  .crate:hover { text-decoration: none; border-color: var(--ink-3); }
+  .crate code { font-size: 0.95rem; font-weight: 600; color: var(--accent-ink); }
+  .crate p { margin-top: 6px; }
+
+  footer { margin-top: 88px; border-top: 1px solid var(--rule); background: var(--tint); }
+  footer .wrap { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 32px; padding-top: 40px; padding-bottom: 40px; font-size: 0.92rem; }
+  footer h4 { margin: 0 0 10px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); }
+  footer ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+  footer a { color: var(--ink-2); }
+  footer .legal { color: var(--ink-3); }
+
+  @media (max-width: 900px) {
+    .hero .wrap { grid-template-columns: minmax(0, 1fr); gap: 36px; }
+    .grid { grid-template-columns: 1fr 1fr; }
+    footer .wrap { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 600px) {
+    .wrap { padding: 0 16px; }
+    .bar nav a.wide { display: none; }
+    .hero { padding: 44px 0 40px; }
+    .grid { grid-template-columns: 1fr; }
+    .status { flex-direction: column; gap: 4px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="logo.svg" alt="">Turbofan</a>
+    <nav>
+      <a href="guide/">Guide</a>
+      <a class="wide" href="guide/architecture.html">Architecture</a>
+      <a href="https://docs.rs/turbofan-cluster">API</a>
+      <a href="https://github.com/jrogers/turbofan">GitHub</a>
+    </nav>
+    <span class="pill">v{{version}}</span>
+  </div>
+</header>
+
+<main>
+<div class="hero">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">Rust · Raft · Apache-2.0 · pre-1.0</p>
+      <h1>Fault-tolerant services in Rust.</h1>
+      <p class="lede">
+        Write your service as a deterministic state machine. Turbofan's leader orders client input
+        into a log, a quorum makes each entry durable, and every node applies it to the same
+        service. If the leader fails, another takes over with the same state, and clients carry on
+        without losing or repeating a message.
+      </p>
+      <div class="actions">
+        <a class="button primary" href="guide/">Read the guide →</a>
+        <a class="button" href="https://github.com/jrogers/turbofan">View on GitHub</a>
+      </div>
+      <div class="install"><span class="prompt">$</span><code>cargo add turbofan-cluster</code></div>
+    </div>
+    <div class="window" aria-label="Starting a node of a three-node cluster">
+      <div class="title"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span>node 1 of 3</span></div>
+      <pre class="shell"><code><span class="c">$</span> {{serve}}</code></pre>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+  <div class="status">
+    <b>Pre-1.0, not used in production yet.</b>
+    <span>Turbofan is simulated, fuzzed and tested over a real network and disk, but its APIs will
+    change before 1.0. It is provided as is, without warranty of any kind.</span>
+  </div>
+
+  <section>
+    <h2>Built so a failure loses nothing</h2>
+    <p class="sub">Safe, thoroughly tested, then fast: a replicated service is only as good as its
+    worst failover.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></svg></div>
+        <h3>Exactly once, across failover</h3>
+        <p>A client keeps one session through a change of leader: its messages are applied once and in order, and its responses arrive once and in order.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
+        <h3>Deterministically simulated</h3>
+        <p>A whole cluster and its clients run in one thread from a seed, through crashes mid-write, partitions, and lost, reordered and duplicated messages, with its guarantees checked after every event.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v16"/></svg></div>
+        <h3>Sans-IO core</h3>
+        <p>Raft and the node take inputs and return outputs: no IO and no clock reads. The tokio driver and the simulator carry them out the same way.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></div>
+        <h3>Fast</h3>
+        <p>The leader sends to followers while it syncs its own disk, and what arrives during a write is written next, together: group commit without waiting.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h10v10H7z"/><path d="M3 12h4M17 12h4M12 3v4M12 17v4"/></svg></div>
+        <h3>Operable</h3>
+        <p>Snapshots, members added and removed while it runs, learners, a standby that takes over a lost cluster, rolling restarts and upgrades, metrics, tokens and TLS.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div>
+        <h3>Opaque to your service</h3>
+        <p>The framework never looks inside your messages: they are bytes. Encode them however you like, or with <code>turbofan-sbe</code>, as the cluster does its own.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>A service</h2>
+    <p class="sub">Your code is a <code>Service</code>: every node applies the same log to it, so it
+    must be deterministic, taking time from <code>Ctx::now</code> rather than a clock. This one
+    answers each message with how many its session has sent; <code>run</code> gives it a command
+    line. The <a href="guide/first-service.html">guide's first chapter</a> builds it up.</p>
+    <div class="window" aria-label="A counter service in Turbofan">
+      <div class="title"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span>counter.rs</span></div>
+      <pre><code>{{counter}}</code></pre>
+    </div>
+  </section>
+
+  <section>
+    <h2>The crates</h2>
+    <p class="sub">The framework, and the codecs it speaks on the wire.</p>
+    <div class="grid">
+      <a class="card crate" href="https://crates.io/crates/turbofan-cluster"><code>turbofan-cluster</code><p>The framework: Raft, client sessions, timers and snapshots, a node on tokio over TCP or TLS, and its clients.</p></a>
+      <a class="card crate" href="https://crates.io/crates/turbofan-sbe"><code>turbofan-sbe</code><p>SBE (Simple Binary Encoding): codecs generated from schemas in a <code>build.rs</code>, and a schemaless API.</p></a>
+    </div>
+  </section>
+</div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a class="brand" href="./"><img src="logo.svg" alt="">Turbofan</a>
+      <p class="legal">Licensed under the Apache License, Version 2.0.</p>
+    </div>
+    <div>
+      <h4>Docs</h4>
+      <ul>
+        <li><a href="guide/">Guide</a></li>
+        <li><a href="guide/architecture.html">Architecture</a></li>
+        <li><a href="https://docs.rs/turbofan-cluster">API reference</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="https://github.com/jrogers/turbofan">GitHub</a></li>
+        <li><a href="https://github.com/jrogers/turbofan/blob/main/CHANGELOG.md">Changelog</a></li>
+        <li><a href="https://github.com/jrogers/turbofan/blob/main/crates/turbofan-cluster/docs/ROADMAP.md">Roadmap</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Crates</h4>
+      <ul>
+        <li><a href="https://crates.io/crates/turbofan-cluster">turbofan-cluster</a></li>
+        <li><a href="https://crates.io/crates/turbofan-sbe">turbofan-sbe</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

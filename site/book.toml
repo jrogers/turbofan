@@ -1,0 +1,18 @@
+# The book of the guide and the architecture overview, built by scripts/site.sh from a copy of
+# docs/ made by site/build.py; mdbook-mermaid adds its preprocessor and scripts to the copy.
+[book]
+title = "Turbofan"
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/jrogers/turbofan"
+site-url = "/turbofan/guide/"
+# The landing page's colours and type (site/theme.css, copied in by build.py).
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/turbofan.css"]
+
+# The examples need Turbofan's crates, which the Rust playground doesn't have.
+[output.html.playground]
+runnable = false

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <title>Turbofan</title>
+  <defs>
+    <!-- One fan blade: an even crescent from the hub to the ring, swept 42 degrees. -->
+    <path id="blade" d="M52.04 41.75 52.35 41.04 52.66 40.33 52.98 39.62 53.31 38.92 53.65 38.23 54.01 37.54 54.38 36.86 54.77 36.18 55.19 35.52 55.62 34.86 56.07 34.21 56.56 33.58 57.06 32.96 57.6 32.36 58.17 31.77 58.77 31.21 59.4 30.66 60.07 30.14 60.78 29.64 61.52 29.17 62.3 28.74 63.13 28.34 63.99 27.97 64.9 27.65 65.84 27.37 66.83 27.14 67.86 26.95 68.92 26.82 70 26.73 71.23 26.8 70.86 26.46 69.27 26.12 67.61 25.81 66 25.63 64.46 25.57 62.97 25.61 61.54 25.75 60.18 25.97 58.88 26.28 57.66 26.66 56.5 27.1 55.42 27.61 54.41 28.17 53.47 28.78 52.62 29.43 51.83 30.11 51.12 30.82 50.48 31.56 49.92 32.32 49.42 33.09 49 33.88 48.64 34.68 48.34 35.47 48.11 36.27 47.93 37.07 47.81 37.87 47.74 38.66 47.73 39.45 47.76 40.22 47.84 40.99 47.96 41.75Z"/>
+  </defs>
+  <rect width="100" height="100" rx="22" fill="#2F6FED"/>
+  <circle cx="50" cy="50" r="35" fill="none" stroke="#fff" stroke-width="5.5"/>
+  <g fill="#fff">
+    <use href="#blade" transform="rotate(0 50 50)"/>
+    <use href="#blade" transform="rotate(30 50 50)"/>
+    <use href="#blade" transform="rotate(60 50 50)"/>
+    <use href="#blade" transform="rotate(90 50 50)"/>
+    <use href="#blade" transform="rotate(120 50 50)"/>
+    <use href="#blade" transform="rotate(150 50 50)"/>
+    <use href="#blade" transform="rotate(180 50 50)"/>
+    <use href="#blade" transform="rotate(210 50 50)"/>
+    <use href="#blade" transform="rotate(240 50 50)"/>
+    <use href="#blade" transform="rotate(270 50 50)"/>
+    <use href="#blade" transform="rotate(300 50 50)"/>
+    <use href="#blade" transform="rotate(330 50 50)"/>
+  </g>
+  <circle cx="50" cy="50" r="9.5" fill="#fff"/>
+  <circle cx="50" cy="50" r="3.8" fill="#2F6FED"/>
+</svg>

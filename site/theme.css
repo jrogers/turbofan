@@ -1,0 +1,81 @@
+/* The guide in the landing page's colours and type (site/index.html): mdBook's light theme takes
+   its light palette and navy (the default for a reader whose system is dark) its dark one. The
+   other built-in themes stay as mdBook has them. Only mdBook's own variables are set, so a new
+   mdBook keeps working, at worst in its own colours. */
+
+:root {
+  --mono-font: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+
+html {
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+code {
+  font-variant-ligatures: none;
+}
+
+.light, html:not(.js) {
+  --bg: #ffffff;
+  --fg: #15171c;
+  --sidebar-bg: #f6f5f2;
+  --sidebar-fg: #4a4f5a;
+  --sidebar-non-existant: #737885;
+  --sidebar-active: #1f56c7;
+  --sidebar-spacer: #e4e2dc;
+  --sidebar-header-border-color: #e4e2dc;
+  --scrollbar: #c9c6be;
+  --icons: #737885;
+  --icons-hover: #15171c;
+  --links: #1f56c7;
+  --inline-code-color: #15171c;
+  --theme-popup-bg: #ffffff;
+  --theme-popup-border: #e4e2dc;
+  --theme-hover: #eaf1ff;
+  --quote-bg: #f6f5f2;
+  --quote-border: #e4e2dc;
+  --table-border-color: #e4e2dc;
+  --table-header-bg: #f6f5f2;
+  --table-alternate-bg: #fbfaf8;
+  --searchbar-border-color: #e4e2dc;
+  --searchbar-bg: #ffffff;
+  --searchbar-fg: #15171c;
+  --searchbar-shadow-color: rgba(20, 22, 28, 0.08);
+  --searchresults-header-fg: #4a4f5a;
+  --searchresults-border-color: #e4e2dc;
+  --searchresults-li-bg: #eaf1ff;
+  --search-mark-bg: #c7dafe;
+}
+
+.navy {
+  --bg: #0f1013;
+  --fg: #ecebe6;
+  --sidebar-bg: #15171b;
+  --sidebar-fg: #b9b8b2;
+  --sidebar-non-existant: #8d8c87;
+  --sidebar-active: #7aa7ff;
+  --sidebar-spacer: #2a2d33;
+  --sidebar-header-border-color: #2a2d33;
+  --scrollbar: #3a3d44;
+  --icons: #8d8c87;
+  --icons-hover: #ecebe6;
+  --links: #7aa7ff;
+  --inline-code-color: #ecebe6;
+  --theme-popup-bg: #191b20;
+  --theme-popup-border: #2a2d33;
+  --theme-hover: #121c2e;
+  --quote-bg: #191b20;
+  --quote-border: #2a2d33;
+  --table-border-color: #2a2d33;
+  --table-header-bg: #191b20;
+  --table-alternate-bg: #13151a;
+  --searchbar-border-color: #2a2d33;
+  --searchbar-bg: #191b20;
+  --searchbar-fg: #ecebe6;
+  --searchbar-shadow-color: rgba(0, 0, 0, 0.4);
+  --searchresults-header-fg: #b9b8b2;
+  --searchresults-border-color: #2a2d33;
+  --searchresults-li-bg: #121c2e;
+  --search-mark-bg: #1d3a73;
+}
