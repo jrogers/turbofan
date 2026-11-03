@@ -18,7 +18,9 @@
 //! ```
 //!
 //! `add-member --learner` adds it as a learner: it takes the log but doesn't vote, so the
-//! cluster's commits don't wait on it, as for a standby in another region. A cluster can start
+//! cluster's commits don't wait on it, as for a standby in another region. Nor does anything
+//! else wait for it to catch up: `--wait <entries>` returns once it's within that many of the
+//! leader's log, and `status --admin <addr>` shows how far behind each member is. A cluster can start
 //! with learners too: `serve --learners 3,4`, the same on every node it starts with.
 //!
 //! Before stopping the leader, `transfer-leadership --admin <addr> [--to <n>]` hands over to a
@@ -52,7 +54,7 @@ use crate::driver::{self, serve};
 
 use crate::node::{self, Service};
 use crate::raft::{self, Member, NodeId};
-use crate::remote::{Admin, AdminError};
+use crate::remote::{Admin, AdminError, ClusterStatus};
 use crate::tls::{ClientTls, NodeTls};
 
 /// A new member may take a while to catch up.
@@ -63,8 +65,10 @@ const ADMIN_TOKEN: &str = "TURBOFAN_ADMIN_TOKEN";
 /// The peer token's environment variable.
 const PEER_TOKEN: &str = "TURBOFAN_PEER_TOKEN";
 /// The operators' commands.
-const COMMANDS: [&str; 7] =
-    ["snapshot", "add-member", "remove-member", "activate", "shutdown", "transfer-leadership", "promote"];
+const COMMANDS: [&str; 8] =
+    ["snapshot", "add-member", "remove-member", "activate", "shutdown", "transfer-leadership", "promote", "status"];
+/// How often `add-member --wait` asks how far behind the new member is.
+const WAIT_POLL: Duration = Duration::from_secs(2);
 
 const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
@@ -72,6 +76,8 @@ const USAGE: &str = "usage:
         [--tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca <pem>]
   snapshot --admin <addr>
   add-member --admin <addr> --member <n>=<peer addr>,<client addr>,<admin addr> [--learner]
+        [--wait <entries>]
+  status --admin <addr>
   remove-member --admin <addr> --id <n>
   transfer-leadership --admin <addr> [--to <n>]
   shutdown --admin <addr>
@@ -124,9 +130,17 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
         "add-member" => {
             let member = Member { learner: args.iter().any(|a| a == "--learner"), ..member(&flag(args, "--member")?)? };
             let admin = admin.with_timeout(MEMBERS_REQUEST_TIMEOUT);
-            let index = runtime()?.block_on(admin.add_member(&member)).map_err(failed)?;
+            let wait = match flag(args, "--wait") {
+                Ok(n) => Some(n.parse::<u64>().map_err(|_| "--wait: a number of entries".to_owned())?),
+                Err(_) => None,
+            };
+            let runtime = runtime()?;
+            let index = runtime.block_on(admin.add_member(&member)).map_err(failed)?;
             let what = if member.learner { "learner" } else { "member" };
             println!("{what} {} added at index {index}", member.id);
+            if let Some(within) = wait {
+                runtime.block_on(wait_caught_up(&admin, member.id, within)).map_err(failed)?;
+            }
         }
         "remove-member" => {
             let id: NodeId = flag(args, "--id")?.parse().map_err(|_| "--id: a number from 1".to_owned())?;
@@ -161,9 +175,33 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             let leader = runtime()?.block_on(admin.transfer_leadership(to)).map_err(failed)?;
             println!("node {leader} leads");
         }
+        "status" => print_status(&runtime()?.block_on(admin.status()).map_err(failed)?),
         _ => unreachable!("one of COMMANDS"),
     }
     Ok(())
+}
+
+fn print_status(status: &ClusterStatus) {
+    println!("leader {}, last index {}, commit index {}", status.leader, status.last_index, status.commit_index);
+    for m in &status.members {
+        let (role, lag) = (if m.learner { "learner" } else { "voter" }, status.lag(m.id).unwrap_or(0));
+        println!("member {} {role}: matched {}, {lag} behind", m.id, m.matched);
+    }
+}
+
+/// Waits for member `id` to be within `within` entries of the leader's log, saying how far behind
+/// it is meanwhile.
+async fn wait_caught_up(admin: &Admin, id: NodeId, within: u64) -> Result<(), AdminError> {
+    loop {
+        // Committed, it's a member: absent, it was removed since.
+        let Some(lag) = admin.status().await?.lag(id) else { return Err(AdminError::MembersRefused) };
+        if lag <= within {
+            println!("member {id} is {lag} entries behind: caught up");
+            return Ok(());
+        }
+        println!("member {id} is {lag} entries behind");
+        tokio::time::sleep(WAIT_POLL).await;
+    }
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {

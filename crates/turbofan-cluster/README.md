@@ -99,6 +99,8 @@ delete the `doubt` file in its `--data` directory's `log/`, and restart it.
 
 Before stopping the leader, for a rolling restart, `transfer-leadership --admin <addr> [--to <n>]`
 hands over to a caught-up member: a quick election instead of waiting out an election timeout.
+`status --admin <addr>` shows, as the leader knows them, its log's end and commit index, and how
+far behind each member is.
 A node reports its role, term, indices, sessions, followers' lag and commit latency through the
 [`metrics`](https://docs.rs/metrics) facade (`src/metrics.rs` lists them): install a recorder, a
 Prometheus exporter say, in the binary before `run` to collect them.

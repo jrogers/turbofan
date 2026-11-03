@@ -284,9 +284,17 @@ async fn a_promoted_learner_leads_a_cluster_of_its_own() {
     let learner = raft::Member { learner: true, ..member(&cluster.addrs, NodeId(4)) };
     admin(1).add_member(&learner).await.unwrap();
     exchange(&mut cluster, &mut client, 101, 200).await;
-    // Commits don't wait on a learner: give it time to catch up, as an operator would (it reports
-    // its lag), before the cluster is lost.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Commits don't wait on a learner: wait for it to catch up, as an operator would, before the
+    // cluster is lost. The leader reports every member.
+    loop {
+        let status = admin(1).status().await.unwrap();
+        assert_eq!(status.members.len(), 4);
+        assert!(status.members.iter().any(|m| m.id == NodeId(4) && m.learner));
+        if status.lag(NodeId(4)) == Some(0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let refused = admin(3).promote().await.unwrap_err();
     assert!(matches!(refused, AdminError::NotPromoted), "it hears its leader: {refused:?}");
 

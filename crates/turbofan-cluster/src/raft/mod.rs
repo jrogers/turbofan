@@ -504,6 +504,22 @@ impl Raft {
         self.peers.iter().filter(|p| self.is_member(p.id)).map(|p| (p.id, last.saturating_sub(p.matched))).collect()
     }
 
+    /// As leader, each member, and the highest index known durable on it.
+    #[must_use]
+    pub fn progress(&self) -> Vec<(&Member, u64)> {
+        if self.role != Role::Leader {
+            return Vec::new();
+        }
+        let matched = |id| {
+            if id == self.config.id {
+                self.durable
+            } else {
+                self.peers.iter().find(|p| p.id == id).map_or(0, |p| p.matched)
+            }
+        };
+        self.members().iter().map(|m| (m, matched(m.id))).collect()
+    }
+
     /// The node has stopped: it should do nothing more.
     #[must_use]
     pub fn stopped(&self) -> bool {

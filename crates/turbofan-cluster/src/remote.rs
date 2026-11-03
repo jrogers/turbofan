@@ -344,6 +344,30 @@ impl Admin {
         .await
     }
 
+    /// The cluster as its leader knows it: how far each member has the log, so an operator can
+    /// tell a learner has caught up before it's needed.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::TokenTooLong`], [`AdminError::Denied`] or [`AdminError::TimedOut`], which
+    /// a leader too old to answer gives too.
+    pub async fn status(&self) -> Result<ClusterStatus, AdminError> {
+        let request = |request_id| frame(&wire::StatusRequest { request_id });
+        self.ask(request, |reply, request_id| match reply {
+            wire::Decoded::Status(m) if m.request_id() == request_id => Some(Ok(ClusterStatus {
+                leader: NodeId(m.leader()),
+                last_index: m.last_index(),
+                commit_index: m.commit_index(),
+                members: m
+                    .member()
+                    .map(|m| MemberStatus { id: NodeId(m.id()), learner: m.learner() == 1, matched: m.matched() })
+                    .collect(),
+            })),
+            _ => None,
+        })
+        .await
+    }
+
     /// Shuts the cluster down: every member snapshots at the next index, so that a restart loads
     /// the snapshot rather than replaying the log, then stops. Returns the index, once the members
     /// have it durable.
@@ -406,11 +430,11 @@ impl Admin {
 
     /// Sends the `request` for a new request ID to the leader, following redirects from the
     /// address, until `answer` makes something of a reply.
-    async fn ask(
+    async fn ask<T>(
         &self,
         request: impl Fn(u64) -> Vec<u8>,
-        answer: impl Fn(&wire::Decoded<'_>, u64) -> Option<Result<u64, AdminError>>,
-    ) -> Result<u64, AdminError> {
+        answer: impl Fn(&wire::Decoded<'_>, u64) -> Option<Result<T, AdminError>>,
+    ) -> Result<T, AdminError> {
         if self.token.len() > MAX_TOKEN_BYTES {
             return Err(AdminError::TokenTooLong);
         }
@@ -432,6 +456,38 @@ impl Admin {
         };
         tokio::time::timeout(self.timeout, attempt).await.map_err(|_| AdminError::TimedOut)?
     }
+}
+
+/// The cluster as its leader knows it, from [`Admin::status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterStatus {
+    /// The leader that answered.
+    pub leader: NodeId,
+    /// The end of the leader's log.
+    pub last_index: u64,
+    /// The leader's commit index.
+    pub commit_index: u64,
+    /// Each member, the leader among them.
+    pub members: Vec<MemberStatus>,
+}
+
+impl ClusterStatus {
+    /// How many entries member `id` is behind the leader's log, if it's a member.
+    #[must_use]
+    pub fn lag(&self, id: NodeId) -> Option<u64> {
+        self.members.iter().find(|m| m.id == id).map(|m| self.last_index.saturating_sub(m.matched))
+    }
+}
+
+/// A member, as the leader knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberStatus {
+    /// Its ID.
+    pub id: NodeId,
+    /// It takes the log but doesn't vote.
+    pub learner: bool,
+    /// The highest index known durable on it.
+    pub matched: u64,
 }
 
 /// Why an [`Admin`] request failed.
@@ -509,14 +565,14 @@ fn refused(e: &io::Error) -> bool {
 }
 
 /// One try: `Ok(answer)`, or `Err(address)` to try instead (empty for none known yet).
-async fn ask(
+async fn ask<T>(
     addr: &str,
     hello: &Hello,
     token: &[u8],
     tls: Option<&ClientTls>,
     request: &[u8],
-    answer: impl Fn(&wire::Decoded<'_>) -> Option<Result<u64, AdminError>>,
-) -> Option<Result<Result<u64, AdminError>, String>> {
+    answer: impl Fn(&wire::Decoded<'_>) -> Option<Result<T, AdminError>>,
+) -> Option<Result<Result<T, AdminError>, String>> {
     let mut stream = match handshake(addr, hello, wire::Role::Admin, token, tls).await {
         Ok(stream) => stream,
         // Every node has the same token and CAs: no use trying another.

@@ -8,7 +8,8 @@ down when they show.
 
 Members can be added and removed while the cluster runs (`add-member`, `remove-member`, at most
 `MAX_MEMBERS` = 7), the leadership handed over (`transfer-leadership`), and the cluster shut
-down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report through the
+down (`shutdown`), and each member's progress shown (`status`); otherwise the admin operations
+are a snapshot. Nodes report through the
 `metrics` crate (`src/metrics.rs`).
 
 - **Security.** TLS is optional (`src/tls.rs`, the `tls` feature): with it, all three listeners are encrypted, and
@@ -32,11 +33,9 @@ down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report t
   (what it holds past its commit index commits), to grow with `add-member`; the old cluster's
   nodes, back, can't talk to it. Refused while the learner hears its leader, but never
   automatic: from the other region a dead cluster and a cut link look alike, and two clusters
-  taking orders fill twice, so an operator fences the old one first. Left:
-  - *Knowing a learner is ready:* commits don't wait on a learner, so nothing tells an operator
-    it has caught up before the cluster it would stand in for is lost: its lag is only the
-    `turbofan_follower_lag_entries` gauge. An `add-member --learner --wait` that returns once
-    it's within so many entries, and a `status` that shows each member's lag.
+  taking orders fill twice, so an operator fences the old one first. Nothing waits for a learner
+  to catch up, but `status` shows how far behind it is, and `add-member --learner --wait <n>`
+  returns once it's within `n` entries. Left:
   - *A log tail past the snapshot:* a snapshot trims the log to its index (`on_snapshot_saved`,
     `src/raft/snapshots.rs`), so a follower one entry behind it is sent the whole snapshot: over
     a WAN, a learner's brief cut costs a full transfer. Keep so many entries past it, and send a

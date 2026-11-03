@@ -261,6 +261,24 @@
         <field name="index" id="2" type="uint64"/>
         <field name="epoch" id="3" type="uint64"/>
     </sbe:message>
+    <!-- Each member's progress, as the leader knows it. An older leader doesn't answer. -->
+    <sbe:message name="StatusRequest" id="74">
+        <field name="requestId" id="1" type="uint64"/>
+    </sbe:message>
+    <!-- From `leader`: the end of its log, its commit index, and how far each member's log is
+         known durable (`matched`; the leader's own, its last index). -->
+    <sbe:message name="Status" id="75">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="leader" id="2" type="uint8"/>
+        <field name="lastIndex" id="3" type="uint64"/>
+        <field name="commitIndex" id="4" type="uint64"/>
+        <group name="member" id="5" dimensionType="groupSizeEncoding">
+            <field name="id" id="6" type="uint8"/>
+            <!-- 1: it takes the log but doesn't vote. -->
+            <field name="learner" id="7" type="uint8"/>
+            <field name="matched" id="8" type="uint64"/>
+        </group>
+    </sbe:message>
     <!-- Snapshot every node at the next index, then stop them. -->
     <sbe:message name="Shutdown" id="48">
         <field name="requestId" id="1" type="uint64"/>

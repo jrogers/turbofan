@@ -1,4 +1,5 @@
-//! Operators' requests: snapshots, members, activation, shutdown, leadership transfer, and promotion.
+//! Operators' requests: snapshots, members, activation, shutdown, leadership transfer, promotion,
+//! and status.
 
 use super::*;
 
@@ -7,7 +8,7 @@ impl<S: Service> Node<S> {
     /// on every node, and is answered `SnapshotTaken` once a quorum has it durable. `AddMember`
     /// and `RemoveMember` change the members, one at a time, and are answered `MembersChanged`
     /// once the change is committed, or `MembersRefused`. `Promote` is for a learner, not the
-    /// leader: see [`Raft::promote`].
+    /// leader: see [`Raft::promote`]. `StatusRequest` is answered `Status`, each member's progress.
     pub fn on_admin(&mut self, conn: ConnId, message: &wire::Decoded<'_>, now: u64) {
         self.after(now);
         // To a learner, which never leads: not for the leader, if there's one.
@@ -23,6 +24,7 @@ impl<S: Service> Node<S> {
                 | wire::Decoded::TransferLeadership(_)
                 | wire::Decoded::Shutdown(_)
                 | wire::Decoded::Activate(_)
+                | wire::Decoded::StatusRequest(_)
         );
         if !admin {
             return;
@@ -73,6 +75,7 @@ impl<S: Service> Node<S> {
                     self.send_client(conn, &wire::LeadershipTransferred { request_id, leader: 0 });
                 }
             }
+            wire::Decoded::StatusRequest(m) => self.status(conn, m.request_id()),
             _ => unreachable!("matched above"),
         }
     }
@@ -107,6 +110,17 @@ impl<S: Service> Node<S> {
         let epoch = mint_epoch(self.now, self.raft.id());
         self.propose(&wire::Epoch { timestamp: self.now, epoch, promoted: 1 });
         self.promoting = Some((conn, request_id, epoch));
+    }
+
+    /// Answers with each member's progress ([`Raft::progress`]).
+    pub(super) fn status(&mut self, conn: ConnId, request_id: u64) {
+        let progress = self.raft.progress();
+        let member: Vec<_> = progress
+            .iter()
+            .map(|&(m, matched)| wire::StatusMember { id: m.id.0, learner: u8::from(m.learner), matched })
+            .collect();
+        let (leader, last_index, commit_index) = (self.raft.id().0, self.raft.last_index(), self.raft.commit_index());
+        self.send_client(conn, &wire::Status { request_id, leader, last_index, commit_index, member: &member });
     }
 
     pub(super) fn start_change(&mut self, conn: ConnId, request_id: u64, started: bool) {
