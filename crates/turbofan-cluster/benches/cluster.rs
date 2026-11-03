@@ -1,13 +1,13 @@
 //! Throughput and latency of a three-node cluster on one machine, over real TCP and files,
-//! synced as in production. `cargo bench -p turbofan-cluster --bench cluster` prints a Markdown
+//! without fsync (the default) and with it. `cargo bench -p turbofan-cluster --bench cluster` prints a Markdown
 //! table, which CI puts in its summary.
 //!
-//! Two runs. One client with one message in flight: the latency of a commit when nothing
+//! Two runs a mode. One client with one message in flight: the latency of a commit when nothing
 //! queues. Then several clients each keeping many in flight: throughput, the latency then mostly
 //! waiting in line. Messages are 64 bytes, answered with 8. Each run measures for `BENCH_SECS`
 //! (10 by default) after a second's warm-up.
 //!
-//! With `--features tls`, both runs again on a cluster over TLS, everywhere: peers, clients.
+//! With `--features tls`, all the runs again on a cluster over TLS, everywhere: peers, clients.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -58,17 +58,20 @@ async fn main() {
         if tls && !cfg!(feature = "tls") {
             break;
         }
-        let dir = dir.path().join(if tls { "tls" } else { "plain" });
-        let (addrs, tls) = start(&dir, tls);
-        // Once a client has a session, there's a leader.
-        drop(connect(&addrs, tls.as_ref()).await);
-        bench(&addrs, tls.as_ref(), secs).await;
+        for fsync in [driver::Fsync::Never, driver::Fsync::EachBatch] {
+            let dir = dir.path().join(format!("{}-{fsync:?}", if tls { "tls" } else { "plain" }));
+            let (addrs, tls) = start(&dir, tls, fsync);
+            // Once a client has a session, there's a leader.
+            drop(connect(&addrs, tls.as_ref()).await);
+            bench(&addrs, tls.as_ref(), fsync, secs).await;
+        }
     }
 }
 
 /// Both runs on the cluster at `addrs`, a row each.
-async fn bench(addrs: &[String], tls: Option<&ClientTls>, secs: u64) {
+async fn bench(addrs: &[String], tls: Option<&ClientTls>, fsync: driver::Fsync, secs: u64) {
     let over = if tls.is_some() { ", TLS" } else { "" };
+    let over = if fsync == driver::Fsync::EachBatch { format!("{over}, fsync") } else { over.to_owned() };
     for (name, clients, window) in [("latency", 1, 1), ("throughput", 8, 256)] {
         let mut latencies = run(addrs, tls, clients, window, secs).await;
         latencies.sort_unstable();
@@ -86,9 +89,9 @@ async fn bench(addrs: &[String], tls: Option<&ClientTls>, secs: u64) {
     }
 }
 
-/// Starts three nodes on free local ports, in `dir`, over TLS if `tls`, returning where they take
+/// Starts three nodes on free local ports, in `dir`, over TLS if `tls`, syncing as `fsync`, returning where they take
 /// clients, and what a client connects with if TLS.
-fn start(dir: &Path, tls: bool) -> (Vec<String>, Option<ClientTls>) {
+fn start(dir: &Path, tls: bool, fsync: driver::Fsync) -> (Vec<String>, Option<ClientTls>) {
     let certs = dir.join("certs");
     let node_tls = tls.then(|| certify(&certs));
     // Bound, read and released: a small race with other processes.
@@ -127,7 +130,7 @@ fn start(dir: &Path, tls: bool) -> (Vec<String>, Option<ClientTls>) {
             },
             service_id: SERVICE_ID,
             data_dir: dir.join(id.to_string()),
-            log_fsync: driver::Fsync::default(),
+            log_fsync: fsync,
             peer_addrs: ids.iter().map(|&m| (m, addr(0, m))).collect(),
             client_listen: addr(3, id),
             admin_listen: addr(6, id),
