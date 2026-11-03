@@ -201,6 +201,7 @@ struct Core<S> {
     /// Peers to dial whatever the members are.
     contacts: Vec<(NodeId, String)>,
     /// The peers dialled: where, the frames for them, and the task dialling.
+    #[allow(clippy::type_complexity, reason = "debug traces only")]
     peers: HashMap<NodeId, (String, mpsc::Sender<(Instant, Vec<u8>)>, AbortHandle)>,
     dbg_drops: u64,
     dials: JoinSet<()>,
