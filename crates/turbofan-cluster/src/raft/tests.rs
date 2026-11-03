@@ -1,0 +1,871 @@
+use super::*;
+
+const MS: u64 = 1_000_000;
+
+fn member(id: u8) -> Member {
+    Member { id: NodeId(id), peer: format!("p{id}"), client: format!("c{id}"), admin: format!("a{id}"), learner: false }
+}
+
+fn config(id: u8, members: &[u8]) -> Config {
+    Config {
+        id: NodeId(id),
+        members: members.iter().map(|&m| member(m)).collect(),
+        election_timeout: Duration::from_millis(150),
+        heartbeat: Duration::from_millis(50),
+        seed: u64::from(id),
+        log_window_bytes: usize::MAX,
+        max_uncommitted_bytes: usize::MAX,
+    }
+}
+
+#[test]
+fn a_lone_member_elects_itself_and_commits() {
+    let mut raft = Raft::new(config(1, &[1]), Meta::default(), None, Entries::default(), 0);
+    raft.on_tick(raft.next_deadline());
+    assert_eq!((raft.role(), raft.term()), (Role::Leader, 1));
+    let out = raft.take_outputs();
+    assert!(out.became_leader);
+    assert_eq!(out.persist, [Persist::Meta(Meta { term: 1, vote: Some(NodeId(1)) })]);
+    assert_eq!(raft.propose(b"a"), Some(1));
+    assert_eq!(raft.commit_index(), 0, "not durable yet");
+    raft.on_persisted(raft.log_end());
+    assert_eq!((raft.commit_index(), raft.entry(1)), (1, Some(&b"a"[..])));
+}
+
+#[test]
+fn a_restarted_node_has_its_log_but_learns_the_commit_again() {
+    let mut records = Vec::new();
+    Record { term: 2, index: 1, payload: b"x" }.encode_into(&mut records);
+    let raft = Raft::new(
+        config(1, &[1, 2, 3]),
+        Meta { term: 2, vote: None },
+        None,
+        Entries::from_records(&records, usize::MAX),
+        0,
+    );
+    assert_eq!((raft.last_index(), raft.term_at(1), raft.commit_index()), (1, Some(2), 0));
+}
+
+/// Records of the given terms, from index 1.
+fn log(terms: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, &term) in terms.iter().enumerate() {
+        Record { term, index: crate::widen(i) + 1, payload: b"x" }.encode_into(&mut out);
+    }
+    out
+}
+
+/// A log of the given terms, from index 1, all in memory.
+fn entries(terms: &[u64]) -> Entries {
+    Entries::from_records(&log(terms), usize::MAX)
+}
+
+fn decode(frame: &[u8]) -> wire::Decoded<'_> {
+    codec::decode_frame(frame).unwrap().unwrap().0
+}
+
+/// Makes the batch durable and returns its appends and sends, as a driver would.
+fn flush(raft: &mut Raft) -> Vec<(NodeId, Vec<u8>)> {
+    let mut out = raft.take_outputs();
+    raft.on_persisted(raft.log_end());
+    out.appends.append(&mut out.sends);
+    out.appends
+}
+
+/// Delivers `sends` from `from`, and everything they cause, between the nodes in `up`.
+fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Vec<u8>)>, now: u64) {
+    let mut queue: Vec<_> = sends.into_iter().map(|(to, frame)| (NodeId(from), to, frame)).collect();
+    while let Some((from, to, frame)) = queue.pop() {
+        if !up.contains(&to.0) {
+            continue;
+        }
+        let raft = &mut rafts[usize::from(to) - 1];
+        raft.on_message(from, &decode(&frame), now);
+        queue.extend(flush(raft).into_iter().map(|(next, frame)| (to, next, frame)));
+    }
+}
+
+/// Times `id` out from `now` and runs its election among `up`, retrying as a real node
+/// would: a stale leader first stands down, and a pre-vote refused for a stale term teaches
+/// it the term.
+fn elect(rafts: &mut [Raft], up: &[u8], id: u8, now: u64) {
+    let mut now = now;
+    for _ in 0..3 {
+        let raft = &mut rafts[usize::from(id) - 1];
+        now = now.max(raft.next_deadline());
+        raft.on_tick(now);
+        let sends = flush(raft);
+        deliver(rafts, up, id, sends, now);
+        if rafts[usize::from(id) - 1].role() == Role::Leader {
+            return;
+        }
+    }
+    panic!("node {id} wasn't elected");
+}
+
+fn cluster(n: u8) -> Vec<Raft> {
+    let members: Vec<u8> = (1..=n).collect();
+    members.iter().map(|&id| Raft::new(config(id, &members), Meta::default(), None, Entries::default(), 0)).collect()
+}
+
+/// A leader's appends go out before its own records are durable, and it counts itself
+/// towards a commit only once they are.
+#[test]
+fn a_leader_counts_itself_towards_a_commit_only_once_durable() {
+    let mut rafts = cluster(3);
+    let now = 1000 * MS;
+    elect(&mut rafts, &[1, 2, 3], 1, now);
+    let committed = rafts[0].commit_index();
+    let index = rafts[0].propose(b"x").unwrap();
+    let out = rafts[0].take_outputs();
+    let end = rafts[0].log_end();
+    assert!(matches!(out.persist[..], [Persist::Append(_)]), "{:?}", out.persist);
+    let (_, append) = out.appends.into_iter().find(|&(to, _)| to == NodeId(2)).expect("an append for node 2");
+    rafts[1].on_message(NodeId(1), &decode(&append), now);
+    for (_, ack) in flush(&mut rafts[1]) {
+        rafts[0].on_message(NodeId(2), &decode(&ack), now);
+    }
+    assert_eq!(rafts[0].commit_index(), committed, "node 2 alone is one of three");
+    assert_eq!(end.index, index);
+    rafts[0].on_persisted(end);
+    assert_eq!(rafts[0].commit_index(), index, "with node 1 durable, two of three");
+}
+
+/// A leader is backlogged while its uncommitted proposals reach the limit, and not once a
+/// quorum has them; one that stands down forgets them.
+#[test]
+fn a_leader_is_backlogged_until_its_proposals_commit() {
+    let mut rafts = cluster(3);
+    rafts[0].config.max_uncommitted_bytes = 4;
+    let now = 1000 * MS;
+    elect(&mut rafts, &[1, 2, 3], 1, now);
+    rafts[0].propose(b"abc");
+    assert!(!rafts[0].backlogged(), "3 bytes of 4");
+    rafts[0].propose(b"d");
+    assert!(rafts[0].backlogged(), "4 bytes of 4");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, now);
+    assert!(!rafts[0].backlogged(), "committed");
+
+    rafts[0].propose(b"abcd");
+    assert!(rafts[0].backlogged());
+    elect(&mut rafts, &[2, 3], 2, 2 * now);
+    let heartbeat = rafts[1].next_deadline();
+    rafts[1].on_tick(heartbeat);
+    let sends = flush(&mut rafts[1]);
+    deliver(&mut rafts, &[1, 2, 3], 2, sends, heartbeat);
+    assert_eq!(rafts[0].role(), Role::Follower);
+    assert!(!rafts[0].backlogged(), "a follower proposes nothing");
+}
+
+/// Raft's figure 8: a leader can't commit an entry of an earlier term by counting replicas,
+/// since a node that lacks it may still win an election and overwrite it.
+#[test]
+fn an_earlier_terms_entry_does_not_commit_by_counting_replicas() {
+    let mut rafts = cluster(3);
+    let second = 1000 * MS;
+    elect(&mut rafts, &[1, 2, 3], 1, second);
+    rafts[0].propose(b"one");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, second);
+    assert_eq!(rafts[0].commit_index(), 1);
+
+    // Node 1 appends index 2 in term 1 and reaches no one.
+    rafts[0].propose(b"lost");
+    flush(&mut rafts[0]);
+    // Node 2 is elected in term 2, appends index 2 of its own, and reaches no one.
+    elect(&mut rafts, &[2, 3], 2, 2 * second);
+    rafts[1].propose(b"term 2");
+    flush(&mut rafts[1]);
+    // Node 1 is elected in term 3 and replicates its term-1 index 2 to node 3: a majority.
+    elect(&mut rafts, &[1, 3], 1, 3 * second);
+    assert_eq!(rafts[0].term_at(2), Some(1));
+    let now = rafts[0].next_deadline();
+    rafts[0].on_tick(now);
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 3], 1, sends, now);
+    assert_eq!(rafts[2].term_at(2), Some(1), "node 3 has it");
+    assert_eq!(rafts[0].commit_index(), 1, "but it isn't committed");
+
+    // An entry of term 3 above it commits both.
+    rafts[0].propose(b"term 3");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 3], 1, sends, now);
+    assert_eq!(rafts[0].commit_index(), 3);
+}
+
+#[test]
+fn a_vote_is_persisted_in_the_batch_that_grants_it() {
+    let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 4, vote: None }, None, entries(&[1]), 0);
+    let mut frame = Vec::new();
+    let request = wire::RequestVote { term: 5, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0 };
+    codec::encode_frame(&request, &mut frame).unwrap();
+    raft.on_message(NodeId(2), &decode(&frame), 0);
+    let out = raft.take_outputs();
+    assert_eq!(out.persist.last(), Some(&Persist::Meta(Meta { term: 5, vote: Some(NodeId(2)) })));
+    let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
+    assert_eq!((vote.term(), vote.granted()), (5, 1));
+
+    // And not again to someone else in the term.
+    let request = wire::RequestVote { term: 5, candidate: 3, last_index: 1, last_term: 1, pre_vote: 0 };
+    frame.clear();
+    codec::encode_frame(&request, &mut frame).unwrap();
+    raft.on_message(NodeId(3), &decode(&frame), 0);
+    let out = raft.take_outputs();
+    let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
+    assert_eq!(vote.granted(), 0);
+}
+
+/// A node that knows no members yet, as one wiped and joining again under its old ID does,
+/// votes for no one: not even a candidate whose log is ahead of its own, which may be a removed
+/// node standing in members the cluster has left.
+#[test]
+fn a_node_that_knows_no_members_doesnt_vote() {
+    let mut raft = Raft::new(config(3, &[]), Meta::default(), None, Entries::default(), 0);
+    for pre_vote in [1, 0] {
+        let mut frame = Vec::new();
+        let request = wire::RequestVote { term: 5, candidate: 1, last_index: 9, last_term: 4, pre_vote };
+        codec::encode_frame(&request, &mut frame).unwrap();
+        raft.on_message(NodeId(1), &decode(&frame), 0);
+        let out = raft.take_outputs();
+        let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
+        assert_eq!(vote.granted(), 0, "pre-vote {pre_vote}");
+    }
+}
+
+/// A node whose log dropped a damaged tail may have lost an entry it acknowledged: an
+/// election counting its vote needs one more than a majority, until it holds an entry of a
+/// later term than it restarted in, when it trusts its log again.
+#[test]
+fn a_node_in_doubt_needs_one_more_vote_until_it_catches_up() {
+    let mut rafts = cluster(3);
+    let mut log = entries(&[1]);
+    log.doubt();
+    rafts[0] = Raft::new(config(1, &[1, 2, 3]), Meta { term: 1, vote: None }, None, log, 0);
+    assert!(rafts[0].in_doubt());
+    // Its own vote and node 2's are a majority, but its own is in doubt.
+    let mut now = 1000 * MS;
+    for _ in 0..3 {
+        now = now.max(rafts[0].next_deadline());
+        rafts[0].on_tick(now);
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &[1, 2], 1, sends, now);
+        assert_ne!(rafts[0].role(), Role::Leader);
+    }
+    elect(&mut rafts, &[1, 2, 3], 1, now);
+    assert!(rafts[0].in_doubt(), "nothing of the new term yet");
+    rafts[0].propose(b"y").unwrap();
+    let out = rafts[0].take_outputs();
+    assert!(matches!(out.persist[..], [Persist::Append(_), Persist::Trust]), "{:?}", out.persist);
+    assert!(!rafts[0].in_doubt());
+}
+
+/// Under a leader of the term it restarted in, which never sends an entry of a later one, a
+/// node in doubt trusts its log once an append reaches the leader's last index.
+#[test]
+fn a_node_in_doubt_trusts_its_log_once_it_has_the_leaders_whole_log() {
+    let mut doubting = entries(&[1]);
+    doubting.doubt();
+    let mut raft = Raft::new(config(2, &[1, 2, 3]), Meta { term: 2, vote: None }, None, doubting, 0);
+    let mut send = |prev_index: u64, prev_term: u64, records: &[u8], last_index: u64| {
+        let count = u32::try_from(codec::records(records).count()).unwrap();
+        let append = wire::AppendEntries {
+            term: 2,
+            leader: 1,
+            prev_index,
+            prev_term,
+            commit: 0,
+            count,
+            entries: records,
+            last_index,
+        };
+        let mut frame = Vec::new();
+        codec::encode_frame(&append, &mut frame).unwrap();
+        raft.on_message(NodeId(1), &decode(&frame), 0);
+        raft.take_outputs();
+        raft.in_doubt()
+    };
+    assert!(send(0, 0, &log(&[1, 2, 2]), 5), "the leader has two more");
+    assert!(!send(3, 2, &[], 3), "all of it");
+}
+
+/// Two voters in doubt take two more votes than a majority: either may have lost an entry.
+#[test]
+fn each_voter_in_doubt_takes_one_more_vote() {
+    let mut raft = Raft::new(config(1, &[1, 2, 3, 4, 5]), Meta { term: 1, vote: None }, None, entries(&[1]), 0);
+    raft.on_tick(raft.next_deadline());
+    raft.take_outputs();
+    assert_eq!(raft.role(), Role::PreCandidate);
+    for (from, doubt) in [(2, 1), (3, 1), (4, 0)] {
+        let mut frame = Vec::new();
+        codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt }, &mut frame).unwrap();
+        raft.on_message(NodeId(from), &decode(&frame), 0);
+    }
+    assert_eq!(raft.role(), Role::PreCandidate, "four of five, two in doubt");
+    let mut frame = Vec::new();
+    codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt: 0 }, &mut frame).unwrap();
+    raft.on_message(NodeId(5), &decode(&frame), 0);
+    assert_eq!(raft.role(), Role::Candidate, "every member");
+}
+
+/// A vote from a node in doubt says so; an older node's, without the field, doesn't.
+#[test]
+fn a_vote_from_a_node_in_doubt_says_so() {
+    let mut log = entries(&[1]);
+    log.doubt();
+    let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 1, vote: None }, None, log, 0);
+    let mut frame = Vec::new();
+    let request = wire::RequestVote { term: 2, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0 };
+    codec::encode_frame(&request, &mut frame).unwrap();
+    raft.on_message(NodeId(2), &decode(&frame), 0);
+    let out = raft.take_outputs();
+    let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
+    assert_eq!((vote.granted(), vote.doubt()), (1, Some(1)));
+
+    // As an older node sends it: version 0, without `doubt`.
+    let mut old = out.sends[0].1.clone();
+    let len = old.len() - 1;
+    old.truncate(len);
+    old[..4].copy_from_slice(&u32::try_from(len - 4).unwrap().to_le_bytes());
+    let block_len = u16::from_le_bytes([old[4], old[5]]) - 1;
+    old[4..6].copy_from_slice(&block_len.to_le_bytes());
+    old[10..12].copy_from_slice(&0_u16.to_le_bytes());
+    let wire::Decoded::Vote(vote) = decode(&old) else { panic!("not a vote") };
+    assert_eq!((vote.granted(), vote.doubt()), (1, None));
+}
+
+#[test]
+fn a_vote_is_refused_to_a_candidate_with_an_older_log() {
+    let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 2, vote: None }, None, entries(&[1, 2]), 0);
+    for (last_index, last_term) in [(1, 2), (5, 1)] {
+        let mut frame = Vec::new();
+        let request = wire::RequestVote { term: 3, candidate: 2, last_index, last_term, pre_vote: 0 };
+        codec::encode_frame(&request, &mut frame).unwrap();
+        raft.on_message(NodeId(2), &decode(&frame), 0);
+        let out = raft.take_outputs();
+        let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
+        assert_eq!(vote.granted(), 0, "({last_index}, {last_term})");
+    }
+}
+
+/// A follower with a stale tail acks, and commits, only as far as the leader's log is known
+/// to match its own.
+#[test]
+fn a_follower_acks_and_commits_only_what_matches_the_leader() {
+    let mut raft = Raft::new(config(3, &[1, 2, 3]), Meta { term: 1, vote: None }, None, entries(&[1, 1, 1]), 0);
+    let mut frame = Vec::new();
+    let append = wire::AppendEntries {
+        term: 2,
+        leader: 2,
+        prev_index: 1,
+        prev_term: 1,
+        commit: 3,
+        count: 0,
+        entries: &[],
+        last_index: 3,
+    };
+    codec::encode_frame(&append, &mut frame).unwrap();
+    raft.on_message(NodeId(2), &decode(&frame), 0);
+    let out = raft.take_outputs();
+    let wire::Decoded::AppendAck(ack) = decode(&out.sends[0].1) else { panic!("not an ack") };
+    assert_eq!((ack.success(), ack.index()), (1, 1));
+    assert_eq!(raft.commit_index(), 1);
+}
+
+/// A batch still being written when a new leader replaces its entries: it being durable says
+/// nothing of those that replaced them.
+#[test]
+fn an_earlier_batch_durable_does_not_count_entries_that_replaced_its_own() {
+    let mut raft = Raft::new(config(3, &[1, 2, 3]), Meta { term: 1, vote: None }, None, entries(&[1]), 0);
+    let mut append = |term: u64, leader: u8, records: &[(u64, u64)]| {
+        let mut bytes = Vec::new();
+        for &(index, term) in records {
+            Record { term, index, payload: b"x" }.encode_into(&mut bytes);
+        }
+        let count = u32::try_from(records.len()).unwrap();
+        let append = wire::AppendEntries {
+            term,
+            leader,
+            prev_index: 1,
+            prev_term: 1,
+            commit: 1,
+            count,
+            entries: &bytes,
+            last_index: 0,
+        };
+        let mut frame = Vec::new();
+        codec::encode_frame(&append, &mut frame).unwrap();
+        raft.on_message(NodeId(leader), &decode(&frame), 0);
+        raft.take_outputs();
+        raft.log_end()
+    };
+    let writing = append(1, 1, &[(2, 1), (3, 1)]);
+    let replaced = append(2, 2, &[(2, 2)]);
+    raft.on_persisted(writing);
+    assert_eq!(raft.durable, 1, "2 and 3 of term 1 were written, not 2 of term 2");
+    raft.on_persisted(replaced);
+    assert_eq!(raft.durable, 2);
+}
+
+#[test]
+fn a_reordered_older_append_does_not_take_the_commit_back() {
+    let mut raft = Raft::new(config(3, &[1, 2, 3]), Meta { term: 1, vote: None }, None, Entries::default(), 0);
+    let mut send = |prev_index: u64, commit: u64, entries: &[u8]| {
+        let count = u32::try_from(codec::records(entries).count()).unwrap();
+        let prev_term = u64::from(prev_index > 0);
+        let append =
+            wire::AppendEntries { term: 1, leader: 1, prev_index, prev_term, commit, count, entries, last_index: 0 };
+        let mut frame = Vec::new();
+        codec::encode_frame(&append, &mut frame).unwrap();
+        raft.on_message(NodeId(1), &decode(&frame), 0);
+        raft.take_outputs();
+        raft.commit_index()
+    };
+    assert_eq!(send(0, 2, &log(&[1, 1, 1])), 2);
+    // Sent after the first, delivered after it, matching only up to 1, with a later commit.
+    assert_eq!(send(1, 3, &[]), 2, "the commit index went back");
+}
+
+fn install_snapshot(raft: &mut Raft, last_index: u64, last_term: u64) -> Outputs {
+    let chunk = wire::InstallSnapshot {
+        term: 2,
+        leader: 1,
+        last_index,
+        last_term,
+        offset: 0,
+        done: 1,
+        checksum: 0,
+        member: &[],
+        chunk: b"state",
+    };
+    let mut frame = Vec::new();
+    codec::encode_frame(&chunk, &mut frame).unwrap();
+    raft.on_message(NodeId(1), &decode(&frame), 0);
+    raft.take_outputs()
+}
+
+/// A snapshot arriving late, after the follower caught up by appends, mustn't take away the
+/// entries after it: the follower acknowledged them.
+#[test]
+fn a_snapshot_the_log_already_matches_keeps_the_entries_after_it() {
+    let mut raft = Raft::new(config(3, &[1, 2, 3]), Meta { term: 2, vote: None }, None, entries(&[1, 1, 2, 2, 2]), 0);
+    let out = install_snapshot(&mut raft, 3, 2);
+    assert!(
+        matches!(out.persist[..], [Persist::SnapshotChunk { .. }, Persist::InstallSnapshot { replace_log: false, .. }]),
+        "{:?}",
+        out.persist
+    );
+    assert_eq!((raft.snapshot_index(), raft.last_index(), raft.commit_index()), (3, 5, 3));
+    assert!(raft.take_installed());
+}
+
+#[test]
+fn a_snapshot_the_log_doesnt_match_replaces_it() {
+    let mut raft = Raft::new(config(3, &[1, 2, 3]), Meta { term: 2, vote: None }, None, entries(&[1, 1, 1, 1]), 0);
+    let out = install_snapshot(&mut raft, 3, 2);
+    assert!(
+        matches!(out.persist[..], [Persist::SnapshotChunk { .. }, Persist::InstallSnapshot { replace_log: true, .. }]),
+        "{:?}",
+        out.persist
+    );
+    assert_eq!((raft.snapshot_index(), raft.last_index(), raft.commit_index()), (3, 3, 3));
+}
+
+/// A leader that keeps no applied records in memory reads them back for a follower that
+/// missed them.
+#[test]
+fn a_follower_behind_the_window_is_sent_records_read_back() {
+    let mut rafts = cluster(3);
+    rafts[0].config.log_window_bytes = 0;
+    let now = 1000 * MS;
+    elect(&mut rafts, &[1, 2], 1, now);
+    for payload in [b"a", b"b", b"c"] {
+        rafts[0].propose(payload);
+    }
+    let out = rafts[0].take_outputs();
+    let [Persist::Append(disk)] = &out.persist[..] else { panic!("{:?}", out.persist) };
+    let disk = disk.clone();
+    let end = rafts[0].log_end();
+    rafts[0].on_persisted(end);
+    deliver(&mut rafts, &[1, 2], 1, out.appends, now);
+    rafts[0].on_applied(3);
+    assert_eq!((rafts[0].commit_index(), rafts[0].entry(1)), (3, None), "committed, and out of memory");
+
+    // Node 3 is back, and refuses a heartbeat past its log. The leader goes back, and asks for
+    // the records from disk; they go in the next round.
+    let now = rafts[0].next_deadline();
+    rafts[0].on_tick(now);
+    let out = rafts[0].take_outputs();
+    let (_, heartbeat) = out.appends.into_iter().find(|&(to, _)| to == NodeId(3)).expect("a heartbeat for node 3");
+    rafts[2].on_message(NodeId(1), &decode(&heartbeat), now);
+    for (_, ack) in flush(&mut rafts[2]) {
+        rafts[0].on_message(NodeId(3), &decode(&ack), now);
+    }
+    assert_eq!(rafts[0].take_outputs().reads, [1]);
+    rafts[0].on_read(&disk);
+    let sends = rafts[0].take_outputs().appends;
+    deliver(&mut rafts, &[1, 3], 1, sends, now);
+    assert_eq!((rafts[2].last_index(), rafts[2].entry(2)), (3, Some(&b"b"[..])));
+    assert_eq!(rafts[0].entry(1), None, "read records are kept for one round");
+}
+
+/// A leader sends a follower several chunks of a snapshot before hearing back, and sends
+/// again from what the follower has when one is lost: at once if a later one shows it, or
+/// after a heartbeat with no progress.
+#[test]
+fn snapshot_chunks_are_pipelined_and_a_lost_one_is_sent_again() {
+    const CHUNK: u64 = crate::widen(MAX_READ_BYTES);
+    let len = 3 * CHUNK + 10;
+    let bytes: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    let snapshot = Snapshot { index: 10, term: 1, len, checksum: 0, members: vec![member(1), member(2)] };
+    let mut rafts = vec![
+        Raft::new(config(1, &[1, 2]), Meta { term: 1, vote: None }, Some(snapshot), Entries::default(), 0),
+        Raft::new(config(2, &[1, 2]), Meta::default(), None, Entries::default(), 0),
+    ];
+    let now = 1000 * MS;
+    elect(&mut rafts, &[1, 2], 1, now);
+    // Node 2 refuses a heartbeat past its log, and the leader goes back past its snapshot.
+    rafts[0].on_tick(now);
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2], 1, sends, now);
+    let send_chunks = |raft: &mut Raft| {
+        let out = raft.take_outputs();
+        for &SnapshotRead { index, offset } in &out.snapshot_reads {
+            let start = usize::try_from(offset).unwrap();
+            raft.on_snapshot_read(index, offset, &bytes[start..(start + MAX_READ_BYTES).min(bytes.len())]);
+        }
+        let reads = out.snapshot_reads.iter().map(|r| r.offset).collect::<Vec<_>>();
+        (
+            reads,
+            raft.take_outputs()
+                .sends
+                .into_iter()
+                .filter(|&(to, _)| to == NodeId(2))
+                .map(|(_, f)| f)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (reads, chunks) = send_chunks(&mut rafts[0]);
+    assert_eq!(reads, [0, CHUNK, 2 * CHUNK, 3 * CHUNK]);
+    assert_eq!(chunks.len(), 4, "the whole snapshot in flight before an ack");
+
+    let deliver_chunks = |rafts: &mut [Raft], chunks: &[&Vec<u8>], now: u64| {
+        for chunk in chunks {
+            rafts[1].on_message(NodeId(1), &decode(chunk), now);
+            for (_, ack) in flush(&mut rafts[1]) {
+                rafts[0].on_message(NodeId(2), &decode(&ack), now);
+            }
+        }
+    };
+    // The second chunk is lost. Node 2 takes the first and refuses the third as out of order,
+    // acking the first again: the leader sends again from there at once.
+    deliver_chunks(&mut rafts, &[&chunks[0], &chunks[2]], now);
+    let (reads, chunks) = send_chunks(&mut rafts[0]);
+    assert_eq!(reads, [CHUNK, 2 * CHUNK, 3 * CHUNK]);
+    // Now the last is lost, with nothing after it to show it. A heartbeat after the acks sees
+    // progress; the next sees none, and goes back.
+    deliver_chunks(&mut rafts, &[&chunks[0], &chunks[1]], now);
+    assert_eq!(rafts[1].snapshot_index(), 0);
+    let mut now = now;
+    for _ in 0..2 {
+        now = rafts[0].next_deadline();
+        rafts[0].on_tick(now);
+    }
+    let (reads, chunks) = send_chunks(&mut rafts[0]);
+    assert_eq!(reads, [3 * CHUNK]);
+    deliver_chunks(&mut rafts, &chunks.iter().collect::<Vec<_>>(), now);
+    assert_eq!(rafts[1].snapshot_index(), 10, "installed");
+}
+
+/// An ack of a snapshot the leader has moved on from, in flight as it took a newer one,
+/// isn't counted towards the newer: the peer has only what it acked of that.
+#[test]
+fn an_ack_of_an_older_snapshot_is_not_counted() {
+    let snapshot = Snapshot { index: 10, term: 1, len: 100, checksum: 0, members: vec![member(1), member(2)] };
+    let mut rafts = vec![
+        Raft::new(config(1, &[1, 2]), Meta { term: 1, vote: None }, Some(snapshot), Entries::default(), 0),
+        Raft::new(config(2, &[1, 2]), Meta::default(), None, Entries::default(), 0),
+    ];
+    let now = 1000 * MS;
+    elect(&mut rafts, &[1, 2], 1, now);
+    rafts[0].on_tick(now);
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2], 1, sends, now);
+    let acked = |raft: &Raft| raft.peers[0].sending.map(|s| (s.index, s.acked));
+    assert_eq!(acked(&rafts[0]), Some((10, 0)), "sending node 2 the snapshot");
+
+    let ack = |offset, index| {
+        let mut frame = Vec::new();
+        codec::encode_frame(&wire::SnapshotAck { term: rafts[0].term(), offset, index }, &mut frame).unwrap();
+        frame
+    };
+    let (older, this) = (ack(60, 9), ack(40, 10));
+    rafts[0].on_message(NodeId(2), &decode(&older), now);
+    assert_eq!(acked(&rafts[0]), Some((10, 0)), "not of this snapshot");
+    rafts[0].on_message(NodeId(2), &decode(&this), now);
+    assert_eq!(acked(&rafts[0]), Some((10, 40)));
+}
+
+fn ids(members: &[Member]) -> Vec<u8> {
+    members.iter().map(|m| m.id.0).collect()
+}
+
+/// Heartbeats from `id`, and all they cause, among `up`.
+fn heartbeat(rafts: &mut [Raft], up: &[u8], id: u8) -> u64 {
+    let raft = &mut rafts[usize::from(id) - 1];
+    let now = raft.next_deadline();
+    raft.on_tick(now);
+    let sends = flush(raft);
+    deliver(rafts, up, id, sends, now);
+    now
+}
+
+/// A node started with `--join` is sent the log without a vote; once it has caught up, the
+/// members with it are proposed and committed, everywhere.
+#[test]
+fn a_member_is_added_once_it_has_caught_up() {
+    let mut rafts = cluster(3);
+    rafts.push(Raft::new(config(4, &[]), Meta::default(), None, Entries::default(), 0));
+    let all = [1, 2, 3, 4];
+    elect(&mut rafts, &all, 1, 1000 * MS);
+    assert!(!rafts[0].add_member(member(4)), "not before an entry of its term is committed");
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &all, 1, sends, 1000 * MS);
+    assert!(rafts[0].add_member(member(4)));
+    assert!(!rafts[0].add_member(member(5)), "one change at a time");
+    assert_eq!(ids(rafts[0].members()), [1, 2, 3], "not a member until it has caught up");
+
+    // The first heartbeat learns it's new enough; then it's sent the log, and is added.
+    for _ in 0..3 {
+        heartbeat(&mut rafts, &all, 1);
+    }
+    for raft in &rafts {
+        assert_eq!(ids(raft.members()), [1, 2, 3, 4], "node {}", raft.id());
+    }
+    assert_eq!(rafts[3].commit_index(), rafts[0].commit_index());
+    assert!(rafts[0].can_change(), "committed");
+}
+
+/// A learner is proposed as soon as it answers, new enough, before it has any of the log: the
+/// quorum doesn't wait on it. It catches up as a member.
+#[test]
+fn a_learner_is_added_without_catching_up() {
+    let mut rafts = cluster(3);
+    rafts.push(Raft::new(config(4, &[]), Meta::default(), None, Entries::default(), 0));
+    let all = [1, 2, 3, 4];
+    elect(&mut rafts, &[1, 2, 3], 1, 1000 * MS);
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, 1000 * MS);
+    assert!(rafts[0].add_member(Member { learner: true, ..member(4) }));
+
+    // Its answer to the first heartbeat, which sends it nothing of the log.
+    let now = rafts[0].next_deadline();
+    rafts[0].on_tick(now);
+    for (to, frame) in flush(&mut rafts[0]).into_iter().filter(|(to, _)| to.0 == 4) {
+        rafts[3].on_message(NodeId(1), &decode(&frame), now);
+        for (_, ack) in flush(&mut rafts[3]) {
+            rafts[0].on_message(to, &decode(&ack), now);
+        }
+    }
+    assert_eq!(rafts[3].last_index(), 0, "it has none of the log");
+    let learners: Vec<_> = rafts[0].members().iter().filter(|m| m.learner).map(|m| m.id.0).collect();
+    assert_eq!(learners, [4], "but is proposed");
+
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &all, 1, sends, now);
+    heartbeat(&mut rafts, &all, 1);
+    assert!(!rafts[0].changing_members(), "committed");
+    assert_eq!(rafts[3].commit_index(), rafts[0].commit_index(), "and it caught up");
+    assert!(rafts[3].members().iter().any(|m| m.id.0 == 4 && m.learner));
+}
+
+/// A node whose code is older than what the cluster runs isn't sent the log, which applying
+/// it would run behaviour it doesn't have, nor added.
+#[test]
+fn a_member_older_than_the_cluster_runs_is_not_added() {
+    let mut rafts = cluster(3);
+    rafts.push(Raft::new(config(4, &[]), Meta::default(), None, Entries::default(), 0));
+    for raft in &mut rafts[..3] {
+        raft.advertise(1, 1);
+    }
+    rafts[0].require(1, 1);
+    let all = [1, 2, 3, 4];
+    elect(&mut rafts, &all, 1, 1000 * MS);
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &all, 1, sends, 1000 * MS);
+    assert_eq!(rafts[0].lowest_versions(), (1, 1), "the members, as they said");
+    assert!(rafts[0].add_member(member(4)));
+    heartbeat(&mut rafts, &all, 1);
+    heartbeat(&mut rafts, &all, 1);
+    assert_eq!(rafts[3].last_index(), 0, "not sent the log, which it would apply");
+    assert!(!rafts[0].changing_members(), "dropped");
+    assert_eq!(ids(rafts[0].members()), [1, 2, 3]);
+}
+
+/// Nodes 1 and 2 vote; 3 is a learner.
+fn with_learner() -> Vec<Raft> {
+    let config = |id| {
+        let mut config = config(id, &[1, 2, 3]);
+        config.members[2].learner = true;
+        config
+    };
+    (1..=3).map(|id| Raft::new(config(id), Meta::default(), None, Entries::default(), 0)).collect()
+}
+
+/// A learner takes the log, but its ack doesn't commit, it never stands, and the leadership
+/// isn't handed to it.
+#[test]
+fn a_learner_takes_the_log_but_has_no_say() {
+    let mut rafts = with_learner();
+    let learner = &mut rafts[2];
+    learner.on_tick(learner.next_deadline());
+    assert_eq!(learner.role(), Role::Follower, "it never stands");
+    assert!(flush(learner).is_empty());
+
+    elect(&mut rafts, &[1, 2], 1, 1000 * MS);
+    let committed = rafts[0].commit_index();
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 3], 1, sends, 1000 * MS);
+    assert_eq!(rafts[2].last_index(), rafts[0].last_index(), "the learner has it");
+    assert_eq!(rafts[0].commit_index(), committed, "but a voter doesn't");
+    assert_eq!(rafts[0].transfer_leadership(Some(NodeId(3))), None, "not to a learner");
+
+    // Without node 2, the leader hears no quorum, and stands down.
+    let now = rafts[0].next_deadline() + 2 * 150 * MS;
+    rafts[0].on_tick(now);
+    assert_eq!(rafts[0].role(), Role::Follower);
+}
+
+/// A learner promoted, its leader silent an election timeout, leads a cluster of its own:
+/// itself, a voter, its log kept, the tail its old cluster hadn't committed committed now.
+/// Not a voter, nor a learner that hears its leader.
+#[test]
+fn a_promoted_learner_leads_a_cluster_of_its_own() {
+    let mut rafts = with_learner();
+    elect(&mut rafts, &[1, 2], 1, 1000 * MS);
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 3], 1, sends, 1000 * MS);
+    let (tail, committed) = (rafts[2].last_index(), rafts[2].commit_index());
+    assert!(tail > committed, "the learner holds what its cluster hasn't committed");
+    assert!(!rafts[2].promote(1000 * MS), "it hears its leader");
+    assert!(!rafts[1].promote(5000 * MS), "not a learner");
+
+    let learner = &mut rafts[2];
+    assert!(learner.promote(1000 * MS + 2 * 150 * MS));
+    assert_eq!((learner.role(), learner.term()), (Role::Leader, 2));
+    let me: Vec<_> = learner.members().iter().map(|m| (m.id.0, m.learner)).collect();
+    assert_eq!(me, [(3, false)]);
+    flush(learner);
+    assert_eq!(learner.commit_index(), learner.last_index(), "alone, it commits on its own");
+    assert!(learner.last_index() > tail);
+    assert_eq!(learner.entry(tail), Some(&b"x"[..]), "its log as it was");
+}
+
+/// The last voter isn't removed, though learners would be left.
+#[test]
+fn the_last_voter_is_not_removed() {
+    let mut config = config(1, &[1, 2]);
+    config.members[1].learner = true;
+    let mut raft = Raft::new(config, Meta::default(), None, Entries::default(), 0);
+    raft.on_tick(raft.next_deadline());
+    assert_eq!(raft.role(), Role::Leader, "a learner isn't needed for a quorum");
+    raft.propose(b"x");
+    raft.on_persisted(raft.log_end());
+    assert!(!raft.remove_member(NodeId(1)));
+    assert!(raft.remove_member(NodeId(2)));
+}
+
+/// A leader that removes itself leads until that commits, then stands down; the others elect a
+/// leader between them.
+#[test]
+fn a_leader_that_removes_itself_stands_down_once_committed() {
+    let mut rafts = cluster(3);
+    let all = [1, 2, 3];
+    elect(&mut rafts, &all, 1, 1000 * MS);
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &all, 1, sends, 1000 * MS);
+    assert!(rafts[0].remove_member(NodeId(1)));
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &all, 1, sends, 1000 * MS);
+    assert_eq!(rafts[0].role(), Role::Follower);
+    assert_eq!(ids(rafts[1].members()), [2, 3]);
+
+    // The others elect a leader between them.
+    elect(&mut rafts, &[2, 3], 2, 5000 * MS);
+}
+
+/// A leader hands over to the follower most caught up: it stands for election at once, without
+/// a pre-vote, and wins the next term.
+#[test]
+fn the_leadership_is_handed_to_a_caught_up_follower() {
+    let mut rafts = cluster(3);
+    let all = [1, 2, 3];
+    elect(&mut rafts, &all, 1, 1000 * MS);
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2], 1, sends, 1000 * MS);
+    assert_eq!(rafts[0].transfer_leadership(Some(NodeId(1))), None, "not to itself");
+    assert_eq!(rafts[0].transfer_leadership(Some(NodeId(9))), None, "not to a node that isn't a member");
+    assert_eq!(rafts[0].transfer_leadership(None), Some(NodeId(2)), "the one with the log");
+    assert_eq!(rafts[0].transfer_leadership(Some(NodeId(3))), None, "one at a time");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &all, 1, sends, 1000 * MS);
+    assert_eq!((rafts[1].role(), rafts[1].term()), (Role::Leader, 2));
+    assert_eq!(rafts[0].role(), Role::Follower);
+    heartbeat(&mut rafts, &all, 2);
+    assert_eq!(rafts[0].leader(), Some(NodeId(2)), "the old leader hears from the new");
+}
+
+/// A `Members` entry takes effect when it's appended, and is undone if it's truncated.
+#[test]
+fn a_truncated_members_entry_is_undone() {
+    let mut members = Vec::new();
+    let three: Vec<wire::MembersMember<'_>> =
+        [1, 2, 3].map(|id| wire::MembersMember { id, learner: 0, peer: b"p", client: b"c", admin: b"a" }).to_vec();
+    wire::Members { timestamp: 0, member: &three }.encode_into(&mut members).unwrap();
+    let mut records = log(&[1]);
+    Record { term: 1, index: 2, payload: &members }.encode_into(&mut records);
+    let mut raft = Raft::new(
+        config(3, &[1, 3]),
+        Meta { term: 1, vote: None },
+        None,
+        Entries::from_records(&records, usize::MAX),
+        0,
+    );
+    assert_eq!(ids(raft.members()), [1, 2, 3]);
+    assert_eq!(ids(&raft.members_at(1)), [1, 3]);
+
+    // A leader of term 2 has another entry at 2: the members go back.
+    let entries = log(&[1, 2]);
+    let append = wire::AppendEntries {
+        term: 2,
+        leader: 1,
+        prev_index: 0,
+        prev_term: 0,
+        commit: 0,
+        count: 2,
+        entries: &entries,
+        last_index: 2,
+    };
+    let mut frame = Vec::new();
+    codec::encode_frame(&append, &mut frame).unwrap();
+    raft.on_message(NodeId(1), &decode(&frame), 0);
+    assert_eq!(ids(raft.members()), [1, 3]);
+    assert_eq!(raft.take_outputs().peers.map(|m| ids(&m)), Some(vec![1, 3]));
+}
+
+/// Nodes with nearby seeds time out at different times: the same jitter splits every vote.
+#[test]
+fn nearby_seeds_give_different_election_timeouts() {
+    let deadlines: Vec<u64> = (1..=4)
+        .map(|id| Raft::new(config(id, &[1, 2, 3, 4]), Meta::default(), None, Entries::default(), 0).next_deadline())
+        .collect();
+    let distinct: std::collections::BTreeSet<_> = deadlines.iter().collect();
+    assert_eq!(distinct.len(), deadlines.len(), "{deadlines:?}");
+}
