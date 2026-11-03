@@ -18,6 +18,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use crate::codec::{CodecError, MAX_RECORD_BYTES, Record};
 use crate::raft::Entries;
@@ -25,11 +26,17 @@ use crate::raft::Entries;
 /// A segment is closed and a new one started once it holds this much.
 pub const MAX_SEGMENT_BYTES: u64 = 64 << 20;
 
+/// With [`Fsync::Never`], each time this much is written, the segment's data is synced on a thread
+/// of its own that nothing waits for. Else the OS lets unwritten data pile up, then makes every
+/// write wait while it writes it out: for seconds on a slow disk, on every node that shares it.
+const FLUSH_BEHIND_BYTES: u64 = 4 << 20;
+
 /// Whether the log is synced to disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fsync {
-    /// Never: the OS writes it back when it will. The cluster's copies on other machines are the
-    /// redundancy; a majority losing power together may lose committed entries.
+    /// Never before acknowledging: the cluster's copies on other machines are the redundancy;
+    /// a majority losing power together may lose committed entries. The log is still synced
+    /// behind the writes, on a thread of its own, so that unwritten data doesn't pile up.
     #[default]
     Never,
     /// Once a batch, before it's acknowledged: committed entries survive any crash.
@@ -56,6 +63,10 @@ pub struct Log {
     dir_dirty: bool,
     /// Where the last read stopped: its segment, the next index and its offset there.
     cursor: Option<(u64, u64, u64)>,
+    /// With [`Fsync::Never`], where to send a handle on the segment to sync behind the writes,
+    /// and how much has been written since the last.
+    flush_behind: Option<mpsc::SyncSender<File>>,
+    unflushed: u64,
     _lock: File,
 }
 
@@ -68,7 +79,11 @@ impl Log {
     /// If the directory is locked by another process, can't be read, or holds damaged records
     /// before the last segment's tail.
     pub fn open(dir: &Path, fsync: Fsync, each: impl FnMut(Record<'_>)) -> io::Result<Self> {
-        Self::open_with(dir, MAX_SEGMENT_BYTES, fsync == Fsync::EachBatch, each)
+        let mut log = Self::open_with(dir, MAX_SEGMENT_BYTES, fsync == Fsync::EachBatch, each)?;
+        if fsync == Fsync::Never {
+            log.flush_behind = Some(flusher()?);
+        }
+        Ok(log)
     }
 
     /// [`Log::open`], for a simulation, whose crashes are modelled: segments close once they
@@ -140,6 +155,8 @@ impl Log {
             next_index,
             dir_dirty: false,
             cursor: None,
+            flush_behind: None,
+            unflushed: 0,
             _lock: lock,
         };
         log.file.seek(SeekFrom::End(0))?;
@@ -229,6 +246,16 @@ impl Log {
         self.file.write_all(bytes)?;
         self.file_len += crate::widen(bytes.len());
         self.next_index += count;
+        self.unflushed += crate::widen(bytes.len());
+        if self.unflushed >= FLUSH_BEHIND_BYTES
+            && let Some(flush) = &self.flush_behind
+        {
+            self.unflushed = 0;
+            // Still busy with the last, it's catching up anyway: this one's skipped.
+            if let Ok(file) = self.file.try_clone() {
+                let _ = flush.try_send(file);
+            }
+        }
         Ok(())
     }
 
@@ -441,6 +468,18 @@ fn segment_path(dir: &Path, first: u64) -> PathBuf {
     dir.join(format!("{first:020}.log"))
 }
 
+/// A thread that syncs the data of each file it's sent, until the log is dropped. A failed sync is
+/// no worse than none: nothing waits on it.
+fn flusher() -> io::Result<mpsc::SyncSender<File>> {
+    let (tx, rx) = mpsc::sync_channel::<File>(1);
+    std::thread::Builder::new().name("turbofan-log-flush".into()).spawn(move || {
+        for file in rx {
+            let _ = file.sync_data();
+        }
+    })?;
+    Ok(tx)
+}
+
 fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
@@ -473,6 +512,25 @@ mod tests {
         let mut found = Vec::new();
         let log = Log::open(dir, Fsync::EachBatch, |r| found.push(r.index)).unwrap();
         (log, found)
+    }
+
+    /// Unsynced, a log handed to the flushing thread several times over reads back whole.
+    #[test]
+    fn a_log_flushed_behind_reads_back_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Log::open(dir.path(), Fsync::Never, |_| {}).unwrap();
+        assert!(log.flush_behind.is_some());
+        let payload = vec![7; 64 << 10];
+        let mut records = Vec::new();
+        for index in 1..=300 {
+            records.clear();
+            Record { term: 1, index, payload: &payload }.encode_into(&mut records);
+            log.append(&records).unwrap();
+        }
+        drop(log);
+        let mut found = Vec::new();
+        Log::open(dir.path(), Fsync::Never, |r| found.push(r.index)).unwrap();
+        assert_eq!(found, (1..=300).collect::<Vec<_>>());
     }
 
     #[test]
