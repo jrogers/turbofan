@@ -556,6 +556,7 @@ impl<S: Service> Node<S> {
                     peer: text(m.peer()),
                     client: text(m.client()),
                     admin: text(m.admin()),
+                    learner: m.learner() == 1,
                 };
                 let free = self.local.changing.is_none() && self.local.activating.is_none();
                 let started = free && self.raft.add_member(member);
@@ -1378,7 +1379,13 @@ mod tests {
     }
 
     fn member(id: u8) -> Member {
-        Member { id: NodeId(id), peer: format!("p{id}"), client: format!("n{id}"), admin: format!("a{id}") }
+        Member {
+            id: NodeId(id),
+            peer: format!("p{id}"),
+            client: format!("n{id}"),
+            admin: format!("a{id}"),
+            learner: false,
+        }
     }
 
     /// A payload over the limit is refused, not sent or proposed, and not a panic.

@@ -17,6 +17,11 @@
 //! that adds it), counting only their votes; one joining, that knows none, stays quiet. A
 //! removed one disrupts nothing: members refuse its pre-votes while they hear a leader.
 //!
+//! **Learners** ([`Member::learner`]) are members that take the log but don't vote: they're
+//! added and removed as members are, but never stand for election, and their acks don't count
+//! towards a commit, check-quorum or a snapshot's quorum, so a quorum never waits on one in
+//! another region. Nor is the leadership handed to one.
+//!
 //! **Leadership transfer** ([`Raft::transfer_leadership`]): the leader sends no more of its log
 //! than it had when the transfer began, and once the target has that, sends it `TimeoutNow`.
 //! It stands for election at once, skipping the pre-vote, and the others, their logs no newer,
@@ -202,6 +207,8 @@ pub struct Member {
     pub client: String,
     /// Where operators do.
     pub admin: String,
+    /// It takes the log but doesn't vote.
+    pub learner: bool,
 }
 
 /// A durable snapshot: the state machine as of a committed index, which stands in for the log
@@ -412,6 +419,7 @@ impl Raft {
     #[must_use]
     pub fn new(config: Config, meta: Meta, snapshot: Option<Snapshot>, log: Entries, now: u64) -> Self {
         assert!(config.members.len() <= MAX_MEMBERS);
+        assert!(config.members.is_empty() || config.members.iter().any(|m| !m.learner), "a new cluster has a voter");
         assert!(
             config.members.is_empty() || config.members.iter().any(|m| m.id == config.id),
             "a node starting a cluster is one of its members"
@@ -492,8 +500,9 @@ impl Raft {
 
     /// Starts adding `member`: it's sent the log, without a vote, until it has caught up, then
     /// the members with it are proposed ([`Outputs::change_proposed`]), or, if it doesn't, the
-    /// change is dropped ([`Outputs::change_failed`]). Refused (false) unless this node leads,
-    /// has committed an entry of its term, no other change is under way, and there's room.
+    /// change is dropped ([`Outputs::change_failed`]). A learner ([`Member::learner`]) catches up
+    /// the same way. Refused (false) unless this node leads, has committed an entry of its term,
+    /// no other change is under way, and there's room.
     pub fn add_member(&mut self, member: Member) -> bool {
         if !self.can_change() || member.id.0 == 0 || self.is_member(member.id) || self.members().len() >= MAX_MEMBERS {
             return false;
@@ -507,17 +516,17 @@ impl Raft {
         true
     }
 
-    /// Starts handing the leadership to member `to`, or with `None` to the member most caught up,
+    /// Starts handing the leadership to voter `to`, or with `None` to the voter most caught up,
     /// returning which. It's sent `TimeoutNow` once it has the log as it is now; this node gives
     /// up after an election timeout ([`Raft::transferring`] goes false while it still leads).
     /// Refused (`None`) unless this node leads, isn't transferring already, and `to` is another
-    /// member, heard from within an election timeout.
+    /// voter, heard from within an election timeout.
     pub fn transfer_leadership(&mut self, to: Option<NodeId>) -> Option<NodeId> {
         if self.role != Role::Leader || self.transfer.is_some() || self.stop.is_some() {
             return None;
         }
         let alive = self.now.saturating_sub(nanos(self.config.election_timeout));
-        let voters = self.peers.iter().filter(|p| self.is_member(p.id) && p.heard_at >= alive);
+        let voters = self.peers.iter().filter(|p| self.is_voter(p.id) && p.heard_at >= alive);
         let target = if let Some(to) = to {
             voters.map(|p| p.id).find(|&id| id == to)?
         } else {
@@ -530,7 +539,7 @@ impl Raft {
     }
 
     /// As leader, not handing over, whether every member heard from within an election timeout,
-    /// this node included, and a quorum, has the snapshot of `index` durable.
+    /// this node included, and a quorum of voters, has the snapshot of `index` durable.
     #[must_use]
     pub fn all_have_snapshot(&self, index: u64) -> bool {
         if self.role != Role::Leader || self.transfer.is_some() || self.snapshot_index() < index {
@@ -538,10 +547,10 @@ impl Raft {
         }
         let alive = self.now.saturating_sub(nanos(self.config.election_timeout));
         let members = self.peers.iter().filter(|p| self.is_member(p.id));
-        let (mut have, mut missing) = (usize::from(self.is_member(self.config.id)), false);
+        let (mut have, mut missing) = (usize::from(self.is_voter(self.config.id)), false);
         for p in members {
             if p.snapshot_index >= index {
-                have += 1;
+                have += usize::from(self.is_voter(p.id));
             } else if p.heard_at >= alive {
                 missing = true;
             }
@@ -607,9 +616,9 @@ impl Raft {
 
     /// Proposes the members without `id` ([`Outputs::change_proposed`]). Refused (false) unless
     /// this node leads, has committed an entry of its term, no other change is under way, `id`
-    /// is a member, and others would be left.
+    /// is a member, and a voter would be left.
     pub fn remove_member(&mut self, id: NodeId) -> bool {
-        if !self.can_change() || !self.is_member(id) || self.members().len() == 1 {
+        if !self.can_change() || !self.is_member(id) || !self.members().iter().any(|m| m.id != id && !m.learner) {
             return false;
         }
         let members: Vec<Member> = self.members().iter().filter(|m| m.id != id).cloned().collect();
@@ -689,10 +698,12 @@ impl Raft {
         self.snapshot.as_ref()
     }
 
-    /// The highest snapshot index a quorum (this node included) has durable, as a leader knows.
+    /// The highest snapshot index a quorum of voters (this node included) has durable, as a
+    /// leader knows.
     #[must_use]
     pub fn quorum_snapshot_index(&self) -> u64 {
-        let mut indices: Vec<u64> = self.peers.iter().map(|p| p.snapshot_index).collect();
+        let mut indices: Vec<u64> =
+            self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.snapshot_index).collect();
         indices.push(self.snapshot_index());
         indices.sort_unstable_by(|a, b| b.cmp(a));
         indices[self.quorum() - 1]
@@ -794,7 +805,7 @@ impl Raft {
         self.append(Record { term: self.meta.term, index, payload });
         self.proposed_at.push_back((index, self.now, payload.len()));
         self.uncommitted_bytes += payload.len();
-        if !self.peers.iter().any(|p| self.is_member(p.id)) {
+        if !self.peers.iter().any(|p| self.is_voter(p.id)) {
             self.advance_commit();
         }
         Some(index)
@@ -806,8 +817,8 @@ impl Raft {
         match self.role {
             Role::Leader if now >= self.heartbeat_at => {
                 let timeout = nanos(self.config.election_timeout);
-                let peers = self.peers.iter().filter(|p| self.is_member(p.id) && p.heard_at + timeout >= now);
-                let heard = peers.count() + usize::from(self.is_member(self.config.id));
+                let peers = self.peers.iter().filter(|p| self.is_voter(p.id) && p.heard_at + timeout >= now);
+                let heard = peers.count() + usize::from(self.is_voter(self.config.id));
                 if heard < self.quorum() {
                     // Check quorum: a leader cut off from a majority stands down, so clients
                     // find the leader the majority elects.
@@ -832,10 +843,11 @@ impl Raft {
             }
             Role::Follower | Role::PreCandidate | Role::Candidate if now >= self.election_at => {
                 // One that knows members stands, even if it isn't among them yet: added, it may
-                // have the most of the log before it has the entry that adds it.
-                if self.members().is_empty() {
-                    // Joining, it doesn't know who leads: clients it would send to a stale leader
-                    // try elsewhere.
+                // have the most of the log before it has the entry that adds it. A learner never
+                // does.
+                if self.members().is_empty() || self.is_learner(self.config.id) {
+                    // Joining, or with its leader gone, it doesn't know who leads: clients it would
+                    // send to a stale leader try elsewhere.
                     self.leader = None;
                     self.reset_election(now);
                 } else {
@@ -949,7 +961,7 @@ impl Raft {
             Role::Candidate => m.pre_vote() == 0 && m.term() == self.meta.term,
             Role::Follower | Role::Leader => false,
         };
-        if !counts || m.granted() == 0 || self.votes.contains(&from) || !self.is_member(from) {
+        if !counts || m.granted() == 0 || self.votes.contains(&from) || !self.is_voter(from) {
             return;
         }
         self.votes.push(from);
@@ -1176,6 +1188,7 @@ impl Raft {
                 .iter()
                 .map(|m| wire::InstallSnapshotMember {
                     id: m.id.0,
+                    learner: u8::from(m.learner),
                     peer: m.peer.as_bytes(),
                     client: m.client.as_bytes(),
                     admin: m.admin.as_bytes(),
@@ -1243,7 +1256,10 @@ impl Raft {
         }
         // A first chunk starts a snapshot, unless it's one already arriving: then it's a resend.
         if m.offset() == 0 && self.incoming.as_ref().is_none_or(|s| s.index != m.last_index()) {
-            let members = m.member().map(|a| Member::read(NodeId(a.id()), a.peer(), a.client(), a.admin())).collect();
+            let members = m
+                .member()
+                .map(|a| Member::read(NodeId(a.id()), a.learner(), a.peer(), a.client(), a.admin()))
+                .collect();
             let (index, term, checksum) = (m.last_index(), m.last_term(), m.checksum());
             self.incoming = Some(Snapshot { index, term, len: 0, checksum, members });
         }
@@ -1297,8 +1313,8 @@ impl Raft {
     }
 
     fn advance_commit(&mut self) {
-        let mut matched: Vec<u64> = self.peers.iter().filter(|p| self.is_member(p.id)).map(|p| p.matched).collect();
-        if self.is_member(self.config.id) {
+        let mut matched: Vec<u64> = self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.matched).collect();
+        if self.is_voter(self.config.id) {
             matched.push(self.durable);
         }
         matched.sort_unstable_by(|a, b| b.cmp(a));
@@ -1314,7 +1330,7 @@ impl Raft {
             }
         }
         // A leader that removed itself leads until that's committed, then stands down.
-        if self.role == Role::Leader && !self.is_member(self.config.id) && self.commit >= self.config_index() {
+        if self.role == Role::Leader && !self.is_voter(self.config.id) && self.commit >= self.config_index() {
             self.become_follower(self.meta.term, self.now);
         }
     }
@@ -1348,13 +1364,25 @@ impl Raft {
 
     /// The leader of this term hands over: stand for election now.
     fn on_timeout_now(&mut self, from: NodeId, m: &wire::TimeoutNowRef<'_>, now: u64) {
-        if m.term() == self.meta.term && self.leader == Some(from) && self.is_member(self.config.id) {
+        if m.term() == self.meta.term && self.leader == Some(from) && self.is_voter(self.config.id) {
             self.become_candidate(now);
         }
     }
 
     fn is_member(&self, id: NodeId) -> bool {
         self.members().iter().any(|m| m.id == id)
+    }
+
+    fn is_voter(&self, id: NodeId) -> bool {
+        self.members().iter().any(|m| m.id == id && !m.learner)
+    }
+
+    fn is_learner(&self, id: NodeId) -> bool {
+        self.members().iter().any(|m| m.id == id && m.learner)
+    }
+
+    fn voters(&self) -> usize {
+        self.members().iter().filter(|m| !m.learner).count()
     }
 
     /// The index of the latest `Members` entry, or of the snapshot if the log has none.
@@ -1412,6 +1440,7 @@ impl Raft {
             .iter()
             .map(|m| wire::MembersMember {
                 id: m.id.0,
+                learner: u8::from(m.learner),
                 peer: m.peer.as_bytes(),
                 client: m.client.as_bytes(),
                 admin: m.admin.as_bytes(),
@@ -1447,8 +1476,8 @@ impl Raft {
     fn start_pre_vote(&mut self, now: u64) {
         self.role = Role::PreCandidate;
         self.leader = None;
-        // Only the members' votes count: its own too, if it's one.
-        self.votes = if self.is_member(self.config.id) { vec![self.config.id] } else { Vec::new() };
+        // Only the voters' votes count: its own too, if it's one.
+        self.votes = if self.is_voter(self.config.id) { vec![self.config.id] } else { Vec::new() };
         self.doubted = usize::from(self.doubt.is_some() && !self.votes.is_empty());
         self.reset_election(now);
         let request = wire::RequestVote {
@@ -1470,8 +1499,8 @@ impl Raft {
         self.role = Role::Candidate;
         self.meta = Meta { term: self.meta.term + 1, vote: Some(self.config.id) };
         self.out.persist.push(Persist::Meta(self.meta));
-        // Only the members' votes count: its own too, if it's one.
-        self.votes = if self.is_member(self.config.id) { vec![self.config.id] } else { Vec::new() };
+        // Only the voters' votes count: its own too, if it's one.
+        self.votes = if self.is_voter(self.config.id) { vec![self.config.id] } else { Vec::new() };
         self.doubted = usize::from(self.doubt.is_some() && !self.votes.is_empty());
         self.reset_election(now);
         let request = wire::RequestVote {
@@ -1586,13 +1615,14 @@ impl Raft {
         self.term_at(self.last_index()).expect("the last entry is in the log or the snapshot")
     }
 
+    /// A majority of the voters.
     fn quorum(&self) -> usize {
-        self.members().len() / 2 + 1
+        self.voters() / 2 + 1
     }
 
     /// The votes win the election: a majority, and one more for each voter in doubt.
     fn won(&self) -> bool {
-        self.votes.len() >= (self.quorum() + self.doubted).min(self.members().len())
+        self.votes.len() >= (self.quorum() + self.doubted).min(self.voters())
     }
 
     /// The log, as of an entry or snapshot of `term`, has everything this node could have
@@ -1709,7 +1739,10 @@ impl Entries {
             self.terms.push((record.index, record.term));
         }
         if let Ok((wire::Decoded::Members(m), _)) = wire::decode(record.payload) {
-            let members = m.member().map(|a| Member::read(NodeId(a.id()), a.peer(), a.client(), a.admin())).collect();
+            let members = m
+                .member()
+                .map(|a| Member::read(NodeId(a.id()), a.learner(), a.peer(), a.client(), a.admin()))
+                .collect();
             self.configs.push((record.index, members));
         }
         let mut bytes = Vec::with_capacity(codec::RECORD_HEADER + record.payload.len());
@@ -1767,9 +1800,9 @@ impl Entries {
 impl Member {
     /// From the wire, where an address that isn't UTF-8 is mangled, not refused: it only
     /// fails to connect.
-    fn read(id: NodeId, peer: &[u8], client: &[u8], admin: &[u8]) -> Self {
+    fn read(id: NodeId, learner: u8, peer: &[u8], client: &[u8], admin: &[u8]) -> Self {
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-        Self { id, peer: text(peer), client: text(client), admin: text(admin) }
+        Self { id, peer: text(peer), client: text(client), admin: text(admin), learner: learner == 1 }
     }
 
     /// Its addresses fit the wire's.
@@ -1800,7 +1833,13 @@ mod tests {
     const MS: u64 = 1_000_000;
 
     fn member(id: u8) -> Member {
-        Member { id: NodeId(id), peer: format!("p{id}"), client: format!("c{id}"), admin: format!("a{id}") }
+        Member {
+            id: NodeId(id),
+            peer: format!("p{id}"),
+            client: format!("c{id}"),
+            admin: format!("a{id}"),
+            learner: false,
+        }
     }
 
     fn config(id: u8, members: &[u8]) -> Config {
@@ -2457,6 +2496,55 @@ mod tests {
         assert_eq!(ids(rafts[0].members()), [1, 2, 3]);
     }
 
+    /// Nodes 1 and 2 vote; 3 is a learner.
+    fn with_learner() -> Vec<Raft> {
+        let config = |id| {
+            let mut config = config(id, &[1, 2, 3]);
+            config.members[2].learner = true;
+            config
+        };
+        (1..=3).map(|id| Raft::new(config(id), Meta::default(), None, Entries::default(), 0)).collect()
+    }
+
+    /// A learner takes the log, but its ack doesn't commit, it never stands, and the leadership
+    /// isn't handed to it.
+    #[test]
+    fn a_learner_takes_the_log_but_has_no_say() {
+        let mut rafts = with_learner();
+        let learner = &mut rafts[2];
+        learner.on_tick(learner.next_deadline());
+        assert_eq!(learner.role(), Role::Follower, "it never stands");
+        assert!(flush(learner).is_empty());
+
+        elect(&mut rafts, &[1, 2], 1, 1000 * MS);
+        let committed = rafts[0].commit_index();
+        rafts[0].propose(b"x");
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &[1, 3], 1, sends, 1000 * MS);
+        assert_eq!(rafts[2].last_index(), rafts[0].last_index(), "the learner has it");
+        assert_eq!(rafts[0].commit_index(), committed, "but a voter doesn't");
+        assert_eq!(rafts[0].transfer_leadership(Some(NodeId(3))), None, "not to a learner");
+
+        // Without node 2, the leader hears no quorum, and stands down.
+        let now = rafts[0].next_deadline() + 2 * 150 * MS;
+        rafts[0].on_tick(now);
+        assert_eq!(rafts[0].role(), Role::Follower);
+    }
+
+    /// The last voter isn't removed, though learners would be left.
+    #[test]
+    fn the_last_voter_is_not_removed() {
+        let mut config = config(1, &[1, 2]);
+        config.members[1].learner = true;
+        let mut raft = Raft::new(config, Meta::default(), None, Entries::default(), 0);
+        raft.on_tick(raft.next_deadline());
+        assert_eq!(raft.role(), Role::Leader, "a learner isn't needed for a quorum");
+        raft.propose(b"x");
+        raft.on_persisted(raft.log_end());
+        assert!(!raft.remove_member(NodeId(1)));
+        assert!(raft.remove_member(NodeId(2)));
+    }
+
     /// A leader that removes itself leads until that commits, then stands down; the others elect a
     /// leader between them.
     #[test]
@@ -2504,7 +2592,7 @@ mod tests {
     fn a_truncated_members_entry_is_undone() {
         let mut members = Vec::new();
         let three: Vec<wire::MembersMember<'_>> =
-            [1, 2, 3].map(|id| wire::MembersMember { id, peer: b"p", client: b"c", admin: b"a" }).to_vec();
+            [1, 2, 3].map(|id| wire::MembersMember { id, learner: 0, peer: b"p", client: b"c", admin: b"a" }).to_vec();
         wire::Members { timestamp: 0, member: &three }.encode_into(&mut members).unwrap();
         let mut records = log(&[1]);
         Record { term: 1, index: 2, payload: &members }.encode_into(&mut records);

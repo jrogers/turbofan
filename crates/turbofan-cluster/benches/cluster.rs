@@ -105,6 +105,7 @@ fn start(dir: &Path, tls: bool) -> (Vec<String>, Option<ClientTls>) {
             peer: addr(0, id).to_string(),
             client: addr(3, id).to_string(),
             admin: addr(6, id).to_string(),
+            learner: false,
         })
         .collect();
     for id in ids {

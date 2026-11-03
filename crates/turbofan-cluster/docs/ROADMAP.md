@@ -19,11 +19,8 @@ down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report t
 - **Backup.** Archive snapshots and closed log segments somewhere off the node, and restore a
   cluster from them.
 - **A standby in another region.** A cluster that can take over, in another region or cloud, if
-  the main one is lost. In order:
-  - *Learners:* members that take the log but don't vote, so the main cluster's commits never
-    wait on the other region. `catching_up` (`src/raft.rs`) is a temporary one. Left: marking
-    learners in the `Members` entry (a schema change, by `WIRE.md`'s rules), leaving them out of
-    the quorum, check-quorum and transfer targets, and letting them snapshot.
+  the main one is lost. Learners are in: `add-member --learner` adds a member that takes the log and snapshots but doesn't vote, so the main cluster's
+  commits never wait on the other region. Left, in order:
   - *Promotion:* an admin `promote` on a learner makes it the one member of a new cluster, from
     its log and snapshot as they are, to grow with `add-member`. Never automatic: from the other
     region a dead cluster and a cut link look alike, and two clusters taking orders fill twice.

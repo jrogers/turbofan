@@ -17,6 +17,9 @@
 //! <binary> remove-member --admin 127.0.0.1:7201 --id 4
 //! ```
 //!
+//! `add-member --learner` adds it as a learner: it takes the log but doesn't vote, so the
+//! cluster's commits don't wait on it, as for a standby in another region.
+//!
 //! Before stopping the leader, `transfer-leadership --admin <addr> [--to <n>]` hands over to a
 //! caught-up member, so a rolling restart costs a quick election rather than an election
 //! timeout. `shutdown --admin <addr>` snapshots every member at the same index and stops them, so
@@ -56,7 +59,7 @@ const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...> [--join]
         [--tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca <pem>]
   snapshot --admin <addr>
-  add-member --admin <addr> --member <n>=<peer addr>,<client addr>,<admin addr>
+  add-member --admin <addr> --member <n>=<peer addr>,<client addr>,<admin addr> [--learner]
   remove-member --admin <addr> --id <n>
   transfer-leadership --admin <addr> [--to <n>]
   shutdown --admin <addr>
@@ -106,10 +109,11 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             println!("snapshot taken at index {index}");
         }
         "add-member" => {
-            let member = member(&flag(args, "--member")?)?;
+            let member = Member { learner: args.iter().any(|a| a == "--learner"), ..member(&flag(args, "--member")?)? };
             let admin = admin.with_timeout(MEMBERS_REQUEST_TIMEOUT);
             let index = runtime()?.block_on(admin.add_member(&member)).map_err(failed)?;
-            println!("member {} added at index {index}", member.id);
+            let what = if member.learner { "learner" } else { "member" };
+            println!("{what} {} added at index {index}", member.id);
         }
         "remove-member" => {
             let id: NodeId = flag(args, "--id")?.parse().map_err(|_| "--id: a number from 1".to_owned())?;
@@ -169,6 +173,7 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
                 peer: addr(&peers, i),
                 client: addr(&clients, i),
                 admin: addr(&admins, i),
+                learner: false,
             })
             .collect()
     };
@@ -235,7 +240,7 @@ fn member(text: &str) -> Result<Member, String> {
     let id: NodeId = id.parse().map_err(|_| bad())?;
     let addrs: Vec<SocketAddr> = addrs.split(',').map(str::parse).collect::<Result<_, _>>().map_err(|_| bad())?;
     let [peer, client, admin] = addrs[..] else { return Err(bad()) };
-    Ok(Member { id, peer: peer.to_string(), client: client.to_string(), admin: admin.to_string() })
+    Ok(Member { id, peer: peer.to_string(), client: client.to_string(), admin: admin.to_string(), learner: false })
 }
 
 /// `1=host:port,2=host:port,...`, sorted by ID.

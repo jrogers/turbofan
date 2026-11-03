@@ -25,7 +25,7 @@
 //!
 //! Seven nodes run, three or five of them the first members. An operator adds and removes
 //! members now and then, between three and seven of them, the leader among those removed and
-//! removed ones among those added back. And hands the leadership over now and then. The nodes
+//! removed ones among those added back, some as learners, the voters kept to three or more. And hands the leadership over now and then. The nodes
 //! start on an old version and are upgraded one by one, restarted on the new; the operator asks
 //! to activate the new version until it's let, which mustn't be while any member is old. Once the
 //! faults stop, it shuts the cluster down, and every member stops with the same snapshot; then
@@ -89,6 +89,7 @@ fn simulate() {
     if several {
         assert!(covered.manual_snapshots > 0, "no manual snapshot was answered");
         assert!(covered.member_changes > 0, "the members never changed");
+        assert!(covered.learners > 0, "no learner was ever a member");
         assert!(covered.transfers > 0, "the leadership was never handed over");
         assert!(covered.activations > 0, "a new version was never activated");
         assert!(covered.shutdowns > 0, "the cluster was never shut down");
@@ -103,6 +104,8 @@ fn simulate() {
 struct Coverage {
     manual_snapshots: u64,
     member_changes: u64,
+    /// Changes of members made while a learner was one.
+    learners: u64,
     transfers: u64,
     activations: u64,
     shutdowns: u64,
@@ -118,6 +121,7 @@ impl Coverage {
     fn add(&mut self, other: &Self) {
         self.manual_snapshots += other.manual_snapshots;
         self.member_changes += other.member_changes;
+        self.learners += other.learners;
         self.transfers += other.transfers;
         self.activations += other.activations;
         self.shutdowns += other.shutdowns;
@@ -841,23 +845,28 @@ impl Sim {
         self.admin(&turbofan_cluster::wire::SnapshotRequest { request_id: self.admin_requests });
     }
 
-    /// An operator adds a member, or removes one (the leader, perhaps), keeping three to seven.
+    /// An operator adds a member, or removes one (the leader, perhaps), keeping three to seven,
+    /// and three voters or more. Some it adds are learners.
     fn change_members(&mut self) {
         if self.now < FAULT_PHASE + QUIET_PHASE / 2 {
             let after = 500 * MS + self.rng.below(1000 * MS);
             self.schedule(after, Event::ChangeMembers);
         }
         let Some(leader) = self.leader() else { return };
-        let members: Vec<NodeId> =
-            self.nodes[&leader].node.as_ref().unwrap().raft().members().iter().map(|m| m.id).collect();
+        let raft = self.nodes[&leader].node.as_ref().unwrap().raft();
+        let members: Vec<NodeId> = raft.members().iter().map(|m| m.id).collect();
+        let learners: Vec<NodeId> = raft.members().iter().filter(|m| m.learner).map(|m| m.id).collect();
+        self.covered.learners += u64::from(!learners.is_empty());
         let others: Vec<NodeId> = self.members.iter().copied().filter(|id| !members.contains(id)).collect();
+        let voters = members.len() - learners.len();
         let request_id = self.rng.next();
-        if members.len() < MAX_MEMBERS && (members.len() <= 3 || self.rng.one_in(2)) {
+        if members.len() < MAX_MEMBERS && (voters <= 3 || self.rng.one_in(2)) {
             let m = member(self.rng.pick(&others));
             let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
-            self.admin(&turbofan_cluster::wire::AddMember { request_id, id: m.id.0, peer, client, admin });
+            let learner = u8::from(self.rng.one_in(3));
+            self.admin(&turbofan_cluster::wire::AddMember { request_id, id: m.id.0, learner, peer, client, admin });
         } else {
-            let id = self.rng.pick(&members);
+            let id = self.rng.pick(if voters <= 3 { &learners } else { &members });
             self.admin(&turbofan_cluster::wire::RemoveMember { request_id, id: id.0 });
         }
     }
@@ -896,6 +905,12 @@ impl Sim {
     fn final_members(&self) -> Option<Vec<NodeId>> {
         let leader = self.nodes[&self.leader()?].node.as_ref()?;
         Some(leader.raft().members().iter().map(|m| m.id).collect())
+    }
+
+    /// How many of the leader's members are voters, or 0 if there's no leader.
+    fn final_voters(&self) -> usize {
+        let leader = self.leader().and_then(|id| self.nodes[&id].node.as_ref());
+        leader.map_or(0, |n| n.raft().members().iter().filter(|m| !m.learner).count())
     }
 
     fn converged(&self) -> bool {
@@ -1331,11 +1346,12 @@ impl Sim {
                 assert_eq!(first, &payload, "seed {}: node {id} committed a different entry at {index}", self.seed);
             } else {
                 assert_eq!(i, self.committed.len());
-                // Committed by a majority of the members of some config from the entry's on: as of
+                // Committed by a majority of the voters of some config from the entry's on: as of
                 // the entry, or as of now if they've changed since.
                 let majority = |members: &[Member]| {
-                    let durable = members.iter().filter(|m| self.nodes[&m.id].disk.has(index, &payload)).count();
-                    durable > members.len() / 2
+                    let voters: Vec<&Member> = members.iter().filter(|m| !m.learner).collect();
+                    let durable = voters.iter().filter(|m| self.nodes[&m.id].disk.has(index, &payload)).count();
+                    durable > voters.len() / 2
                 };
                 assert!(
                     majority(&raft.members_at(index)) || majority(raft.members()),
@@ -1507,9 +1523,9 @@ impl Sim {
         }
         let after = 500 * MS + self.rng.below(1000 * MS);
         self.schedule(after, Event::Rot);
-        // One node's disk damaged at a time, and of three members or more: two of three lost at
+        // One node's disk damaged at a time, and of three voters or more: two of three lost at
         // once would lose what only they had, past what Raft tolerates.
-        let Some(members) = self.final_members().filter(|m| m.len() >= 3) else { return };
+        let Some(members) = self.final_members().filter(|_| self.final_voters() >= 3) else { return };
         // Damage on a node that's left the members counts too: the leader's members may not be
         // committed, and the node not gone.
         let damaged = self
@@ -1732,5 +1748,5 @@ impl Sim {
 
 /// Node `id`'s addresses, which the simulation names rather than uses.
 fn member(id: NodeId) -> Member {
-    Member { id, peer: format!("p{id}"), client: format!("n{id}"), admin: format!("a{id}") }
+    Member { id, peer: format!("p{id}"), client: format!("n{id}"), admin: format!("a{id}"), learner: false }
 }

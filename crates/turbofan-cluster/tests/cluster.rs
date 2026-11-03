@@ -149,7 +149,7 @@ impl Cluster {
 /// Member `id` of a cluster on `addrs`: peers, then clients, then operators, four of each.
 fn member(addrs: &[SocketAddr], id: NodeId) -> raft::Member {
     let addr = |offset: usize| addrs[offset + usize::from(id) - 1].to_string();
-    raft::Member { id, peer: addr(0), client: addr(4), admin: addr(8) }
+    raft::Member { id, peer: addr(0), client: addr(4), admin: addr(8), learner: false }
 }
 
 /// Sends `from..=to`, and waits for each to come back, once and in order. Not in time, it names

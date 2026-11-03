@@ -118,6 +118,7 @@
         <!-- The members as of `lastIndex`, as in `Members`. -->
         <group name="member" id="8" dimensionType="groupSizeEncoding">
             <field name="id" id="9" type="uint8"/>
+            <field name="learner" id="14" type="uint8"/>
             <data name="peer" id="10" type="addrData"/>
             <data name="client" id="11" type="addrData"/>
             <data name="admin" id="12" type="addrData"/>
@@ -194,10 +195,12 @@
         <field name="index" id="2" type="uint64"/>
         <field name="quorumAcked" id="3" type="uint8"/>
     </sbe:message>
-    <!-- Add a member, reached at these addresses: it catches up, then joins. -->
+    <!-- Add a member, reached at these addresses: it catches up, then joins; with `learner` 1,
+         as a learner, which takes the log but doesn't vote. -->
     <sbe:message name="AddMember" id="42">
         <field name="requestId" id="1" type="uint64"/>
         <field name="id" id="2" type="uint8"/>
+        <field name="learner" id="6" type="uint8"/>
         <data name="peer" id="3" type="addrData"/>
         <data name="client" id="4" type="addrData"/>
         <data name="admin" id="5" type="addrData"/>
@@ -296,6 +299,8 @@
         <field name="timestamp" id="1" type="uint64"/>
         <group name="member" id="2" dimensionType="groupSizeEncoding">
             <field name="id" id="3" type="uint8"/>
+            <!-- 1: it takes the log but doesn't vote. -->
+            <field name="learner" id="7" type="uint8"/>
             <data name="peer" id="4" type="addrData"/>
             <data name="client" id="5" type="addrData"/>
             <data name="admin" id="6" type="addrData"/>
@@ -340,6 +345,7 @@
     <sbe:message name="SnapshotMembers" id="65">
         <group name="member" id="1" dimensionType="groupSizeEncoding">
             <field name="id" id="2" type="uint8"/>
+            <field name="learner" id="6" type="uint8"/>
             <data name="peer" id="3" type="addrData"/>
             <data name="client" id="4" type="addrData"/>
             <data name="admin" id="5" type="addrData"/>

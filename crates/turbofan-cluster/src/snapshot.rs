@@ -178,6 +178,7 @@ fn encode_members(members: &[Member]) -> Vec<u8> {
         .iter()
         .map(|m| wire::SnapshotMembersMember {
             id: m.id.0,
+            learner: u8::from(m.learner),
             peer: m.peer.as_bytes(),
             client: m.client.as_bytes(),
             admin: m.admin.as_bytes(),
@@ -192,7 +193,8 @@ fn decode_members(bytes: &[u8]) -> Option<Vec<Member>> {
     let (wire::Decoded::SnapshotMembers(m), used) = codec::decode_frame(bytes).ok()?? else { return None };
     let text = |b: &[u8]| String::from_utf8(b.to_vec()).ok();
     let members = m.member().map(|a| {
-        Some(Member { id: NodeId(a.id()), peer: text(a.peer())?, client: text(a.client())?, admin: text(a.admin())? })
+        let (peer, client, admin) = (text(a.peer())?, text(a.client())?, text(a.admin())?);
+        Some(Member { id: NodeId(a.id()), peer, client, admin, learner: a.learner() == 1 })
     });
     (used == bytes.len()).then_some(members.collect::<Option<Vec<_>>>()?)
 }
@@ -267,9 +269,14 @@ mod tests {
     use super::*;
 
     fn members() -> Vec<Member> {
-        let member =
-            |id| Member { id: NodeId(id), peer: format!("p{id}"), client: format!("c{id}"), admin: String::new() };
-        vec![member(1), member(2)]
+        let member = |id, learner| Member {
+            id: NodeId(id),
+            peer: format!("p{id}"),
+            client: format!("c{id}"),
+            admin: String::new(),
+            learner,
+        };
+        vec![member(1, false), member(2, true)]
     }
 
     fn writer(bytes: &'static [u8]) -> SnapshotWriter {

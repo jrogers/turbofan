@@ -288,8 +288,9 @@ impl Admin {
         .await
     }
 
-    /// Adds `member` to the cluster: it catches up from the leader, then joins. Start it first,
-    /// with `--join`. Returns the index of the change, once it's committed.
+    /// Adds `member` to the cluster, as a learner if it's [`Member::learner`]: it catches up from
+    /// the leader, then joins. Start it first, with `--join`. Returns the index of the change,
+    /// once it's committed.
     ///
     /// # Errors
     ///
@@ -299,7 +300,8 @@ impl Admin {
     pub async fn add_member(&self, member: &Member) -> Result<u64, AdminError> {
         let request = |request_id| {
             let (peer, client, admin) = (member.peer.as_bytes(), member.client.as_bytes(), member.admin.as_bytes());
-            frame(&wire::AddMember { request_id, id: member.id.0, peer, client, admin })
+            let learner = u8::from(member.learner);
+            frame(&wire::AddMember { request_id, id: member.id.0, learner, peer, client, admin })
         };
         self.ask(request, changed).await
     }

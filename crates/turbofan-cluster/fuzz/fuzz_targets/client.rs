@@ -117,7 +117,7 @@ fuzz_target!(|steps: Vec<Step>| {
     let config = node::Config {
         raft: raft::Config {
             id: raft::NodeId(1),
-            members: vec![raft::Member { id: raft::NodeId(1), peer: "p1".into(), client: "n1".into(), admin: "a1".into() }],
+            members: vec![raft::Member { id: raft::NodeId(1), peer: "p1".into(), client: "n1".into(), admin: "a1".into(), learner: false }],
             election_timeout: Duration::from_millis(150),
             heartbeat: Duration::from_millis(50),
             seed: 1,

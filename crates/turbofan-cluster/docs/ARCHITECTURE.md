@@ -226,7 +226,9 @@ later term, or the whole log of the leader it follows.
 ## Changing a running cluster
 
 - **Members** change one at a time, through the log: a `Members` entry takes effect as it's
-  appended. A new member catches up without a vote first. At most `MAX_MEMBERS` (7).
+  appended. A new member catches up without a vote first. At most `MAX_MEMBERS` (7). A
+  learner is a member that takes the log but never votes or stands, so commits, check-quorum
+  and the snapshot quorum count voters only (`add-member --learner`).
 - **Leadership transfer**: the leader sends the target no more of its log than it had when the
   transfer began, then `TimeoutNow` once the target has it all, so a rolling restart costs a
   quick election.
