@@ -26,7 +26,8 @@ before writing code.
   prints `SIM_SEED=<n>`, which replays it.
 - `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan-cluster/fuzz`,
   outside the workspace; nightly and cargo-fuzz). `check.sh` only checks it builds.
-- Releasing: both crates share the workspace version. Bump it, date its `CHANGELOG.md` section,
+- Releasing: both crates share the workspace version. Bump it (and `cargo update -w` both lock files, the
+  fuzz crate's too), date its `CHANGELOG.md` section,
   `cargo publish --workspace` (the user runs it: their token), then `scripts/github-release.sh <version>`
   tags `v<version>` and makes the GitHub release from that section.
 - CI runs the simulation's fixed seeds and the fuzz targets' build in jobs of their own on every push;

@@ -7,7 +7,7 @@ echo "== fmt";    cargo fmt --all --check
 echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings
 echo "== clippy, all features"; cargo clippy --workspace --all-targets --all-features -- -D warnings
 echo "== fuzz";   cargo fmt --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --check
-                  cargo clippy --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --bins -- -D warnings
+                  cargo clippy --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --bins --locked -- -D warnings
 echo "== test";   cargo test --workspace
 echo "== test, all features"; cargo test --workspace --all-features
 echo "== doc";    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
