@@ -1,11 +1,18 @@
+<p align="center"><img src="https://raw.githubusercontent.com/jrogers/turbofan/main/docs/assets/logo.svg" width="120" alt=""></p>
+
 <h1 align="center">turbofan</h1>
 
 <p align="center">
-  <a href="https://jrogers.github.io/turbofan/">Website</a> ·
-  <a href="https://github.com/jrogers/turbofan/actions/workflows/ci.yml"><img src="https://github.com/jrogers/turbofan/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://crates.io/crates/turbofan-cluster"><img src="https://img.shields.io/crates/v/turbofan-cluster" alt="crates.io"></a>
   <a href="https://docs.rs/turbofan-cluster"><img src="https://img.shields.io/docsrs/turbofan-cluster" alt="docs.rs"></a>
+  <a href="https://github.com/jrogers/turbofan/actions/workflows/ci.yml"><img src="https://github.com/jrogers/turbofan/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
+</p>
+
+<p align="center">
+  <a href="https://jrogers.github.io/turbofan/">Website</a> ·
+  <a href="https://jrogers.github.io/turbofan/guide/">Guide</a> ·
+  <a href="https://docs.rs/turbofan-cluster">API</a>
 </p>
 
 > [!WARNING]
