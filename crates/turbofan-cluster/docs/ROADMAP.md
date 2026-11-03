@@ -18,6 +18,9 @@ down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report t
   node with it and one without can't talk.
 - **Backup.** Archive snapshots and closed log segments somewhere off the node, and restore a
   cluster from them.
+- **Backing off an unreachable peer.** The driver dials one every `REDIAL` (100 ms) for as long
+  as it's down (`src/driver.rs`): harmless on a LAN, noise towards a standby region down for
+  hours. Back off, to a ceiling of a second or so, and start again on a connection.
 - **A standby in another region.** A cluster that can take over, in another region or cloud, if
   the main one is lost. Learners are in: members that take the log and snapshot but don't vote,
   so the main cluster's commits never wait on the other region (`add-member --learner`, or
@@ -29,6 +32,19 @@ down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report t
   nodes, back, can't talk to it. Refused while the learner hears its leader, but never
   automatic: from the other region a dead cluster and a cut link look alike, and two clusters
   taking orders fill twice, so an operator fences the old one first. Left:
+  - *Knowing a learner is ready:* commits don't wait on a learner, so nothing tells an operator
+    it has caught up before the cluster it would stand in for is lost: its lag is only the
+    `turbofan_follower_lag_entries` gauge. An `add-member --learner --wait` that returns once
+    it's within so many entries, and a `status` that shows each member's lag.
+  - *A log tail past the snapshot:* a snapshot trims the log to its index (`on_snapshot_saved`,
+    `src/raft/snapshots.rs`), so a follower one entry behind it is sent the whole snapshot: over
+    a WAN, a learner's brief cut costs a full transfer. Keep so many entries past it, and send a
+    follower within them the log instead. Compaction drops whole segments, so most of the tail is
+    on disk already.
+  - *A member's role changed in place:* a learner made a voter, or a voter a learner, is one
+    `Members` entry that adds or removes one voter, safe as a single-server change once the
+    learner has caught up. Today it's `remove-member` then `add-member`, which ships the whole log
+    again.
   - *Clients:* the hello tells them the epoch, which they don't check yet. Sessions are
     replicated, so clients reattach to the promoted cluster and resend what it hasn't applied.
     What committed but never reached the learner is lost, and clients can't always tell: a
@@ -49,7 +65,8 @@ A service upgrades by `Service::version` and `activate`, and the cluster's proto
 - **Benchmark regressions.** CI runs `benches/cluster.rs` (throughput, and latency to p99.9, of
   three nodes over real TCP and disks) into each run's summary, but nothing compares it with
   main's last run. Keep main's results and flag a run well below them; shared runners are noisy,
-  so only by a wide margin.
+  so only by a wide margin. And time each entry's stages, not only proposed to committed
+  (`commit_latencies`): persisted, committed, applied, answered, so a regression says where.
 - **A stable API.** Freeze `Service`, `Ctx`, `ClusterClient` and `driver::Config`, and publish to
   crates.io.
 
