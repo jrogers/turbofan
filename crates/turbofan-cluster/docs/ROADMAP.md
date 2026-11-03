@@ -23,12 +23,12 @@ down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report t
   so the main cluster's commits never wait on the other region (`add-member --learner`, or
   `serve --learners` to start with some). So is a cluster epoch: a new cluster's first leader
   names one in the log (an `Epoch` entry, kept in snapshots), every hello carries it, and peers
-  that know different ones don't talk, so a node of an old cluster can't rejoin one promoted
-  from it. Left, in order:
-  - *Promotion:* an admin `promote` on a learner makes it the one member of a new cluster, from
-    its log and snapshot as they are, under a new epoch (`node::mint_epoch`), to grow with
-    `add-member`. Never automatic: from the other region a dead cluster and a cut link look
-    alike, and two clusters taking orders fill twice. An operator fences the old one first.
+  that know different ones don't talk. And promotion: with the main cluster lost, `promote`
+  on a learner makes it the one member of a new cluster of a new epoch, from its log as it is
+  (what it holds past its commit index commits), to grow with `add-member`; the old cluster's
+  nodes, back, can't talk to it. Refused while the learner hears its leader, but never
+  automatic: from the other region a dead cluster and a cut link look alike, and two clusters
+  taking orders fill twice, so an operator fences the old one first. Left:
   - *Clients:* the hello tells them the epoch, which they don't check yet. Sessions are
     replicated, so clients reattach to the promoted cluster and resend what it hasn't applied.
     What committed but never reached the learner is lost, and clients can't always tell: a

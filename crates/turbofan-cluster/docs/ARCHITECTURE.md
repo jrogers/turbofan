@@ -231,7 +231,9 @@ later term, or the whole log of the leader it follows.
   and the snapshot quorum count voters only (`add-member --learner`, or `serve --learners`).
 - **The epoch** names the cluster: its first leader logs an `Epoch` entry, and every hello
   carries it as the node has applied it (0 for none yet). Peers that know different epochs don't
-  talk, checked on every frame, so a connection outlives no change of epoch.
+  talk, checked on every frame, so a connection outlives no change of epoch. **Promotion**
+  (`promote`, to a learner whose leader is silent) makes the learner the one member of a new
+  cluster, of a new epoch, from its log as it is, for a standby to take over a lost cluster.
 - **Leadership transfer**: the leader sends the target no more of its log than it had when the
   transfer began, then `TimeoutNow` once the target has it all, so a rolling restart costs a
   quick election.

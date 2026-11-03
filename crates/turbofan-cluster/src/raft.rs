@@ -615,6 +615,27 @@ impl Raft {
         self.transfer.is_some()
     }
 
+    /// Makes this learner the one member of a new cluster, with its cluster lost: it leads a new
+    /// term, without an election, and proposes the members as itself, a voter, which take effect
+    /// as they're appended. Its log stays as it is: what follows its commit index commits beneath
+    /// that. Refused (false) unless it's a learner that hasn't heard a leader for an election
+    /// timeout: never automatic, since a lost cluster and a cut link look alike from here.
+    pub fn promote(&mut self, now: u64) -> bool {
+        self.now = now;
+        let timeout = nanos(self.config.election_timeout);
+        let leader_alive = self.leader_seen_at.is_some_and(|at| at + timeout > self.now);
+        if self.role != Role::Follower || !self.is_learner(self.config.id) || leader_alive || self.stop.is_some() {
+            return false;
+        }
+        let me = self.members().iter().find(|m| m.id == self.config.id).expect("a learner is a member");
+        let me = Member { learner: false, ..me.clone() };
+        self.meta = Meta { term: self.meta.term + 1, vote: Some(self.config.id) };
+        self.out.persist.push(Persist::Meta(self.meta));
+        self.become_leader(self.now);
+        self.propose_members(&[me]);
+        true
+    }
+
     /// Proposes the members without `id` ([`Outputs::change_proposed`]). Refused (false) unless
     /// this node leads, has committed an entry of its term, no other change is under way, `id`
     /// is a member, and a voter would be left.
@@ -2605,6 +2626,32 @@ mod tests {
         let now = rafts[0].next_deadline() + 2 * 150 * MS;
         rafts[0].on_tick(now);
         assert_eq!(rafts[0].role(), Role::Follower);
+    }
+
+    /// A learner promoted, its leader silent an election timeout, leads a cluster of its own:
+    /// itself, a voter, its log kept, the tail its old cluster hadn't committed committed now.
+    /// Not a voter, nor a learner that hears its leader.
+    #[test]
+    fn a_promoted_learner_leads_a_cluster_of_its_own() {
+        let mut rafts = with_learner();
+        elect(&mut rafts, &[1, 2], 1, 1000 * MS);
+        rafts[0].propose(b"x");
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &[1, 3], 1, sends, 1000 * MS);
+        let (tail, committed) = (rafts[2].last_index(), rafts[2].commit_index());
+        assert!(tail > committed, "the learner holds what its cluster hasn't committed");
+        assert!(!rafts[2].promote(1000 * MS), "it hears its leader");
+        assert!(!rafts[1].promote(5000 * MS), "not a learner");
+
+        let learner = &mut rafts[2];
+        assert!(learner.promote(1000 * MS + 2 * 150 * MS));
+        assert_eq!((learner.role(), learner.term()), (Role::Leader, 2));
+        let me: Vec<_> = learner.members().iter().map(|m| (m.id.0, m.learner)).collect();
+        assert_eq!(me, [(3, false)]);
+        flush(learner);
+        assert_eq!(learner.commit_index(), learner.last_index(), "alone, it commits on its own");
+        assert!(learner.last_index() > tail);
+        assert_eq!(learner.entry(tail), Some(&b"x"[..]), "its log as it was");
     }
 
     /// The last voter isn't removed, though learners would be left.

@@ -1,6 +1,7 @@
 //! Three nodes over real TCP and real files, with a gateway client: messages answered once and in
 //! order while every node in turn, the leader among them, is killed and restarted from disk, and
-//! while a fourth joins and the first leaves.
+//! while a fourth joins and the first leaves; and a fourth, a learner, promoted to a cluster of
+//! its own once the three are lost, that they can't take back.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -264,6 +265,47 @@ async fn a_member_joins_and_another_leaves() {
     // Two of the three that are left are a majority: one more can go down.
     cluster.kill(1).await;
     exchange(&mut cluster, &mut client, 301, 400).await;
+}
+
+/// A learner, promoted once its cluster is lost, leads a cluster of its own. The old cluster,
+/// back, a majority of its own, can't take it back: of another epoch, it's refused, and a session
+/// opened on the new cluster goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promoted_learner_leads_a_cluster_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new(dir.path(), None);
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 100).await;
+    cluster.start(3);
+    let addrs: Vec<String> = cluster.configs.iter().map(|c| c.admin_listen.to_string()).collect();
+    let admin = |i: usize| Admin::new(&addrs[i], SERVICE_ID).with_token(TOKEN).with_timeout(Duration::from_secs(20));
+    let learner = raft::Member { learner: true, ..member(&cluster.addrs, NodeId(4)) };
+    admin(1).add_member(&learner).await.unwrap();
+    exchange(&mut cluster, &mut client, 101, 200).await;
+    // Commits don't wait on a learner: give it time to catch up, as an operator would (it reports
+    // its lag), before the cluster is lost.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let refused = admin(3).promote().await.unwrap_err();
+    assert!(matches!(refused, AdminError::NotPromoted), "it hears its leader: {refused:?}");
+
+    // The cluster is lost; once its leader has been silent a while, the learner is promoted.
+    for i in 0..3 {
+        cluster.kill(i).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    admin(3).promote().await.unwrap();
+    let fourth = vec![cluster.configs[3].client_listen.to_string()];
+    let mut promoted = ClusterClient::connect(fourth, SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut promoted, 1, 100).await;
+
+    // The old cluster comes back, three of its four, and elects a leader of its own; the new one
+    // goes on as it was.
+    for i in 0..3 {
+        cluster.start(i);
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    exchange(&mut cluster, &mut promoted, 101, 200).await;
 }
 
 /// A CA's certificate and key, and a certificate it signs for `127.0.0.1`, under `dir`, as PEM:

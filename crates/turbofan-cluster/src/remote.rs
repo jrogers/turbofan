@@ -382,6 +382,28 @@ impl Admin {
         Ok(NodeId(u8::try_from(leader).expect("a node ID")))
     }
 
+    /// Makes the learner at this address the one member of a new cluster, of a new epoch, from
+    /// its log as it is, with its cluster lost: fence the old one first, since from here a lost
+    /// cluster and a cut link look alike. The old cluster's nodes can't talk to the new one, which
+    /// grows with [`Admin::add_member`]. Returns the index the new epoch was logged at: what the
+    /// old cluster committed past what this learner had is lost.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::NotPromoted`] if it isn't a learner, or heard a leader within an election
+    /// timeout; or [`AdminError::TokenTooLong`], [`AdminError::Denied`] or
+    /// [`AdminError::TimedOut`].
+    pub async fn promote(&self) -> Result<u64, AdminError> {
+        let request = |request_id| frame(&wire::Promote { request_id });
+        self.ask(request, |reply, request_id| match reply {
+            wire::Decoded::Promoted(m) if m.request_id() == request_id => {
+                Some(if m.index() == 0 { Err(AdminError::NotPromoted) } else { Ok(m.index()) })
+            }
+            _ => None,
+        })
+        .await
+    }
+
     /// Sends the `request` for a new request ID to the leader, following redirects from the
     /// address, until `answer` makes something of a reply.
     async fn ask(
@@ -433,6 +455,8 @@ pub enum AdminError {
     },
     /// The leadership wasn't transferred.
     NotTransferred,
+    /// The node isn't a learner, or heard a leader within an election timeout.
+    NotPromoted,
     /// No leader answered in time.
     TimedOut,
 }
@@ -449,6 +473,7 @@ impl fmt::Display for AdminError {
                  {lowest_service_version} at most, or that's a step back"
             ),
             Self::NotTransferred => f.write_str("the leadership wasn't transferred"),
+            Self::NotPromoted => f.write_str("refused: not a learner, or its leader is alive"),
             Self::TimedOut => f.write_str("no leader answered"),
         }
     }

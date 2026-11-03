@@ -31,6 +31,10 @@
 //! to peers, and refuses peers without it. They're read from the environment, not flags, to keep
 //! them out of the process list.
 //!
+//! With the cluster lost, `promote --admin <addr>` makes the learner at that admin address the
+//! one member of a new cluster, of a new epoch, from its log as it is: fence the old cluster first.
+//! Its nodes can't talk to the new one, which grows with `add-member`.
+//!
 //! TLS is optional. `serve --tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca
 //! <pem>` puts it on all three listeners and to peers (see [`crate::tls`]); the operators'
 //! commands then take `--tls-ca <pem> --tls-cert <pem> --tls-key <pem>`, a certificate the admin
@@ -54,7 +58,8 @@ const ADMIN_TOKEN: &str = "TURBOFAN_ADMIN_TOKEN";
 /// The peer token's environment variable.
 const PEER_TOKEN: &str = "TURBOFAN_PEER_TOKEN";
 /// The operators' commands.
-const COMMANDS: [&str; 6] = ["snapshot", "add-member", "remove-member", "activate", "shutdown", "transfer-leadership"];
+const COMMANDS: [&str; 7] =
+    ["snapshot", "add-member", "remove-member", "activate", "shutdown", "transfer-leadership", "promote"];
 
 const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
@@ -65,6 +70,7 @@ const USAGE: &str = "usage:
   remove-member --admin <addr> --id <n>
   transfer-leadership --admin <addr> [--to <n>]
   shutdown --admin <addr>
+  promote --admin <learner's admin addr>
   activate --admin <addr> [--protocol <n>] [--service <n>]
 an operator's command, over TLS: [--tls-ca <pem> --tls-cert <pem> --tls-key <pem>]";
 
@@ -135,6 +141,12 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
         "shutdown" => {
             let index = runtime()?.block_on(admin.shutdown()).map_err(failed)?;
             println!("snapshot taken at index {index}: the members are stopping");
+        }
+        "promote" => {
+            let index = runtime()?.block_on(admin.promote()).map_err(failed)?;
+            println!(
+                "promoted: the one member of a new cluster, its epoch logged at index {index}; add members with add-member"
+            );
         }
         "transfer-leadership" => {
             let to = match flag(args, "--to") {

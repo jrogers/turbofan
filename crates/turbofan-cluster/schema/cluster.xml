@@ -249,6 +249,18 @@
         <field name="lowestProtocol" id="3" type="uint32"/>
         <field name="lowestServiceVersion" id="4" type="uint32"/>
     </sbe:message>
+    <!-- To a learner, with its cluster lost: make it the one member of a new cluster, of a new
+         epoch, from its log as it is. Refused unless it's a learner that hasn't heard a leader
+         for an election timeout. -->
+    <sbe:message name="Promote" id="72">
+        <field name="requestId" id="1" type="uint64"/>
+    </sbe:message>
+    <!-- Promoted: the new cluster's epoch, logged at `index`; or refused (0). -->
+    <sbe:message name="Promoted" id="73">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="index" id="2" type="uint64"/>
+        <field name="epoch" id="3" type="uint64"/>
+    </sbe:message>
     <!-- Snapshot every node at the next index, then stop them. -->
     <sbe:message name="Shutdown" id="48">
         <field name="requestId" id="1" type="uint64"/>
@@ -294,11 +306,13 @@
         <field name="protocol" id="2" type="uint32"/>
         <field name="serviceVersion" id="3" type="uint32"/>
     </sbe:message>
-    <!-- The cluster's epoch, from a new cluster's first leader: only the first one applied
-         counts. -->
+    <!-- The cluster's epoch from here on: from a new cluster's first leader, which counts only if
+         there's none yet (so only the first one applied does); or, with `promoted` 1, from a
+         learner promoted to start a cluster of its own, which replaces it. -->
     <sbe:message name="Epoch" id="59">
         <field name="timestamp" id="1" type="uint64"/>
         <field name="epoch" id="2" type="uint64"/>
+        <field name="promoted" id="3" type="uint8"/>
     </sbe:message>
     <!-- A service's own message, from `Ctx::propose`: `id` is its place in the outbox. -->
     <sbe:message name="ServiceProposal" id="57">

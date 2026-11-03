@@ -725,12 +725,18 @@ async fn dial_peer(
             tokio::time::sleep(REDIAL).await;
             continue;
         };
+        let epoch = hello.epoch();
         if write_frames(&mut stream, [&hello.frame(wire::Role::Peer, &token)[..]]).await.is_err() {
             tokio::time::sleep(REDIAL).await;
             continue;
         }
         loop {
             let Some(frame) = rx.recv().await else { return };
+            // Its epoch changed since its hello said: dialled again, for the peer to check the new
+            // one. Else one that said none would go on being taken for one of any cluster.
+            if hello.epoch() != epoch {
+                break;
+            }
             batch.clear();
             batch.extend_from_slice(&frame);
             while batch.len() < MAX_FRAME_BYTES {

@@ -425,6 +425,9 @@ pub struct Node<S> {
     /// A leadership transfer asked for, on this admin connection with this request ID: answered
     /// once another node leads, which is after this one stops leading.
     transferring: Option<(ConnId, u64)>,
+    /// A promotion asked for, on this admin connection with this request ID, to this epoch:
+    /// answered once it applies.
+    promoting: Option<(ConnId, u64, u64)>,
     /// When the latest snapshot was taken or installed, or the node started.
     snapshot_at: u64,
 }
@@ -455,6 +458,7 @@ impl<S: Service> Node<S> {
             save: None,
             restoring,
             transferring: None,
+            promoting: None,
             snapshot_at: now,
         }
     }
@@ -523,9 +527,15 @@ impl<S: Service> Node<S> {
     /// An operator's request on `conn`. `SnapshotRequest` asks for a snapshot at the next index,
     /// on every node, and is answered `SnapshotTaken` once a quorum has it durable. `AddMember`
     /// and `RemoveMember` change the members, one at a time, and are answered `MembersChanged`
-    /// once the change is committed, or `MembersRefused`.
+    /// once the change is committed, or `MembersRefused`. `Promote` is for a learner, not the
+    /// leader: see [`Raft::promote`].
     pub fn on_admin(&mut self, conn: ConnId, message: &wire::Decoded<'_>, now: u64) {
         self.after(now);
+        // To a learner, which never leads: not for the leader, if there's one.
+        if let wire::Decoded::Promote(m) = message {
+            self.promote(conn, m.request_id());
+            return;
+        }
         let admin = matches!(
             message,
             wire::Decoded::SnapshotRequest(_)
@@ -606,6 +616,18 @@ impl<S: Service> Node<S> {
                 self.send_client(conn, &refused);
             }
         }
+    }
+
+    /// Makes this learner a cluster of its own, of a new epoch ([`Raft::promote`]): answered
+    /// `Promoted` once the epoch applies, after the rest of its log.
+    fn promote(&mut self, conn: ConnId, request_id: u64) {
+        if self.promoting.is_some() || !self.raft.promote(self.now) {
+            self.send_client(conn, &wire::Promoted { request_id, index: 0, epoch: 0 });
+            return;
+        }
+        let epoch = mint_epoch(self.now, self.raft.id());
+        self.propose(&wire::Epoch { timestamp: self.now, epoch, promoted: 1 });
+        self.promoting = Some((conn, request_id, epoch));
     }
 
     fn start_change(&mut self, conn: ConnId, request_id: u64, started: bool) {
@@ -854,7 +876,8 @@ impl<S: Service> Node<S> {
         // A new cluster's first leader names it. Another leader may too, before this applies: the
         // first applied counts.
         if self.state.epoch == 0 {
-            self.propose(&wire::Epoch { timestamp: self.now, epoch: mint_epoch(self.now, self.raft.id()) });
+            let epoch = mint_epoch(self.now, self.raft.id());
+            self.propose(&wire::Epoch { timestamp: self.now, epoch, promoted: 0 });
         }
     }
 
@@ -1025,9 +1048,7 @@ impl<S: Service> Node<S> {
             }
             wire::Decoded::Epoch(e) => {
                 self.advance_time(e.timestamp());
-                if self.state.epoch == 0 {
-                    self.state.epoch = e.epoch();
-                }
+                self.apply_epoch(index, e.epoch(), e.promoted() == 1);
             }
             wire::Decoded::Activated(e) => {
                 self.advance_time(e.timestamp());
@@ -1089,6 +1110,20 @@ impl<S: Service> Node<S> {
                 }
             }
             _ => panic!("a log entry this node knows, at {index}: see WIRE.md"),
+        }
+    }
+
+    /// The cluster's epoch from `index` on, if it has none yet or this one's promoted: answered,
+    /// if it's this node's promotion.
+    fn apply_epoch(&mut self, index: u64, epoch: u64, promoted: bool) {
+        if self.state.epoch == 0 || promoted {
+            self.state.epoch = epoch;
+        }
+        if let Some((conn, request_id, at)) = self.promoting
+            && at == epoch
+        {
+            self.promoting = None;
+            self.send_client(conn, &wire::Promoted { request_id, index, epoch });
         }
     }
 
@@ -1675,7 +1710,7 @@ mod tests {
         let mut node = leader();
         let epoch = node.epoch();
         assert_ne!(epoch, 0);
-        node.propose(&wire::Epoch { timestamp: 1, epoch: epoch + 1 });
+        node.propose(&wire::Epoch { timestamp: 1, epoch: epoch + 1, promoted: 0 });
         drive(&mut node);
         assert_eq!(node.epoch(), epoch, "only the first counts");
 
@@ -1683,6 +1718,34 @@ mod tests {
         assert_eq!(decode_state(&mut &bytes[..]).unwrap().epoch, epoch, "kept in snapshots");
         assert_ne!(mint_epoch(5, NodeId(1)), mint_epoch(5, NodeId(2)), "two nodes at once");
         assert_ne!(mint_epoch(0, NodeId(0)), 0);
+    }
+
+    /// A learner promoted leads alone, of a new epoch that replaces its cluster's, and says so
+    /// once it applies; a new cluster's naming of one doesn't replace it. A voter isn't promoted.
+    #[test]
+    fn a_promoted_learner_names_a_new_epoch() {
+        let promote = |node: &mut Node<Recorder>| {
+            let mut frame = Vec::new();
+            codec::encode_frame(&wire::Promote { request_id: 9 }, &mut frame).unwrap();
+            node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
+            drive(node).join(" ")
+        };
+        assert!(promote(&mut leader()).contains("Promoted(PromotedRef { request_id: 9, index: 0, epoch: 0 })"));
+
+        let mut config = leader().config;
+        config.raft.id = NodeId(2);
+        config.raft.members = vec![member(1), Member { learner: true, ..member(2) }];
+        let mut node = Node::new(config, Recorder::default(), Meta::default(), None, Entries::default(), 0);
+        node.state.epoch = 5;
+        let answer = promote(&mut node);
+        assert!(node.is_ready(), "it leads");
+        assert_ne!(node.epoch(), 5, "a new epoch");
+        let promoted = format!("index: {}, epoch: {}", node.applied() - 1, node.epoch());
+        assert!(answer.contains(&promoted), "{answer}");
+        let epoch = node.epoch();
+        node.propose(&wire::Epoch { timestamp: 1, epoch: 6, promoted: 0 });
+        drive(&mut node);
+        assert_eq!(node.epoch(), epoch, "a new cluster's naming doesn't replace it");
     }
 
     /// What a service proposes comes back through the log, once, even when it's logged twice.
