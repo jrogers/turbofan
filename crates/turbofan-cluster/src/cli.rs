@@ -18,7 +18,8 @@
 //! ```
 //!
 //! `add-member --learner` adds it as a learner: it takes the log but doesn't vote, so the
-//! cluster's commits don't wait on it, as for a standby in another region.
+//! cluster's commits don't wait on it, as for a standby in another region. A cluster can start
+//! with learners too: `serve --learners 3,4`, the same on every node it starts with.
 //!
 //! Before stopping the leader, `transfer-leadership --admin <addr> [--to <n>]` hands over to a
 //! caught-up member, so a rolling restart costs a quick election rather than an election
@@ -56,7 +57,8 @@ const PEER_TOKEN: &str = "TURBOFAN_PEER_TOKEN";
 const COMMANDS: [&str; 6] = ["snapshot", "add-member", "remove-member", "activate", "shutdown", "transfer-leadership"];
 
 const USAGE: &str = "usage:
-  serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...> [--join]
+  serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
+        [--join | --learners <n,...>]
         [--tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca <pem>]
   snapshot --admin <addr>
   add-member --admin <addr> --member <n>=<peer addr>,<client addr>,<admin addr> [--learner]
@@ -162,8 +164,12 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
     }
     let own = |list: &[(NodeId, SocketAddr)]| list.iter().find(|(m, _)| *m == id).map(|&(_, a)| a).expect("checked");
     let nanos = |d: Duration| u64::try_from(d.as_nanos()).expect("small");
+    let learners = learners(args, &ids(&peers))?;
     // Joining, the lists are where to find the cluster; otherwise they're its first members.
     let members = if args.iter().any(|a| a == "--join") {
+        if !learners.is_empty() {
+            return Err("--learners starts a cluster: a node joining is added with add-member".into());
+        }
         Vec::new()
     } else {
         let addr = |list: &[(NodeId, SocketAddr)], i: usize| list[i].1.to_string();
@@ -173,7 +179,7 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
                 peer: addr(&peers, i),
                 client: addr(&clients, i),
                 admin: addr(&admins, i),
-                learner: false,
+                learner: learners.contains(&peers[i].0),
             })
             .collect()
     };
@@ -243,6 +249,20 @@ fn member(text: &str) -> Result<Member, String> {
     Ok(Member { id, peer: peer.to_string(), client: client.to_string(), admin: admin.to_string(), learner: false })
 }
 
+/// `--learners 3,4`, if given: some of `members`, not all.
+fn learners(args: &[String], members: &[NodeId]) -> Result<Vec<NodeId>, String> {
+    if !args.iter().any(|a| a == "--learners") {
+        return Ok(Vec::new());
+    }
+    let bad = || "--learners: IDs among the members, not all of them".to_owned();
+    let learners: Vec<NodeId> =
+        flag(args, "--learners")?.split(',').map(str::parse).collect::<Result<_, _>>().map_err(|_| bad())?;
+    if learners.iter().any(|l| !members.contains(l)) || members.iter().all(|m| learners.contains(m)) {
+        return Err(bad());
+    }
+    Ok(learners)
+}
+
 /// `1=host:port,2=host:port,...`, sorted by ID.
 fn members(list: &str) -> Result<Vec<(NodeId, SocketAddr)>, String> {
     let mut members = Vec::new();
@@ -261,7 +281,8 @@ fn members(list: &str) -> Result<Vec<(NodeId, SocketAddr)>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::tls_flags;
+    use super::{learners, tls_flags};
+    use crate::raft::NodeId;
 
     /// All the TLS flags or none; one without its value is refused, never read as no TLS.
     #[test]
@@ -272,5 +293,18 @@ mod tests {
         assert_eq!(tls_flags(&args(&["--a", "1", "--b", "2"]), names), Ok(Some(["1".into(), "2".into()])));
         assert!(tls_flags(&args(&["--a", "1"]), names).is_err());
         assert!(tls_flags(&args(&["--a"]), names).is_err());
+    }
+
+    /// Learners are some of the members, never all: a cluster needs a voter.
+    #[test]
+    fn learners_are_some_of_the_members() {
+        let args = |a: &[&str]| a.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+        let members = [1, 2, 3].map(NodeId);
+        assert_eq!(learners(&args(&["--x"]), &members), Ok(vec![]));
+        assert_eq!(learners(&args(&["--learners", "3,2"]), &members), Ok(vec![NodeId(3), NodeId(2)]));
+        assert!(learners(&args(&["--learners", "1,2,3"]), &members).is_err(), "no voter");
+        assert!(learners(&args(&["--learners", "4"]), &members).is_err(), "not a member");
+        assert!(learners(&args(&["--learners", "x"]), &members).is_err());
+        assert!(learners(&args(&["--learners"]), &members).is_err(), "no value");
     }
 }
