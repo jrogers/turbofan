@@ -14,7 +14,7 @@ before writing code.
   generated code, and only as `crates/turbofan-cluster/docs/WIRE.md` allows: old and new nodes run side
   by side. A generator change: `SBE_REGENERATE=1 cargo test -p turbofan-sbe` rewrites its
   checked-in test codecs.
-- Services live in repositories of their own, depending on it by git: the OMS (an order book) is
+- Services live in repositories of their own, depending on it by git (or crates.io): the OMS (an order book) is
   at `../oms`. A framework change can break one: check it there with `cargo update -p
   turbofan-cluster` and its `scripts/check.sh`.
 - `scripts/check.sh` (fmt, clippy `-D warnings`, tests, rustdoc, `cargo deny`) before calling work
@@ -26,6 +26,9 @@ before writing code.
   prints `SIM_SEED=<n>`, which replays it.
 - `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan-cluster/fuzz`,
   outside the workspace; nightly and cargo-fuzz). `check.sh` only checks it builds.
+- Releasing: both crates share the workspace version. Bump it, date its `CHANGELOG.md` section,
+  `cargo publish --workspace` (the user runs it: their token), then `scripts/github-release.sh <version>`
+  tags `v<version>` and makes the GitHub release from that section.
 - CI runs the simulation's fixed seeds and the fuzz targets' build in jobs of their own on every push;
   fresh seeds (`simulate.yml`) and fuzzing (`fuzz.yml`) run nightly, and a failing night opens an issue
   (`scripts/nightly-report.sh`).

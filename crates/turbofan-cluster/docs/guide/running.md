@@ -50,9 +50,11 @@ replaced, not repaired: see [Members][membership].
 
 ## Durability
 
-The log isn't synced to disk by default. The other nodes' copies are the redundancy: a process
-that crashes loses nothing (the operating system still has the writes), and a machine that's lost
-is caught up from the others. What it doesn't survive is a majority of nodes losing power at
+The log isn't synced to disk before an entry is acknowledged, by default. The other nodes' copies
+are the redundancy: a process that crashes loses nothing (the operating system still has the
+writes), and a machine that's lost is caught up from the others. It's still synced behind the
+writes, every 4 MiB, on a thread nothing waits for, so that unwritten data doesn't pile up and
+stall the disk. What it doesn't survive is a majority of nodes losing power at
 once, which may lose entries already committed. Spread the nodes over power domains, or run with
 `serve --fsync`, which syncs the log once a batch before acknowledging it, at a cost in latency
 (see [Performance][performance]). The term and vote, and snapshots, are always synced.

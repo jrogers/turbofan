@@ -24,7 +24,7 @@ An arrow points from a crate to one that depends on it. `turbofan-sbe` generates
 schemas in a `build.rs`, and is also the runtime those codecs call. `turbofan-cluster` is the
 reusable core: Raft, client sessions, the disk and the network. It knows nothing of what a
 service does: a service's messages are opaque bytes to it. Services live in repositories of their
-own, depending on both crates by git: the [OMS](https://github.com/jrogers/oms), an order book,
+own, depending on both crates: the [OMS](https://github.com/jrogers/oms), an order book,
 is one. Here, `examples/counter.rs` is a service small enough to read whole. The fuzz crate sits
 outside the workspace, with a lock file of its own.
 

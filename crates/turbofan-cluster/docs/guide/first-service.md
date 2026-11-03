@@ -11,12 +11,11 @@ from `turbofan-sbe`.
 
 ## Dependencies
 
-Turbofan isn't on crates.io yet: depend on it by git, and `Cargo.lock` pins the commit. Nodes and
-clients run on [tokio](https://docs.rs/tokio):
+Nodes and clients run on [tokio](https://docs.rs/tokio):
 
 ```toml
 [dependencies]
-turbofan-cluster = { git = "https://github.com/jrogers/turbofan" }
+turbofan-cluster = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -237,4 +236,4 @@ network, and replay any failure exactly.
 - `node/` adds client sessions, timers and snapshots on top, and runs the service.
 - `driver` runs a node on tokio, with TCP and files; `ClusterClient` runs a client.
 
-[ARCHITECTURE.md](../ARCHITECTURE.md) goes through it in full.
+[ARCHITECTURE.md](https://github.com/jrogers/turbofan/blob/main/crates/turbofan-cluster/docs/ARCHITECTURE.md) goes through it in full.

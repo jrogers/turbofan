@@ -55,8 +55,8 @@ A service upgrades by `Service::version` and `activate`, and the cluster's proto
 
 ## 3. Toward 1.0
 
-- **A stable API.** Freeze `Service`, `Ctx`, `ClusterClient` and `driver::Config`, and publish to
-  crates.io.
+- **A stable API.** Freeze `Service`, `Ctx`, `ClusterClient` and `driver::Config`. The crates are
+  on crates.io from 0.1.0, but until 1.0 a minor version may break the API (CHANGELOG.md says how).
 
 ## 4. Docs and outreach
 
@@ -69,8 +69,7 @@ What Turbojet did for its own launch (its `site/` and `docs/guide/`), done again
   numbers, and links to the crates and the repository. Build it from the repository's own docs,
   as Turbojet's `site/build.py` does, so it can't drift from them, with `llms.txt` beside it.
 - **Announcement posts.** Posts introducing Turbofan where Rust and trading-systems developers
-  read, linking to the website and guide. Wait until those are up, and until the crates are on
-  crates.io (section 3), so a reader can `cargo add` it.
+  read, linking to the website and guide. Wait until those are up.
 
 ## Not planned
 
