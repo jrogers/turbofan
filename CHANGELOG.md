@@ -4,6 +4,11 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## 0.1.1 (2026-11-03)
+
+Documentation only: the READMEs, guide and architecture overview no longer link to the OMS, whose
+repository is private. The code is as in 0.1.0.
+
 ## 0.1.0 (2026-11-03)
 
 The first release.
