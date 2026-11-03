@@ -1,5 +1,5 @@
-//! Members: adding (after catching up, unless a learner) and removing them, versions, leadership
-//! transfer, and promotion.
+//! Members: adding (after catching up, unless a learner), removing them and changing their role,
+//! versions, leadership transfer, and promotion.
 
 use super::*;
 
@@ -7,7 +7,7 @@ impl Raft {
     /// The peers to connect to: the members, and a member being added.
     #[must_use]
     pub fn peers(&self) -> Vec<Member> {
-        let learner = self.catching_up.as_ref().map(|c| c.member.clone());
+        let learner = self.adding().map(|c| c.member.clone());
         self.members().iter().cloned().chain(learner).collect()
     }
 
@@ -124,11 +124,40 @@ impl Raft {
         true
     }
 
+    /// Makes member `id` a learner, or a voter, in place: one change of members. A voter made a
+    /// learner is proposed at once ([`Outputs::change_proposed`]); a learner made a voter first
+    /// catches up, as a member being added does ([`Raft::add_member`]), so that a quorum doesn't
+    /// wait on it. Refused (false) unless this node leads, has committed an entry of its term, no
+    /// other change is under way, `id` is a member of the other role, and a voter would be left.
+    pub fn set_role(&mut self, id: NodeId, learner: bool) -> bool {
+        let Some(member) = self.members().iter().find(|m| m.id == id && m.learner != learner).cloned() else {
+            return false;
+        };
+        if !self.can_change() || (learner && self.voters() == 1) {
+            return false;
+        }
+        let member = Member { learner, ..member };
+        if learner {
+            let members: Vec<Member> =
+                self.members().iter().map(|m| if m.id == id { member.clone() } else { m.clone() }).collect();
+            self.propose_members(&members);
+        } else {
+            let (now, last) = (self.now, self.last_index());
+            self.catching_up = Some(CatchUp { member, started: now, round_start: now, round_end: last });
+        }
+        true
+    }
+
+    /// The member being added, not one changing role.
+    fn adding(&self) -> Option<&CatchUp> {
+        self.catching_up.as_ref().filter(|c| !self.is_member(c.member.id))
+    }
+
     /// A member being added isn't sent the log until it's known to support the versions the
     /// cluster runs: applying what it's sent, older code would run behaviour it doesn't have.
     pub(super) fn held_back(&self, peer: usize) -> bool {
         let p = &self.peers[peer];
-        let adding = self.catching_up.as_ref().is_some_and(|c| c.member.id == p.id);
+        let adding = self.adding().is_some_and(|c| c.member.id == p.id);
         let new_enough = p.versions.is_some_and(|(q, s)| q >= self.required.0 && s >= self.required.1);
         adding && !new_enough
     }
@@ -148,6 +177,20 @@ impl Raft {
         if m.term() == self.meta.term && self.leader == Some(from) && self.is_voter(self.config.id) {
             self.become_candidate(now);
         }
+    }
+
+    /// Whether this node stands for election: it knows members, and isn't a learner, unless a
+    /// change it hasn't seen committed made it one. Then it may have the most of the log, which
+    /// the others, still counting it a voter, may need to elect anyone: it stands, its own vote
+    /// not counted, and once leading, leads until the change commits, then stands down, as a
+    /// leader that removed itself does.
+    pub(super) fn may_stand(&self) -> bool {
+        let me = self.config.id;
+        let demoted = || {
+            let at = self.config_index();
+            at > self.commit && self.members_at(at - 1).iter().any(|m| m.id == me && !m.learner)
+        };
+        !self.members().is_empty() && (!self.is_learner(me) || demoted())
     }
 
     pub(super) fn is_member(&self, id: NodeId) -> bool {
@@ -205,10 +248,11 @@ impl Raft {
         self.join();
     }
 
-    /// Proposes the members with the one being added.
+    /// Proposes the members with the one being added, or changing role, as it will be.
     pub(super) fn join(&mut self) {
         let member = self.catching_up.take().expect("one is being added").member;
         let mut members = self.members().to_vec();
+        members.retain(|m| m.id != member.id);
         members.push(member);
         members.sort_unstable_by_key(|m| m.id);
         self.propose_members(&members);
@@ -248,7 +292,7 @@ impl Raft {
     /// keep their state.
     pub(super) fn rebuild_peers(&mut self) {
         let (next, now) = (self.last_index() + 1, self.now);
-        let learner = self.catching_up.as_ref().map(|c| c.member.id);
+        let learner = self.adding().map(|c| c.member.id);
         let mut ids: Vec<NodeId> = self.members().iter().map(|m| m.id).chain(learner).collect();
         ids.retain(|&id| id != self.config.id);
         self.peers.retain(|p| ids.contains(&p.id));

@@ -20,7 +20,9 @@
 //! `add-member --learner` adds it as a learner: it takes the log but doesn't vote, so the
 //! cluster's commits don't wait on it, as for a standby in another region. Nor does anything
 //! else wait for it to catch up: `--wait <entries>` returns once it's within that many of the
-//! leader's log, and `status --admin <addr>` shows how far behind each member is. A cluster can start
+//! leader's log, and `status --admin <addr>` shows how far behind each member is. `set-role --id <n>
+//! --voter` makes a caught-up learner a voter in place, and `--learner` the reverse, without
+//! shipping it the log again. A cluster can start
 //! with learners too: `serve --learners 3,4`, the same on every node it starts with.
 //!
 //! Before stopping the leader, `transfer-leadership --admin <addr> [--to <n>]` hands over to a
@@ -65,8 +67,17 @@ const ADMIN_TOKEN: &str = "TURBOFAN_ADMIN_TOKEN";
 /// The peer token's environment variable.
 const PEER_TOKEN: &str = "TURBOFAN_PEER_TOKEN";
 /// The operators' commands.
-const COMMANDS: [&str; 8] =
-    ["snapshot", "add-member", "remove-member", "activate", "shutdown", "transfer-leadership", "promote", "status"];
+const COMMANDS: [&str; 9] = [
+    "snapshot",
+    "add-member",
+    "remove-member",
+    "set-role",
+    "activate",
+    "shutdown",
+    "transfer-leadership",
+    "promote",
+    "status",
+];
 /// How often `add-member --wait` asks how far behind the new member is.
 const WAIT_POLL: Duration = Duration::from_secs(2);
 
@@ -79,6 +90,7 @@ const USAGE: &str = "usage:
         [--wait <entries>]
   status --admin <addr>
   remove-member --admin <addr> --id <n>
+  set-role --admin <addr> --id <n> (--voter | --learner)
   transfer-leadership --admin <addr> [--to <n>]
   shutdown --admin <addr>
   promote --admin <learner's admin addr>
@@ -148,6 +160,13 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             let index = runtime()?.block_on(admin.remove_member(id)).map_err(failed)?;
             println!("member {id} removed at index {index}: stop it");
         }
+        "set-role" => {
+            let id: NodeId = flag(args, "--id")?.parse().map_err(|_| "--id: a number from 1".to_owned())?;
+            let learner = learner_flag(args)?;
+            let admin = admin.with_timeout(MEMBERS_REQUEST_TIMEOUT);
+            let index = runtime()?.block_on(admin.set_role(id, learner)).map_err(failed)?;
+            println!("member {id} is a {} from index {index}", if learner { "learner" } else { "voter" });
+        }
         "activate" => {
             let version = |name| match flag(args, name) {
                 Ok(v) => v.parse().map_err(|_| format!("{name}: a number")),
@@ -179,6 +198,15 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
         _ => unreachable!("one of COMMANDS"),
     }
     Ok(())
+}
+
+/// `set-role`'s `--learner` (true) or `--voter` (false): one of them.
+fn learner_flag(args: &[String]) -> Result<bool, String> {
+    match (args.iter().any(|a| a == "--voter"), args.iter().any(|a| a == "--learner")) {
+        (true, false) => Ok(false),
+        (false, true) => Ok(true),
+        _ => Err(format!("set-role: --voter or --learner\n{USAGE}")),
+    }
 }
 
 fn print_status(status: &ClusterStatus) {

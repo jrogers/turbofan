@@ -52,6 +52,8 @@ use turbofan_cluster::raft::{
 use turbofan_cluster::{Ctx, Service, SessionId, SnapshotWriter, snapshot};
 
 const MS: u64 = 1_000_000;
+/// Marks an admin request's ID as a `SetRole`'s, to count its answer.
+const ROLE_REQUEST: u64 = 1 << 63;
 const FAULT_PHASE: u64 = 20_000 * MS;
 const QUIET_PHASE: u64 = 10_000 * MS;
 const CLIENTS: usize = 3;
@@ -90,6 +92,7 @@ fn simulate() {
         assert!(covered.manual_snapshots > 0, "no manual snapshot was answered");
         assert!(covered.member_changes > 0, "the members never changed");
         assert!(covered.learners > 0, "no learner was ever a member");
+        assert!(covered.role_changes > 0, "no member's role was ever changed");
         assert!(covered.transfers > 0, "the leadership was never handed over");
         assert!(covered.activations > 0, "a new version was never activated");
         assert!(covered.shutdowns > 0, "the cluster was never shut down");
@@ -106,6 +109,8 @@ struct Coverage {
     member_changes: u64,
     /// Changes of members made while a learner was one.
     learners: u64,
+    /// Members made a learner or a voter in place.
+    role_changes: u64,
     transfers: u64,
     activations: u64,
     shutdowns: u64,
@@ -122,6 +127,7 @@ impl Coverage {
         self.manual_snapshots += other.manual_snapshots;
         self.member_changes += other.member_changes;
         self.learners += other.learners;
+        self.role_changes += other.role_changes;
         self.transfers += other.transfers;
         self.activations += other.activations;
         self.shutdowns += other.shutdowns;
@@ -846,7 +852,8 @@ impl Sim {
     }
 
     /// An operator adds a member, or removes one (the leader, perhaps), keeping three to seven,
-    /// and three voters or more. Some it adds are learners.
+    /// and three voters or more. Some it adds are learners; some changes make a learner a voter,
+    /// or a voter a learner, in place.
     fn change_members(&mut self) {
         if self.now < FAULT_PHASE + QUIET_PHASE / 2 {
             let after = 500 * MS + self.rng.below(1000 * MS);
@@ -859,8 +866,13 @@ impl Sim {
         self.covered.learners += u64::from(!learners.is_empty());
         let others: Vec<NodeId> = self.members.iter().copied().filter(|id| !members.contains(id)).collect();
         let voters = members.len() - learners.len();
-        let request_id = self.rng.next();
-        if members.len() < MAX_MEMBERS && (voters <= 3 || self.rng.one_in(2)) {
+        let request_id = self.rng.next() & !ROLE_REQUEST;
+        if self.rng.one_in(3) && (!learners.is_empty() || voters > 3) {
+            let (id, learner) =
+                if learners.is_empty() { (self.rng.pick(&members), true) } else { (self.rng.pick(&learners), false) };
+            let request_id = request_id | ROLE_REQUEST;
+            self.admin(&turbofan_cluster::wire::SetRole { request_id, id: id.0, learner: u8::from(learner) });
+        } else if members.len() < MAX_MEMBERS && (voters <= 3 || self.rng.one_in(2)) {
             let m = member(self.rng.pick(&others));
             let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
             let learner = u8::from(self.rng.one_in(3));
@@ -1164,7 +1176,10 @@ impl Sim {
         if c == ADMIN {
             let (message, _) = codec::decode_frame(frame).unwrap().unwrap();
             self.admin_answers += u64::from(matches!(message, turbofan_cluster::wire::Decoded::SnapshotTaken(_)));
-            self.member_changes += u64::from(matches!(message, turbofan_cluster::wire::Decoded::MembersChanged(_)));
+            if let turbofan_cluster::wire::Decoded::MembersChanged(m) = &message {
+                self.member_changes += 1;
+                self.covered.role_changes += u64::from(m.request_id() & ROLE_REQUEST != 0);
+            }
             if let turbofan_cluster::wire::Decoded::Activation(m) = message
                 && m.index() > 0
                 && self.activated.is_none()
@@ -1489,7 +1504,7 @@ impl Sim {
             return;
         };
         if members.contains(&id) {
-            let request_id = self.rng.next();
+            let request_id = self.rng.next() & !ROLE_REQUEST;
             self.admin(&turbofan_cluster::wire::RemoveMember { request_id, id: id.0 });
             self.schedule(500 * MS, Event::Replace(id));
             return;

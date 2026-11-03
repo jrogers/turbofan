@@ -261,6 +261,14 @@
         <field name="index" id="2" type="uint64"/>
         <field name="epoch" id="3" type="uint64"/>
     </sbe:message>
+    <!-- Make member `id` a learner (`learner` 1) or a voter (0), in place: one change of members,
+         answered as `AddMember` is. A learner made a voter catches up first, as a member added
+         does. An older leader doesn't answer. -->
+    <sbe:message name="SetRole" id="76">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="id" id="2" type="uint8"/>
+        <field name="learner" id="3" type="uint8"/>
+    </sbe:message>
     <!-- Each member's progress, as the leader knows it. An older leader doesn't answer. -->
     <sbe:message name="StatusRequest" id="74">
         <field name="requestId" id="1" type="uint64"/>

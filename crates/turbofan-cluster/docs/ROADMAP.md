@@ -36,11 +36,8 @@ are a snapshot. Nodes report through the
   taking orders fill twice, so an operator fences the old one first. Nothing waits for a learner
   to catch up, but `status` shows how far behind it is, and `add-member --learner --wait <n>`
   returns once it's within `n` entries. A snapshot keeps a tail of the log before it, so a
-  learner briefly cut off is sent the entries it missed rather than the whole snapshot. Left:
-  - *A member's role changed in place:* a learner made a voter, or a voter a learner, is one
-    `Members` entry that adds or removes one voter, safe as a single-server change once the
-    learner has caught up. Today it's `remove-member` then `add-member`, which ships the whole log
-    again.
+  learner briefly cut off is sent the entries it missed rather than the whole snapshot, and
+  `set-role` makes a learner a voter, or a voter a learner, in place. Left:
   - *Clients:* the hello tells them the epoch, which they don't check yet. Sessions are
     replicated, so clients reattach to the promoted cluster and resend what it hasn't applied.
     What committed but never reached the learner is lost, and clients can't always tell: a

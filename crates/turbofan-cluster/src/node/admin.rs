@@ -5,8 +5,8 @@ use super::*;
 
 impl<S: Service> Node<S> {
     /// An operator's request on `conn`. `SnapshotRequest` asks for a snapshot at the next index,
-    /// on every node, and is answered `SnapshotTaken` once a quorum has it durable. `AddMember`
-    /// and `RemoveMember` change the members, one at a time, and are answered `MembersChanged`
+    /// on every node, and is answered `SnapshotTaken` once a quorum has it durable. `AddMember`,
+    /// `RemoveMember` and `SetRole` change the members, one at a time, and are answered `MembersChanged`
     /// once the change is committed, or `MembersRefused`. `Promote` is for a learner, not the
     /// leader: see [`Raft::promote`]. `StatusRequest` is answered `Status`, each member's progress.
     pub fn on_admin(&mut self, conn: ConnId, message: &wire::Decoded<'_>, now: u64) {
@@ -21,6 +21,7 @@ impl<S: Service> Node<S> {
             wire::Decoded::SnapshotRequest(_)
                 | wire::Decoded::AddMember(_)
                 | wire::Decoded::RemoveMember(_)
+                | wire::Decoded::SetRole(_)
                 | wire::Decoded::TransferLeadership(_)
                 | wire::Decoded::Shutdown(_)
                 | wire::Decoded::Activate(_)
@@ -51,13 +52,15 @@ impl<S: Service> Node<S> {
                     admin: text(m.admin()),
                     learner: m.learner() == 1,
                 };
-                let free = self.local.changing.is_none() && self.local.activating.is_none();
-                let started = free && self.raft.add_member(member);
-                self.start_change(conn, m.request_id(), started);
+                self.change_members(conn, m.request_id(), |raft| raft.add_member(member));
             }
             wire::Decoded::RemoveMember(m) => {
                 let started = self.local.changing.is_none() && self.raft.remove_member(NodeId(m.id()));
                 self.start_change(conn, m.request_id(), started);
+            }
+            wire::Decoded::SetRole(m) => {
+                let (id, learner) = (NodeId(m.id()), m.learner() == 1);
+                self.change_members(conn, m.request_id(), |raft| raft.set_role(id, learner));
             }
             wire::Decoded::Activate(m) => self.activate(conn, m.request_id(), m.protocol(), m.service_version()),
             wire::Decoded::Shutdown(m) => {
@@ -121,6 +124,14 @@ impl<S: Service> Node<S> {
             .collect();
         let (leader, last_index, commit_index) = (self.raft.id().0, self.raft.last_index(), self.raft.commit_index());
         self.send_client(conn, &wire::Status { request_id, leader, last_index, commit_index, member: &member });
+    }
+
+    /// Starts a change of members by `change`, unless one is under way, or an activation, which
+    /// a member too old for it could otherwise slip past.
+    fn change_members(&mut self, conn: ConnId, request_id: u64, change: impl FnOnce(&mut Raft) -> bool) {
+        let free = self.local.changing.is_none() && self.local.activating.is_none();
+        let started = free && change(&mut self.raft);
+        self.start_change(conn, request_id, started);
     }
 
     pub(super) fn start_change(&mut self, conn: ConnId, request_id: u64, started: bool) {

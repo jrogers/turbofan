@@ -86,7 +86,9 @@ cargo run --example counter -- add-member --admin 127.0.0.1:7201 \
 
 It's sent the log, or a snapshot, without a vote until it has caught up, then joins. `remove-member
 --admin <addr> --id <n>` takes one out; stop it once that's answered. Replacing a node whose disk
-died is a remove, then an add of a new one.
+died is a remove, then an add of a new one. `set-role --admin <addr> --id <n> --voter` makes a
+learner a voter once it has caught up, and `--learner` makes a voter a learner, without shipping
+it the log again.
 
 A node that finds a damaged record at the end of its log, after a crash, drops it: a write that
 power cut off partway, it's never been acknowledged. But bit rot in the last record looks the

@@ -759,6 +759,76 @@ fn with_learner() -> Vec<Raft> {
     (1..=3).map(|id| Raft::new(config(id), Meta::default(), None, Entries::default(), 0)).collect()
 }
 
+fn roles(raft: &Raft) -> Vec<(u8, bool)> {
+    raft.members().iter().map(|m| (m.id.0, m.learner)).collect()
+}
+
+/// A learner made a voter in place catches up first, then the members with it a voter are
+/// proposed, everywhere; a voter made a learner is proposed at once. The last voter stays one.
+#[test]
+fn a_member_changes_role_in_place() {
+    let mut rafts = with_learner();
+    let all = [1, 2, 3];
+    elect(&mut rafts, &[1, 2], 1, 1000 * MS);
+    assert!(!rafts[0].set_role(NodeId(3), false), "not before an entry of its term is committed");
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2], 1, sends, 1000 * MS);
+    assert!(!rafts[0].set_role(NodeId(2), false), "a voter already");
+    assert!(!rafts[0].set_role(NodeId(4), false), "not a member");
+
+    // Node 3 has none of the log: it isn't a voter until it has caught up.
+    assert!(rafts[0].set_role(NodeId(3), false));
+    assert!(!rafts[0].set_role(NodeId(2), true), "one change at a time");
+    assert_eq!(roles(&rafts[0]), [(1, false), (2, false), (3, true)]);
+    assert_eq!(rafts[0].peers().len(), 3, "no second peer for it");
+    heartbeat(&mut rafts, &all, 1);
+    heartbeat(&mut rafts, &all, 1);
+    assert!(!rafts[0].changing_members(), "committed");
+    for raft in &rafts {
+        assert_eq!(roles(raft), [(1, false), (2, false), (3, false)]);
+    }
+
+    assert!(rafts[0].set_role(NodeId(2), true));
+    assert_eq!(roles(&rafts[0]), [(1, false), (2, true), (3, false)], "at once");
+    let (sends, now) = (flush(&mut rafts[0]), rafts[0].now);
+    deliver(&mut rafts, &all, 1, sends, now);
+    heartbeat(&mut rafts, &all, 1);
+    assert!(!rafts[0].changing_members());
+    assert!(rafts[0].set_role(NodeId(3), true));
+    let (sends, now) = (flush(&mut rafts[0]), rafts[0].now);
+    deliver(&mut rafts, &all, 1, sends, now);
+    heartbeat(&mut rafts, &all, 1);
+    assert!(!rafts[0].set_role(NodeId(1), true), "the last voter");
+}
+
+/// A voter made a learner by a change it hasn't seen committed still stands: it may hold the
+/// most of the log, which the others, counting it a voter, may need to elect anyone.
+#[test]
+fn a_voter_demoted_by_an_uncommitted_change_still_stands() {
+    let members = [member(1), member(2), member(3)];
+    let demoted: Vec<wire::MembersMember<'_>> = members
+        .iter()
+        .map(|m| wire::MembersMember {
+            id: m.id.0,
+            learner: u8::from(m.id.0 == 1),
+            peer: m.peer.as_bytes(),
+            client: m.client.as_bytes(),
+            admin: m.admin.as_bytes(),
+        })
+        .collect();
+    let mut payload = Vec::new();
+    wire::Members { timestamp: 0, member: &demoted }.encode_into(&mut payload).unwrap();
+    let mut records = Vec::new();
+    Record { term: 1, index: 1, payload: &payload }.encode_into(&mut records);
+    let log = Entries::from_records(&records, usize::MAX);
+    let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 1, vote: None }, None, log, 0);
+    assert!(raft.is_learner(NodeId(1)));
+    raft.on_tick(raft.next_deadline());
+    assert_eq!(raft.role(), Role::PreCandidate, "it stands");
+    assert!(raft.votes.is_empty(), "its own vote not counted");
+}
+
 /// A learner takes the log, but its ack doesn't commit, it never stands, and the leadership
 /// isn't handed to it.
 #[test]

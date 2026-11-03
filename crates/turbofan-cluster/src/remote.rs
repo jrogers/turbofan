@@ -320,6 +320,21 @@ impl Admin {
         self.ask(request, changed).await
     }
 
+    /// Makes member `id` a learner, or a voter, in place, rather than removing it and adding it
+    /// again, which ships it the whole log. A learner made a voter catches up first: check
+    /// [`Admin::status`] that it's close. Returns the index of the change, once it's committed.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::MembersRefused`] if another change is under way, `id` isn't a member of the
+    /// other role, it's the last voter, or it didn't catch up; or [`AdminError::TokenTooLong`],
+    /// [`AdminError::Denied`] or [`AdminError::TimedOut`], which a leader too old to answer
+    /// gives too.
+    pub async fn set_role(&self, id: NodeId, learner: bool) -> Result<u64, AdminError> {
+        let request = |request_id| frame(&wire::SetRole { request_id, id: id.0, learner: u8::from(learner) });
+        self.ask(request, changed).await
+    }
+
     /// Switches the cluster to `protocol` and `service_version` of the service's behaviour, once
     /// a rolling upgrade has every member running code that has them. Returns the index they're
     /// active from.

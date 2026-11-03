@@ -22,7 +22,9 @@
 //! **Learners** ([`Member::learner`]) are members that take the log but don't vote: they're
 //! added and removed as members are, without catching up first, but never stand for election, and their acks don't count
 //! towards a commit, check-quorum or a snapshot's quorum, so a quorum never waits on one in
-//! another region. Nor is the leadership handed to one.
+//! another region. Nor is the leadership handed to one. One changes role in place
+//! ([`Raft::set_role`]): made a voter, it catches up first. A voter made a learner by a change
+//! it hasn't seen committed still stands, as a removed one does: it may have the most of the log.
 //!
 //! **Leadership transfer** ([`Raft::transfer_leadership`]): the leader sends no more of its log
 //! than it had when the transfer began, and once the target has that, sends it `TimeoutNow`.
@@ -682,9 +684,9 @@ impl Raft {
             }
             Role::Follower | Role::PreCandidate | Role::Candidate if now >= self.election_at => {
                 // One that knows members stands, even if it isn't among them yet: added, it may
-                // have the most of the log before it has the entry that adds it. A learner never
-                // does.
-                if self.members().is_empty() || self.is_learner(self.config.id) {
+                // have the most of the log before it has the entry that adds it. A learner
+                // doesn't ([`Raft::may_stand`]).
+                if !self.may_stand() {
                     // Joining, or with its leader gone, it doesn't know who leads: clients it would
                     // send to a stale leader try elsewhere.
                     self.leader = None;
