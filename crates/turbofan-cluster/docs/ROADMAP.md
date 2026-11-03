@@ -55,12 +55,6 @@ A service upgrades by `Service::version` and `activate`, and the cluster's proto
 
 ## 3. Toward 1.0
 
-- **The leader's own write under load.** The benchmark's stage timings show the leader's copy
-  of an entry durable well after the followers' have committed it: in the fsync throughput run,
-  a p50 of 185 ms to persisted against 14 ms to committed, on a laptop. Commits don't wait on it
-  (two followers are a quorum of three), but a leader that's far behind its own log is one a
-  single follower's failure stalls. Find where its writes queue: the driver takes a finished
-  write and inputs in random order, and the leader has the most inputs.
 - **A stable API.** Freeze `Service`, `Ctx`, `ClusterClient` and `driver::Config`, and publish to
   crates.io.
 

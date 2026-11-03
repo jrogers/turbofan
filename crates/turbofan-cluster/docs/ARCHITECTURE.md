@@ -120,7 +120,8 @@ flowchart TB
 - **The disk never blocks the node.** Batches are written and synced on a blocking thread, one
   write at a time. Meanwhile the node goes on with its inputs (acks commit, clients are answered),
   and the batches it gives are queued, to be written next, together, with one sync: that's the
-  group commit. Only a restore from a snapshot waits for the disk.
+  group commit. Their appends go in one write too: a leader gives a small batch nearly every
+  turn, and hundreds of writes, a syscall each, once kept its own copy far behind its followers'. Only a restore from a snapshot waits for the disk.
 - **Snapshots are taken off the apply path.** `Service::snapshot` returns a frozen copy, which a
   thread writes out while the node goes on applying. The log is compacted once it's durable,
   but for a tail before it (`log_tail_entries`, 100,000 by default): a follower that's behind

@@ -399,13 +399,26 @@ impl Storage {
 
     /// Writes `batches` in order, each one's reads after its operations, then syncs. Returns the
     /// records and snapshot chunks read, a read that an earlier batch asked for once.
+    ///
+    /// Appends running on from one batch to the next are written together: a leader gives a
+    /// small batch nearly every turn, and a write of hundreds, each its own syscall, took far
+    /// longer than its sync.
     #[allow(clippy::type_complexity, reason = "the two kinds of read")]
     fn write(&mut self, batches: &[pipeline::Batch]) -> io::Result<(Vec<Vec<u8>>, Vec<(u64, u64, Vec<u8>)>)> {
         let (mut reads, mut chunks) = (Vec::new(), Vec::new());
         let (mut froms, mut offsets) = (HashSet::new(), HashSet::new());
+        let mut appends = Vec::new();
         for batch in batches {
             for op in &batch.persist {
-                self.apply(op)?;
+                if let Persist::Append(records) = op {
+                    appends.extend_from_slice(records);
+                } else {
+                    self.append(&mut appends)?;
+                    self.apply(op)?;
+                }
+            }
+            if !batch.reads.is_empty() || !batch.snapshot_reads.is_empty() {
+                self.append(&mut appends)?;
             }
             for &from in &batch.reads {
                 if froms.insert(from) {
@@ -418,8 +431,18 @@ impl Storage {
                 }
             }
         }
+        self.append(&mut appends)?;
         self.log.sync()?;
         Ok((reads, chunks))
+    }
+
+    /// Writes the `records` gathered so far, if any, and empties them.
+    fn append(&mut self, records: &mut Vec<u8>) -> io::Result<()> {
+        if !records.is_empty() {
+            self.log.append(records)?;
+            records.clear();
+        }
+        Ok(())
     }
 
     fn apply(&mut self, op: &Persist) -> io::Result<()> {
@@ -774,6 +797,24 @@ async fn dial_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Appends from several batches are written together, and a batch's read still sees every
+    /// append before it, its own included.
+    #[test]
+    fn a_writes_appends_are_joined_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut storage, ..) = Storage::open(dir.path(), Fsync::Never, usize::MAX).unwrap();
+        let append = |index| {
+            let mut records = Vec::new();
+            crate::codec::Record { term: 1, index, payload: b"x" }.encode_into(&mut records);
+            pipeline::Batch { persist: vec![Persist::Append(records)], reads: Vec::new(), snapshot_reads: Vec::new() }
+        };
+        let read = pipeline::Batch { reads: vec![1], ..append(3) };
+        let (reads, _) = storage.write(&[append(1), append(2), read, append(4)]).unwrap();
+        let indices: Vec<u64> = crate::codec::records(&reads[0]).map(|r| r.unwrap().index).collect();
+        assert_eq!(indices, [1, 2, 3], "the read follows its own batch's append, not the next");
+        assert_eq!(storage.log.next_index(), 5);
+    }
 
     /// An unreachable peer is dialled less and less often, but at least once a [`MAX_REDIAL`].
     #[test]
