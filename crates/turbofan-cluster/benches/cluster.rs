@@ -8,6 +8,12 @@
 //! (10 by default) after a second's warm-up.
 //!
 //! With `--features tls`, all the runs again on a cluster over TLS, everywhere: peers, clients.
+//!
+//! `BENCH_RESULTS=<file>` writes each run's msgs/s there, and `BENCH_BASELINE=<file>`, such a file
+//! from an earlier run, adds a column comparing them, flagging a run below
+//! [`REGRESSION_PERCENT`] of it, and a GitHub `::warning` line after the table for each. CI keeps
+//! main's last results to compare every run with. On a latency run msgs/s is one over the mean
+//! latency, so it catches either getting worse.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -24,6 +30,9 @@ use turbofan_cluster::{ClusterClient, Ctx, Service, SessionId, SnapshotWriter, n
 const SERVICE_ID: u32 = 9;
 const PAYLOAD_BYTES: usize = 64;
 const MS: u64 = 1_000_000;
+/// A run below this share of the baseline's msgs/s is flagged: shared CI runners are noisy, so
+/// only a wide margin means anything.
+const REGRESSION_PERCENT: u64 = 70;
 
 /// Answers each message with its first 8 bytes, keeping nothing.
 struct Ack;
@@ -51,8 +60,14 @@ async fn main() {
         std::env::consts::OS
     );
     println!();
-    println!("| run | clients × in flight | msgs/s | p50 | p99 | p99.9 | max |");
-    println!("|---|---|---:|---:|---:|---:|---:|");
+    let baseline = std::env::var("BENCH_BASELINE").ok().and_then(|path| std::fs::read_to_string(path).ok());
+    let baseline: Option<Vec<(&str, u64)>> = baseline.as_deref().map(|text| {
+        text.lines().filter_map(|line| line.split_once('\t')).filter_map(|(r, n)| Some((r, n.parse().ok()?))).collect()
+    });
+    let vs = if baseline.is_some() { (" vs main |", "---:|") } else { ("", "") };
+    println!("| run | clients × in flight | msgs/s | p50 | p99 | p99.9 | max |{}", vs.0);
+    println!("|---|---|---:|---:|---:|---:|---:|{}", vs.1);
+    let (mut results, mut warnings) = (String::new(), Vec::new());
     let dir = tempfile::tempdir().unwrap();
     for tls in [false, true] {
         if tls && !cfg!(feature = "tls") {
@@ -63,13 +78,44 @@ async fn main() {
             let (addrs, tls) = start(&dir, tls, fsync);
             // Once a client has a session, there's a leader.
             drop(connect(&addrs, tls.as_ref()).await);
-            bench(&addrs, tls.as_ref(), fsync, secs).await;
+            for (name, msgs, row) in bench(&addrs, tls.as_ref(), fsync, secs).await {
+                results.push_str(&format!("{name}\t{msgs}\n"));
+                let Some(baseline) = &baseline else {
+                    println!("{row}");
+                    continue;
+                };
+                let Some(&(_, then)) = baseline.iter().find(|&&(r, _)| r == name) else {
+                    println!("{row} new |");
+                    continue;
+                };
+                let percent = msgs * 100 / then.max(1);
+                let flagged = percent < REGRESSION_PERCENT;
+                println!("{row} {percent}%{} |", if flagged { " ⚠️" } else { "" });
+                if flagged {
+                    warnings.push(format!(
+                        "::warning title=Benchmark regression::{name}: {msgs} msgs/s, {percent}% of main's {then}"
+                    ));
+                }
+            }
         }
+    }
+    if let Ok(path) = std::env::var("BENCH_RESULTS") {
+        std::fs::write(path, results).unwrap();
+    }
+    if !warnings.is_empty() {
+        println!();
+        println!("{}", warnings.join("\n"));
     }
 }
 
-/// Both runs on the cluster at `addrs`, a row each.
-async fn bench(addrs: &[String], tls: Option<&ClientTls>, fsync: driver::Fsync, secs: u64) {
+/// Both runs on the cluster at `addrs`: each one's name, msgs/s, and table row.
+async fn bench(
+    addrs: &[String],
+    tls: Option<&ClientTls>,
+    fsync: driver::Fsync,
+    secs: u64,
+) -> Vec<(String, u64, String)> {
+    let mut rows = Vec::new();
     let over = if tls.is_some() { ", TLS" } else { "" };
     let over = if fsync == driver::Fsync::EachBatch { format!("{over}, fsync") } else { over.to_owned() };
     for (name, clients, window) in [("latency", 1, 1), ("throughput", 8, 256)] {
@@ -78,15 +124,17 @@ async fn bench(addrs: &[String], tls: Option<&ClientTls>, fsync: driver::Fsync, 
         // Per mille; none answered in time (a leader change, a slow runner) shows as -.
         let at =
             |q: usize| latencies.get(latencies.len().saturating_sub(1) * q / 1000).map_or("-".into(), |&ns| micros(ns));
-        println!(
-            "| {name}{over} | {clients} × {window} | {} | {} | {} | {} | {} |",
-            latencies.len() as u64 / secs,
+        let msgs = latencies.len() as u64 / secs;
+        let row = format!(
+            "| {name}{over} | {clients} × {window} | {msgs} | {} | {} | {} | {} |",
             at(500),
             at(990),
             at(999),
             at(1000),
         );
+        rows.push((format!("{name}{over}"), msgs, row));
     }
+    rows
 }
 
 /// Starts three nodes on free local ports, in `dir`, over TLS if `tls`, syncing as `fsync`, returning where they take

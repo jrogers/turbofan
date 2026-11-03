@@ -55,11 +55,11 @@ A service upgrades by `Service::version` and `activate`, and the cluster's proto
 
 ## 3. Toward 1.0
 
-- **Benchmark regressions.** CI runs `benches/cluster.rs` (throughput, and latency to p99.9, of
-  three nodes over real TCP and disks) into each run's summary, but nothing compares it with
-  main's last run. Keep main's results and flag a run well below them; shared runners are noisy,
-  so only by a wide margin. And time each entry's stages, not only proposed to committed
-  (`commit_latencies`): persisted, committed, applied, answered, so a regression says where.
+- **Where a regression is.** CI runs `benches/cluster.rs` (throughput, and latency to p99.9, of
+  three nodes over real TCP and disks, with and without fsync) into each run's summary, compared
+  with main's last run, kept in the Actions cache: a run below 70% of it is flagged with a
+  warning. Left: time each entry's stages, not only proposed to committed (`commit_latencies`):
+  persisted, committed, applied, answered, so a regression says where.
 - **A stable API.** Freeze `Service`, `Ctx`, `ClusterClient` and `driver::Config`, and publish to
   crates.io.
 
