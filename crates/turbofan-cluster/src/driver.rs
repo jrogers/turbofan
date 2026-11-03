@@ -212,9 +212,18 @@ impl<S: Service + 'static> Core<S> {
             if self.dbg_loop.1.elapsed() >= Duration::from_secs(1) {
                 let mut gaps: Vec<_> = self.dbg_peers.iter().map(|(p, (_, g))| (p.0, *g)).collect();
                 gaps.sort();
-                eprintln!("DBG node {} {:?} term {}: max loop {:?}, {} terms changed, longest silence by peer {:?}",
-                    self.node.raft().id(), self.node.raft().role(), self.node.raft().term(), self.dbg_loop.0, self.dbg_loop.2, gaps);
-                for v in self.dbg_peers.values_mut() { v.1 = Duration::ZERO; }
+                eprintln!(
+                    "DBG node {} {:?} term {}: max loop {:?}, {} terms changed, longest silence by peer {:?}",
+                    self.node.raft().id(),
+                    self.node.raft().role(),
+                    self.node.raft().term(),
+                    self.dbg_loop.0,
+                    self.dbg_loop.2,
+                    gaps
+                );
+                for v in self.dbg_peers.values_mut() {
+                    v.1 = Duration::ZERO;
+                }
                 self.dbg_loop = (Duration::ZERO, Instant::now(), 0);
             }
             let dbg_term = self.node.raft().term();
