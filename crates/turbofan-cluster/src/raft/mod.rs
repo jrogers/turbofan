@@ -315,9 +315,29 @@ pub struct Outputs {
     /// A member being added didn't catch up, or this node stopped leading first: the change
     /// was dropped.
     pub change_failed: bool,
-    /// As leader, how long each entry committed in this batch took from proposed, in
-    /// nanoseconds.
-    pub commit_latencies: Vec<u64>,
+    /// As leader, how long each of its entries took from proposed to each [`Stage`] it reached
+    /// in this batch, in nanoseconds.
+    pub latencies: Vec<(Stage, u64)>,
+}
+
+/// A stage a leader's own entry reaches, timed from when it was proposed: see
+/// [`Outputs::latencies`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stage {
+    /// The leader's own copy is durable.
+    Persisted,
+    /// A quorum has it durable.
+    Committed,
+    /// The node has applied it ([`Raft::on_applied`]), and so answered it.
+    Applied,
+}
+
+/// Times the entries proposed at, up to `index`, as having reached `stage` by `now`.
+fn reached(waiting: &mut VecDeque<(u64, u64)>, index: u64, stage: Stage, now: u64, out: &mut Outputs) {
+    while let Some(&(_, at)) = waiting.front().filter(|&&(i, _)| i <= index) {
+        waiting.pop_front();
+        out.latencies.push((stage, now.saturating_sub(at)));
+    }
 }
 
 #[derive(Debug)]
@@ -402,6 +422,10 @@ pub struct Raft {
     /// As leader, each of its entries not yet committed: its index, when it was proposed, and
     /// its payload's length; and those lengths summed.
     proposed_at: VecDeque<(u64, u64, usize)>,
+    /// As leader, its entries not yet durable here, and not yet applied: each index, and when it
+    /// was proposed.
+    unpersisted: VecDeque<(u64, u64)>,
+    unapplied: VecDeque<(u64, u64)>,
     uncommitted_bytes: usize,
     /// Records read back from disk, by the index of the first in each run, until the next
     /// [`Raft::take_outputs`].
@@ -484,6 +508,8 @@ impl Raft {
             stop: None,
             now,
             proposed_at: VecDeque::new(),
+            unpersisted: VecDeque::new(),
+            unapplied: VecDeque::new(),
             uncommitted_bytes: 0,
             fetched: Vec::new(),
             durable: 0,
@@ -645,11 +671,19 @@ impl Raft {
         let index = self.last_index() + 1;
         self.append(Record { term: self.meta.term, index, payload });
         self.proposed_at.push_back((index, self.now, payload.len()));
+        self.unpersisted.push_back((index, self.now));
+        self.unapplied.push_back((index, self.now));
         self.uncommitted_bytes += payload.len();
         if !self.peers.iter().any(|p| self.is_voter(p.id)) {
             self.advance_commit();
         }
         Some(index)
+    }
+
+    /// The time is `now`, for timing what's proposed next, without acting on it as
+    /// [`Raft::on_tick`] does.
+    pub fn set_time(&mut self, now: u64) {
+        self.now = now;
     }
 
     /// Time passed.
@@ -723,13 +757,17 @@ impl Raft {
         }
     }
 
-    /// The batches up to one taken when the log ended at `end` ([`Raft::log_end`]) are durable.
+    /// The batches up to one taken when the log ended at `end` ([`Raft::log_end`]) are durable,
+    /// at `now`.
     /// If the entry there has been replaced since (truncated, or the log replaced by a snapshot),
     /// what's durable of the log now is unknown, and a later batch's will say.
-    pub fn on_persisted(&mut self, end: LogEnd) {
+    pub fn on_persisted(&mut self, end: LogEnd, now: u64) {
+        // Never before the input it follows.
+        self.now = self.now.max(now);
         // Log matching: the same entry there, the same log up to it.
         if self.term_at(end.index) == Some(end.term) {
             self.durable = end.index;
+            reached(&mut self.unpersisted, self.durable, Stage::Persisted, now, &mut self.out);
         }
         if self.role == Role::Leader {
             self.advance_commit();

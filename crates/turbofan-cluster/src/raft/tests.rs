@@ -29,7 +29,7 @@ fn a_lone_member_elects_itself_and_commits() {
     assert_eq!(out.persist, [Persist::Meta(Meta { term: 1, vote: Some(NodeId(1)) })]);
     assert_eq!(raft.propose(b"a"), Some(1));
     assert_eq!(raft.commit_index(), 0, "not durable yet");
-    raft.on_persisted(raft.log_end());
+    raft.on_persisted(raft.log_end(), raft.now);
     assert_eq!((raft.commit_index(), raft.entry(1)), (1, Some(&b"a"[..])));
 }
 
@@ -68,7 +68,7 @@ fn decode(frame: &[u8]) -> wire::Decoded<'_> {
 /// Makes the batch durable and returns its appends and sends, as a driver would.
 fn flush(raft: &mut Raft) -> Vec<(NodeId, Vec<u8>)> {
     let mut out = raft.take_outputs();
-    raft.on_persisted(raft.log_end());
+    raft.on_persisted(raft.log_end(), raft.now);
     out.appends.append(&mut out.sends);
     out.appends
 }
@@ -128,7 +128,8 @@ fn a_leader_counts_itself_towards_a_commit_only_once_durable() {
     }
     assert_eq!(rafts[0].commit_index(), committed, "node 2 alone is one of three");
     assert_eq!(end.index, index);
-    rafts[0].on_persisted(end);
+    let now = rafts[0].now;
+    rafts[0].on_persisted(end, now);
     assert_eq!(rafts[0].commit_index(), index, "with node 1 durable, two of three");
 }
 
@@ -402,9 +403,9 @@ fn an_earlier_batch_durable_does_not_count_entries_that_replaced_its_own() {
     };
     let writing = append(1, 1, &[(2, 1), (3, 1)]);
     let replaced = append(2, 2, &[(2, 2)]);
-    raft.on_persisted(writing);
+    raft.on_persisted(writing, raft.now);
     assert_eq!(raft.durable, 1, "2 and 3 of term 1 were written, not 2 of term 2");
-    raft.on_persisted(replaced);
+    raft.on_persisted(replaced, raft.now);
     assert_eq!(raft.durable, 2);
 }
 
@@ -487,7 +488,8 @@ fn a_follower_behind_the_window_is_sent_records_read_back() {
     let [Persist::Append(disk)] = &out.persist[..] else { panic!("{:?}", out.persist) };
     let disk = disk.clone();
     let end = rafts[0].log_end();
-    rafts[0].on_persisted(end);
+    let now = rafts[0].now;
+    rafts[0].on_persisted(end, now);
     deliver(&mut rafts, &[1, 2], 1, out.appends, now);
     rafts[0].on_applied(3);
     assert_eq!((rafts[0].commit_index(), rafts[0].entry(1)), (3, None), "committed, and out of memory");
@@ -889,7 +891,7 @@ fn the_last_voter_is_not_removed() {
     raft.on_tick(raft.next_deadline());
     assert_eq!(raft.role(), Role::Leader, "a learner isn't needed for a quorum");
     raft.propose(b"x");
-    raft.on_persisted(raft.log_end());
+    raft.on_persisted(raft.log_end(), raft.now);
     assert!(!raft.remove_member(NodeId(1)));
     assert!(raft.remove_member(NodeId(2)));
 }

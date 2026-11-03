@@ -1,7 +1,7 @@
 //! What a node reports through the [`metrics`] facade, to whichever recorder the binary installs
 //! (a Prometheus exporter, say): none, and they go nowhere. The core only counts, into
-//! [`Metrics`] from `Node::metrics` and the commit latencies in
-//! `Outputs::commit_latencies`; the driver publishes them.
+//! [`Metrics`] from `Node::metrics` and the latencies in `Outputs::latencies`; the driver
+//! publishes them.
 //!
 //! | Name | Kind | |
 //! |---|---|---|
@@ -17,11 +17,13 @@
 //! | `turbofan_sessions` | gauge | client sessions open |
 //! | `turbofan_in_doubt` | gauge | 1 while the node doubts its log, which dropped a damaged tail |
 //! | `turbofan_follower_lag_entries` | gauge, by `peer` | as leader, how far behind its log each member is |
-//! | `turbofan_commit_latency_seconds` | histogram | as leader, from an entry proposed to committed |
+//! | `turbofan_persist_latency_seconds` | histogram | as leader, from its entry proposed to durable on its own disk |
+//! | `turbofan_commit_latency_seconds` | histogram | as leader, from its entry proposed to committed |
+//! | `turbofan_apply_latency_seconds` | histogram | as leader, from its entry proposed to applied, and answered |
 
 use metrics::{gauge, histogram};
 
-use crate::raft::{NodeId, Role};
+use crate::raft::{NodeId, Role, Stage};
 
 /// A node's state, at a moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,9 +87,14 @@ impl Metrics {
     }
 }
 
-/// Records an entry's time from proposed to committed, in nanoseconds.
-pub fn record_commit_latency(ns: u64) {
-    histogram!("turbofan_commit_latency_seconds").record(seconds(ns));
+/// Records an entry's time from proposed to `stage`, in nanoseconds.
+pub fn record_latency(stage: Stage, ns: u64) {
+    let name = match stage {
+        Stage::Persisted => "turbofan_persist_latency_seconds",
+        Stage::Committed => "turbofan_commit_latency_seconds",
+        Stage::Applied => "turbofan_apply_latency_seconds",
+    };
+    histogram!(name).record(seconds(ns));
 }
 
 #[allow(clippy::cast_precision_loss, clippy::as_conversions, reason = "nanoseconds to seconds, for a metric")]

@@ -52,8 +52,8 @@ pub struct Taken {
     pub save: Option<SaveSnapshot>,
     /// See [`crate::node::Outputs::peers`].
     pub peers: Option<Vec<Member>>,
-    /// See [`crate::node::Outputs::commit_latencies`].
-    pub commit_latencies: Vec<u64>,
+    /// See [`crate::node::Outputs::latencies`].
+    pub latencies: Vec<(crate::raft::Stage, u64)>,
     /// Write these, each batch's reads after its operations, then sync; then, with what was read,
     /// [`Pipeline::written`].
     pub write: Option<Vec<Batch>>,
@@ -95,7 +95,7 @@ impl Pipeline {
             peer_sends,
             save: out.save,
             peers: out.peers,
-            commit_latencies: out.commit_latencies,
+            latencies: out.latencies,
             write,
         }
     }
@@ -117,6 +117,7 @@ impl Pipeline {
         reads: &[Vec<u8>],
         chunks: &[(u64, u64, Vec<u8>)],
         from: Option<&mut dyn Read>,
+        now: u64,
     ) -> io::Result<Vec<(NodeId, Vec<u8>)>> {
         let waiting = self.writing.take().expect("a write is under way");
         for records in reads {
@@ -129,7 +130,7 @@ impl Pipeline {
             node.restore(from.expect("the snapshot to restore from"))?;
             self.restore_waits = false;
         }
-        node.on_persisted(waiting.last().expect("a write has batches").log_end);
+        node.on_persisted(waiting.last().expect("a write has batches").log_end, now);
         Ok(waiting.into_iter().flat_map(|w| w.peer_sends).collect())
     }
 

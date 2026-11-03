@@ -115,7 +115,7 @@ fn drive(node: &mut Node<Recorder>) -> Vec<String> {
         if out.persist.is_empty() {
             break;
         }
-        node.on_persisted(node.raft().log_end());
+        node.on_persisted(node.raft().log_end(), node.now);
     }
     sends.iter().map(|(conn, f)| format!("{conn}: {:?}", codec::decode_frame(f).unwrap().unwrap().0)).collect()
 }
@@ -427,8 +427,11 @@ fn a_leader_times_its_commits_and_reports_its_state() {
     node.take_outputs();
     let now = node.next_deadline();
     node.on_tick(now);
-    node.on_persisted(node.raft().log_end());
-    assert_eq!(node.take_outputs().commit_latencies.len(), 1, "the one message");
+    node.on_persisted(node.raft().log_end(), now + MS);
+    let mut latencies = node.take_outputs().latencies;
+    latencies.sort_unstable();
+    let stages = [raft::Stage::Persisted, raft::Stage::Committed, raft::Stage::Applied];
+    assert_eq!(latencies, stages.map(|s| (s, now + MS)), "the one message, proposed at 0, each stage once");
     let metrics = node.metrics(now + 5 * MS);
     assert_eq!((metrics.role, metrics.sessions, metrics.members), (Role::Leader, 1, 1));
     assert_eq!((metrics.commit, metrics.applied), (node.raft().last_index(), node.raft().last_index()));

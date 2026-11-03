@@ -271,8 +271,8 @@ impl<S: Service + 'static> Core<S> {
     fn flush(&mut self) {
         let taken = self.pipeline.take(&mut self.node);
         self.hello.epoch.store(self.node.epoch(), Ordering::Relaxed);
-        for &ns in &taken.commit_latencies {
-            metrics::record_commit_latency(ns);
+        for &(stage, ns) in &taken.latencies {
+            metrics::record_latency(stage, ns);
         }
         self.send_peers(taken.peer_appends);
         self.send_clients(taken.client_sends);
@@ -311,7 +311,8 @@ impl<S: Service + 'static> Core<S> {
             snapshot = Some(bytes);
         }
         let from = snapshot.as_mut().map(|b| -> &mut dyn io::Read { b });
-        let sends = self.pipeline.written(&mut self.node, &reads, &chunks, from)?;
+        let now = self.clock.now();
+        let sends = self.pipeline.written(&mut self.node, &reads, &chunks, from, now)?;
         self.send_peers(sends);
         Ok(())
     }

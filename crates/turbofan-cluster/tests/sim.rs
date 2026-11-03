@@ -1045,7 +1045,7 @@ impl Sim {
         }
         let from = snapshot.as_mut().map(|b| b as &mut dyn Read);
         let node = sim_node.node.as_mut().unwrap();
-        let sends = sim_node.pipeline.written(node, &reads, &chunks, from).unwrap();
+        let sends = sim_node.pipeline.written(node, &reads, &chunks, from, self.now).unwrap();
         for (to, frame) in sends {
             self.send_peer(id, to, frame);
         }

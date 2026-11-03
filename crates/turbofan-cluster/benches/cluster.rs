@@ -14,11 +14,16 @@
 //! [`REGRESSION_PERCENT`] of it, and a GitHub `::warning` line after the table for each. CI keeps
 //! main's last results to compare every run with. On a latency run msgs/s is one over the mean
 //! latency, so it catches either getting worse.
+//!
+//! A second table says where the time goes: from an entry proposed on the leader to its own copy
+//! durable, to committed, and to applied (and so answered), from the node's metrics, beside the
+//! client's round trip.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use turbofan_cluster::client::Event;
@@ -33,6 +38,59 @@ const MS: u64 = 1_000_000;
 /// A run below this share of the baseline's msgs/s is flagged: shared CI runners are noisy, so
 /// only a wide margin means anything.
 const REGRESSION_PERCENT: u64 = 70;
+
+/// The stages' histograms, as `metrics::record_latency` names them: persisted, committed, applied.
+const STAGES: [&str; 3] =
+    ["turbofan_persist_latency_seconds", "turbofan_commit_latency_seconds", "turbofan_apply_latency_seconds"];
+
+/// What a histogram recorded, in seconds.
+#[derive(Debug, Default)]
+struct Samples(Mutex<Vec<f64>>);
+
+impl metrics::HistogramFn for Samples {
+    fn record(&self, seconds: f64) {
+        self.0.lock().unwrap().push(seconds);
+    }
+}
+
+/// The leader's stage latencies, a [`Samples`] each; every other metric goes nowhere.
+#[derive(Debug, Default, Clone)]
+struct Stages([Arc<Samples>; 3]);
+
+impl Stages {
+    /// What each stage recorded since the last take, in nanoseconds, sorted.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "latencies, whole nanoseconds from seconds, are small and never negative"
+    )]
+    fn take(&self) -> [Vec<u64>; 3] {
+        self.0.each_ref().map(|samples| {
+            let mut ns: Vec<u64> =
+                std::mem::take(&mut *samples.0.lock().unwrap()).into_iter().map(|s| (s * 1e9) as u64).collect();
+            ns.sort_unstable();
+            ns
+        })
+    }
+}
+
+impl metrics::Recorder for Stages {
+    fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::noop()
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+        match STAGES.iter().position(|&name| name == key.name()) {
+            Some(i) => metrics::Histogram::from_arc(self.0[i].clone()),
+            None => metrics::Histogram::noop(),
+        }
+    }
+}
 
 /// Answers each message with its first 8 bytes, keeping nothing.
 struct Ack;
@@ -67,7 +125,9 @@ async fn main() {
     let vs = if baseline.is_some() { (" vs main |", "---:|") } else { ("", "") };
     println!("| run | clients × in flight | msgs/s | p50 | p99 | p99.9 | max |{}", vs.0);
     println!("|---|---|---:|---:|---:|---:|---:|{}", vs.1);
-    let (mut results, mut warnings) = (String::new(), Vec::new());
+    let (mut results, mut warnings, mut stage_rows) = (String::new(), Vec::new(), Vec::new());
+    let stages = Stages::default();
+    metrics::set_global_recorder(stages.clone()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     for tls in [false, true] {
         if tls && !cfg!(feature = "tls") {
@@ -78,7 +138,8 @@ async fn main() {
             let (addrs, tls) = start(&dir, tls, fsync);
             // Once a client has a session, there's a leader.
             drop(connect(&addrs, tls.as_ref()).await);
-            for (name, msgs, row) in bench(&addrs, tls.as_ref(), fsync, secs).await {
+            for (name, msgs, row, stage_row) in bench(&addrs, tls.as_ref(), fsync, secs, &stages).await {
+                stage_rows.push(stage_row);
                 results.push_str(&format!("{name}\t{msgs}\n"));
                 let Some(baseline) = &baseline else {
                     println!("{row}");
@@ -99,6 +160,14 @@ async fn main() {
             }
         }
     }
+    println!();
+    println!("Where the time goes, from proposed on the leader: p50 / p99.");
+    println!();
+    println!("| run | persisted | committed | applied | client's round trip |");
+    println!("|---|---:|---:|---:|---:|");
+    for row in stage_rows {
+        println!("{row}");
+    }
     if let Ok(path) = std::env::var("BENCH_RESULTS") {
         std::fs::write(path, results).unwrap();
     }
@@ -108,22 +177,21 @@ async fn main() {
     }
 }
 
-/// Both runs on the cluster at `addrs`: each one's name, msgs/s, and table row.
+/// Both runs on the cluster at `addrs`: each one's name, msgs/s, table row, and row of stages.
 async fn bench(
     addrs: &[String],
     tls: Option<&ClientTls>,
     fsync: driver::Fsync,
     secs: u64,
-) -> Vec<(String, u64, String)> {
+    stages: &Stages,
+) -> Vec<(String, u64, String, String)> {
     let mut rows = Vec::new();
     let over = if tls.is_some() { ", TLS" } else { "" };
     let over = if fsync == driver::Fsync::EachBatch { format!("{over}, fsync") } else { over.to_owned() };
     for (name, clients, window) in [("latency", 1, 1), ("throughput", 8, 256)] {
-        let mut latencies = run(addrs, tls, clients, window, secs).await;
+        let (mut latencies, by_stage) = run(addrs, tls, clients, window, secs, stages).await;
         latencies.sort_unstable();
-        // Per mille; none answered in time (a leader change, a slow runner) shows as -.
-        let at =
-            |q: usize| latencies.get(latencies.len().saturating_sub(1) * q / 1000).map_or("-".into(), |&ns| micros(ns));
+        let at = |q: usize| per_mille(&latencies, q);
         let msgs = latencies.len() as u64 / secs;
         let row = format!(
             "| {name}{over} | {clients} × {window} | {msgs} | {} | {} | {} | {} |",
@@ -132,7 +200,10 @@ async fn bench(
             at(999),
             at(1000),
         );
-        rows.push((format!("{name}{over}"), msgs, row));
+        let both = |sorted: &[u64]| format!("{} / {}", per_mille(sorted, 500), per_mille(sorted, 990));
+        let [persisted, committed, applied] = by_stage.each_ref().map(|s| both(s));
+        let stage_row = format!("| {name}{over} | {persisted} | {committed} | {applied} | {} |", both(&latencies));
+        rows.push((format!("{name}{over}"), msgs, row, stage_row));
     }
     rows
 }
@@ -234,9 +305,16 @@ async fn connect(addrs: &[String], tls: Option<&ClientTls>) -> ClusterClient {
 }
 
 /// `clients` sessions, each keeping `window` messages in flight, for a warm-up second then
-/// `secs`: the latency of each message sent after the warm-up and answered before the end, in
-/// nanoseconds.
-async fn run(addrs: &[String], tls: Option<&ClientTls>, clients: usize, window: usize, secs: u64) -> Vec<u64> {
+/// `secs`: the latency of each message sent after the warm-up and answered before the end, and
+/// what the leader timed of each stage meanwhile, in nanoseconds.
+async fn run(
+    addrs: &[String],
+    tls: Option<&ClientTls>,
+    clients: usize,
+    window: usize,
+    secs: u64,
+    stages: &Stages,
+) -> (Vec<u64>, [Vec<u64>; 3]) {
     let mut sessions = Vec::new();
     for _ in 0..clients {
         sessions.push(connect(addrs, tls).await);
@@ -244,11 +322,18 @@ async fn run(addrs: &[String], tls: Option<&ClientTls>, clients: usize, window: 
     let warm = Instant::now() + Duration::from_secs(1);
     let end = warm + Duration::from_secs(secs);
     let tasks: Vec<_> = sessions.into_iter().map(|c| tokio::spawn(keep_sending(c, window, warm, end))).collect();
+    tokio::time::sleep_until(warm.into()).await;
+    stages.take();
     let mut latencies = Vec::new();
     for task in tasks {
         latencies.extend(task.await.unwrap());
     }
-    latencies
+    (latencies, stages.take())
+}
+
+/// The `q`th per mille of `sorted`; none (a leader change, a slow runner) shows as -.
+fn per_mille(sorted: &[u64], q: usize) -> String {
+    sorted.get(sorted.len().saturating_sub(1) * q / 1000).map_or("-".into(), |&ns| micros(ns))
 }
 
 /// Keeps `window` messages in flight until `end`, sending the next as each is answered.

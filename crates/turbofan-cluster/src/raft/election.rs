@@ -126,6 +126,8 @@ impl Raft {
             self.drop_change();
             self.transfer = None;
             self.proposed_at.clear();
+            self.unpersisted.clear();
+            self.unapplied.clear();
             self.uncommitted_bytes = 0;
         }
         self.role = Role::Follower;

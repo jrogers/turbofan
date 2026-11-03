@@ -109,7 +109,7 @@ fn drive(node: &mut Node<Checker>) {
         if out.persist.is_empty() {
             return;
         }
-        node.on_persisted(node.raft().log_end());
+        node.on_persisted(node.raft().log_end(), 0);
     }
 }
 

@@ -44,6 +44,7 @@ impl Raft {
     /// Entries up to `index` are applied: their records, past the window, can leave memory once
     /// they're durable, so a read can find them.
     pub fn on_applied(&mut self, index: u64) {
+        reached(&mut self.unapplied, index, Stage::Applied, self.now, &mut self.out);
         self.log.evict(index.min(self.commit).min(self.durable), self.config.log_window_bytes);
     }
 
@@ -234,7 +235,7 @@ impl Raft {
                 self.proposed_at.pop_front();
                 self.uncommitted_bytes -= len;
                 debug_assert!(index <= self.commit);
-                self.out.commit_latencies.push(self.now.saturating_sub(at));
+                self.out.latencies.push((Stage::Committed, self.now.saturating_sub(at)));
             }
         }
         // A leader that removed itself leads until that's committed, then stands down.

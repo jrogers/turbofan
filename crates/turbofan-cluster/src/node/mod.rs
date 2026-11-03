@@ -154,9 +154,9 @@ pub struct Outputs {
     pub restore: Option<u64>,
     /// The peers to connect to changed, to these: the members, and a member being added.
     pub peers: Option<Vec<Member>>,
-    /// As leader, how long each entry committed took from proposed, in nanoseconds: see
-    /// [`crate::metrics`].
-    pub commit_latencies: Vec<u64>,
+    /// As leader, how long each of its entries took from proposed to each stage it reached, in
+    /// nanoseconds: see [`crate::metrics`].
+    pub latencies: Vec<(raft::Stage, u64)>,
 }
 
 /// This node's, as leader.
@@ -366,8 +366,9 @@ impl<S: Service> Node<S> {
 
     /// The batches up to one taken when the log ended at `end` are durable: see
     /// [`Raft::on_persisted`].
-    pub fn on_persisted(&mut self, end: LogEnd) {
-        self.raft.on_persisted(end);
+    pub fn on_persisted(&mut self, end: LogEnd, now: u64) {
+        self.now = self.now.max(now);
+        self.raft.on_persisted(end, now);
         self.apply();
         self.answer_snapshot_requests();
     }
@@ -431,7 +432,7 @@ impl<S: Service> Node<S> {
             out.appends.extend(more.appends);
             out.sends.extend(more.sends);
             out.peers = more.peers.or(out.peers);
-            out.commit_latencies.extend(more.commit_latencies);
+            out.latencies.extend(more.latencies);
         }
         if let (Some(index), Some((_, _, at))) = (out.change_proposed, self.local.changing.as_mut()) {
             *at = Some(index);
@@ -451,7 +452,7 @@ impl<S: Service> Node<S> {
             save: self.save.take(),
             restore: self.restoring,
             peers: out.peers,
-            commit_latencies: out.commit_latencies,
+            latencies: out.latencies,
         }
     }
 
@@ -479,6 +480,7 @@ impl<S: Service> Node<S> {
     /// After any input: apply what's committed, and notice losing the leadership.
     fn after(&mut self, now: u64) {
         self.now = now;
+        self.raft.set_time(now);
         if self.raft.take_installed() {
             // A snapshot being saved is older: it's ignored once saved.
             self.restoring = Some(self.raft.snapshot_index());
