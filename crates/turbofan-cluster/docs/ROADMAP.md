@@ -62,10 +62,9 @@ A service upgrades by `Service::version` and `activate`, and the cluster's proto
 
 What Turbojet did for its own launch (its `site/` and `docs/guide/`), done again here.
 
-- **A guide.** The crate README is an overview and the crate docs are reference material, with
-  no examples in them. Wanted: a guide that goes from a first service (`examples/counter.rs`) to
-  a running cluster, and then to operating it: members, snapshots, TLS, learners and promotion,
-  and metrics. Also examples in the crate docs for `Service`, `Ctx` and `ClusterClient`.
+- **A guide.** Done: `docs/guide`, in the crate docs as `turbofan_cluster::guide`, with its
+  examples run as doctests. Left: examples in the crate docs for `Service`, `Ctx` and
+  `ClusterClient`.
 - **A public website.** A landing page, the guide and ARCHITECTURE.md as a book, the benchmark
   numbers, and links to the crates and the repository. Build it from the repository's own docs,
   as Turbojet's `site/build.py` does, so it can't drift from them, with `llms.txt` beside it.

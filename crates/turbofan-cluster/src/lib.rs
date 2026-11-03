@@ -5,10 +5,31 @@
 //! A service implements [`Service`] and runs with [`run`], or with [`driver::serve`] for control
 //! over its [`driver::Config`]. Gateways connect with [`ClusterClient`], or [`client::Client`]
 //! to do their own IO.
+//!
+//! The [`guide`] goes from a first service to running a cluster in production:
+//! clients, members, operations, upgrades and performance.
 #![warn(clippy::unwrap_used)]
 // Conversions go through `From`, `TryFrom` or `widen`, never `as`: the cast lints miss
 // `usize as u64`, which is lossless only on targets where usize fits.
 #![warn(clippy::as_conversions)]
+
+/// The guide's chapter links, as rustdoc resolves them: see `guide.rs`.
+macro_rules! guide_links {
+    () => {
+        "[guide]: crate::guide\n\
+         [first-service]: crate::guide::first_service\n\
+         [services]: crate::guide::services\n\
+         [clients]: crate::guide::clients\n\
+         [running]: crate::guide::running\n\
+         [membership]: crate::guide::membership\n\
+         [operations]: crate::guide::operations\n\
+         [upgrades]: crate::guide::upgrades\n\
+         [performance]: crate::guide::performance\n"
+    };
+}
+
+// The guide: from a first service to running a cluster in production (docs/guide).
+pub mod guide;
 
 mod cli;
 pub mod client;

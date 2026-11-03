@@ -20,7 +20,8 @@ thoroughly tested, and fast.
 | [`turbofan-sbe`](crates/turbofan-sbe) | SBE (Simple Binary Encoding): codecs generated from message schemas in a `build.rs`, and a schemaless API for reading and writing fields one at a time. |
 
 [crates/turbofan-cluster/docs/ARCHITECTURE.md](crates/turbofan-cluster/docs/ARCHITECTURE.md) is an overview of how they fit
-together.
+together, and [the guide](crates/turbofan-cluster/docs/guide/README.md) goes from a first service to
+running a cluster in production.
 
 ## Building and testing
 

@@ -59,63 +59,9 @@ cargo run --example counter -- serve --id 1 --data /tmp/counter/1 \
     --admin   1=127.0.0.1:7201,2=127.0.0.1:7202,3=127.0.0.1:7203
 ```
 
-Run the same command for nodes 2 and 3. Each node keeps its log, Raft metadata and latest snapshot
-in `--data`. An operator can ask for a snapshot with `snapshot --admin <addr>`.
-
-Set `TURBOFAN_ADMIN_TOKEN` to the same secret for every node and every operator's command: a node
-refuses an operator without it (`serve` warns when it's unset, and then refuses no one). It's
-checked, not encrypted, so keep the admin listener on a private network all the same.
-`TURBOFAN_PEER_TOKEN` is the same for the nodes' hellos to each other: set it, on every node, so
-that nothing else that reaches the peer listener can act as a node. To turn it on in a running
-cluster, restart the nodes with it one at a time: until the last, the ones that have it don't hear
-those that don't, which is like them being down, so wait for each to catch up before the next.
-For control over timeouts and the rest of the configuration, call `driver::serve` with a
-`driver::Config`, starting from `NodeConfig::new`'s defaults.
-
-The members change one at a time, while the cluster runs. To add a fourth node, start it with
-`--join` (its lists are then just where to find the cluster), and ask for it:
-
-```sh
-cargo run --example counter -- serve --id 4 --data /tmp/counter/4 --join \
-    --peers   1=127.0.0.1:7001,4=127.0.0.1:7004 \
-    --clients 1=127.0.0.1:7101,4=127.0.0.1:7104 \
-    --admin   1=127.0.0.1:7201,4=127.0.0.1:7204
-cargo run --example counter -- add-member --admin 127.0.0.1:7201 \
-    --member 4=127.0.0.1:7004,127.0.0.1:7104,127.0.0.1:7204
-```
-
-It's sent the log, or a snapshot, without a vote until it has caught up, then joins. `remove-member
---admin <addr> --id <n>` takes one out; stop it once that's answered. Replacing a node whose disk
-died is a remove, then an add of a new one. `set-role --admin <addr> --id <n> --voter` makes a
-learner a voter once it has caught up, and `--learner` makes a voter a learner, without shipping
-it the log again.
-
-A node that finds a damaged record at the end of its log, after a crash, drops it: a write that
-power cut off partway, it's never been acknowledged. But bit rot in the last record looks the
-same, and that may have been, so the node doubts its log (`turbofan_in_doubt`) until a leader
-has caught it up, and an election needs a vote more than a majority for each voter in doubt.
-Usually that passes unnoticed. But after a power cut every node may doubt, and then an election
-needs every member; or in a three-node cluster with one node's disk dead and another in doubt,
-there's no leader, so the dead one can't be removed. If you know a node in doubt only lost power,
-delete the `doubt` file in its `--data` directory's `log/`, and restart it.
-
-Before stopping the leader, for a rolling restart, `transfer-leadership --admin <addr> [--to <n>]`
-hands over to a caught-up member: a quick election instead of waiting out an election timeout.
-`status --admin <addr>` shows, as the leader knows them, its log's end and commit index, and how
-far behind each member is.
-A node reports its role, term, indices, sessions, followers' lag, and how long its entries take
-to be persisted, committed and applied, through the
-[`metrics`](https://docs.rs/metrics) facade (`src/metrics.rs` lists them): install a recorder, a
-Prometheus exporter say, in the binary before `run` to collect them.
-
-A rolling upgrade that changes a service's behaviour ships code with the old behaviour and the
-new (`Service::version` says which it has), node by node, then switches: `activate --admin <addr>
---service <n>`, refused while a member doesn't have it. Every node switches at the same point in
-the log, and `Ctx::service_version` tells the service which runs. [`WIRE.md`](docs/WIRE.md) has
-the cluster's own rules for changing what nodes send each other.
-
-`shutdown --admin <addr>` stops the whole cluster: every member snapshots at the same index, then
-exits, so a restart loads the snapshot instead of replaying the log.
+Run the same command for nodes 2 and 3. The same binary's other commands operate the cluster:
+`status`, `snapshot`, `add-member`, `remove-member`, `set-role`, `transfer-leadership`,
+`activate`, `promote` and `shutdown`.
 
 ## Clients
 
@@ -125,18 +71,17 @@ client.send(b"hello".to_vec()).await?;
 while let Some(event) = client.recv().await { /* Event::Message(bytes), ... */ }
 ```
 
-A client carries credentials, opaque bytes the service checks in `Service::authenticate` on the
-leader: refused, it gets no session; accepted, the session opens for the principal the service
-names, which `on_session_open` is given and only which may reattach to it.
+A `ClusterClient` keeps one session open across failovers: while it lasts, messages are applied
+exactly once and in order, and responses arrive exactly once and in order.
 
-A `ClusterClient` keeps one session open across failovers. It finds the leader, follows redirects,
-resends whatever the cluster hasn't yet applied, and drops responses it has already seen. While the
-session lasts, messages are applied exactly once and in order, and responses arrive exactly once
-and in order.
+## The guide
 
-A client that's away longer than the cluster keeps responses for gets `Event::Lost`, naming the
-first response it missed. A session the leader hears nothing from for a while is closed.
-`client::Client` is the same logic without tokio, for a caller that does its own IO.
+[`docs/guide`](docs/guide/README.md), also in the crate docs as `turbofan_cluster::guide`, goes
+from a first service to running a cluster in production: [services](docs/guide/services.md),
+[clients](docs/guide/clients.md), [the command line, configuration, durability, tokens and
+TLS](docs/guide/running.md), [members, learners and standbys](docs/guide/membership.md),
+[operations and metrics](docs/guide/operations.md), [upgrades](docs/guide/upgrades.md) and
+[performance](docs/guide/performance.md). Its examples run as doctests.
 
 ## How it's built
 
