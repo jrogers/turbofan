@@ -92,7 +92,7 @@ pub struct Config {
 pub const MAX_TOKEN_BYTES: usize = 255;
 
 enum Input {
-    Peer(NodeId, Vec<u8>),
+    Peer(NodeId, Vec<u8>, Instant),
     Client(ConnId, Vec<u8>),
     Admin(ConnId, Vec<u8>),
     Open(ConnId, mpsc::Sender<Vec<u8>>),
@@ -161,6 +161,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
         clock,
         published: Instant::now(),
         dbg_peers: HashMap::new(),
+        dbg_drops: 0,
         dbg_loop: (Duration::ZERO, Instant::now(), 0),
         hello,
         peer_token: peer_token.unwrap_or_else(|| Arc::from(&[][..])),
@@ -200,7 +201,8 @@ struct Core<S> {
     /// Peers to dial whatever the members are.
     contacts: Vec<(NodeId, String)>,
     /// The peers dialled: where, the frames for them, and the task dialling.
-    peers: HashMap<NodeId, (String, mpsc::Sender<Vec<u8>>, AbortHandle)>,
+    peers: HashMap<NodeId, (String, mpsc::Sender<(Instant, Vec<u8>)>, AbortHandle)>,
+    dbg_drops: u64,
     dials: JoinSet<()>,
     conns: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
 }
@@ -213,21 +215,27 @@ impl<S: Service + 'static> Core<S> {
                 let mut gaps: Vec<_> = self.dbg_peers.iter().map(|(p, (_, g))| (p.0, *g)).collect();
                 gaps.sort();
                 eprintln!(
-                    "DBG node {} {:?} term {}: max loop {:?}, {} terms changed, longest silence by peer {:?}",
+                    "DBG node {} {:?} term {}: max loop {:?}, {} terms changed, {} frames to peers dropped, longest silence by peer {:?}",
                     self.node.raft().id(),
                     self.node.raft().role(),
                     self.node.raft().term(),
                     self.dbg_loop.0,
                     self.dbg_loop.2,
+                    self.dbg_drops,
                     gaps
                 );
+                self.dbg_drops = 0;
                 for v in self.dbg_peers.values_mut() {
                     v.1 = Duration::ZERO;
                 }
                 self.dbg_loop = (Duration::ZERO, Instant::now(), 0);
             }
             let dbg_term = self.node.raft().term();
+            let dbg_flush = Instant::now();
             self.flush();
+            if dbg_flush.elapsed() > Duration::from_millis(50) {
+                eprintln!("DBG node {}: flush took {:?}", self.node.raft().id(), dbg_flush.elapsed());
+            }
             if self.published.elapsed() >= METRICS_EVERY {
                 self.published = Instant::now();
                 self.node.metrics(self.clock.now()).publish();
@@ -246,23 +254,35 @@ impl<S: Service + 'static> Core<S> {
                 }
                 input = rx.recv(), if take_inputs => {
                     let Some(input) = input else { return Ok(()) };
+                    let busy = Instant::now();
                     self.handle(input)?;
+                    let mut n = 1;
                     for _ in 1..MAX_BATCH_INPUTS {
                         let Ok(input) = rx.try_recv() else { break };
                         self.handle(input)?;
+                        n += 1;
+                    }
+                    if busy.elapsed() > Duration::from_millis(50) {
+                        eprintln!("DBG node {}: {n} peer inputs took {:?}", self.node.raft().id(), busy.elapsed());
                     }
                 }
                 // A backlogged leader leaves clients waiting, so TCP holds them back, until what
                 // it has proposed commits.
                 input = client_rx.recv(), if take_inputs && !self.node.raft().backlogged() => {
                     let Some(input) = input else { return Ok(()) };
+                    let busy = Instant::now();
                     self.handle(input)?;
+                    let mut n = 1;
                     for _ in 1..MAX_BATCH_INPUTS {
                         if self.node.raft().backlogged() {
                             break;
                         }
                         let Ok(input) = client_rx.try_recv() else { break };
                         self.handle(input)?;
+                        n += 1;
+                    }
+                    if busy.elapsed() > Duration::from_millis(50) {
+                        eprintln!("DBG node {}: {n} client inputs took {:?}", self.node.raft().id(), busy.elapsed());
                     }
                 }
                 () = tokio::time::sleep_until(wake.into()), if take_inputs => self.node.on_tick(self.clock.now()),
@@ -275,8 +295,15 @@ impl<S: Service + 'static> Core<S> {
     fn handle(&mut self, input: Input) -> io::Result<()> {
         let now = self.clock.now();
         match input {
-            Input::Peer(from, frame) => {
+            Input::Peer(from, frame, queued) => {
                 let t = Instant::now();
+                if t - queued > Duration::from_millis(50) {
+                    eprintln!(
+                        "DBG node {}: frame from {from} sat {:?} in the input queue",
+                        self.node.raft().id(),
+                        t - queued
+                    );
+                }
                 let last = self.dbg_peers.entry(from).or_insert((t, Duration::ZERO));
                 last.1 = last.1.max(t - last.0);
                 last.0 = t;
@@ -387,11 +414,13 @@ impl<S: Service + 'static> Core<S> {
         }
     }
 
-    fn send_peers(&self, frames: Vec<(NodeId, Vec<u8>)>) {
+    fn send_peers(&mut self, frames: Vec<(NodeId, Vec<u8>)>) {
         for (to, frame) in frames {
             if let Some((_, tx, _)) = self.peers.get(&to) {
                 // Full or down: Raft resends.
-                let _ = tx.try_send(frame);
+                if tx.try_send((Instant::now(), frame)).is_err() {
+                    self.dbg_drops += 1;
+                }
             }
         }
     }
@@ -682,11 +711,21 @@ async fn accept_peers(
             if Some(from) == hello.node_id {
                 return;
             }
+            let me = hello.node_id.map_or(0, |n| n.0);
+            let mut last_read = Instant::now();
             while let Ok(frame) = read_valid_frame(&mut stream).await {
+                let read = Instant::now();
+                if read - last_read > Duration::from_millis(100) {
+                    eprintln!("DBG node {me}: read nothing from {from} for {:?}", read - last_read);
+                }
+                last_read = read;
                 // Checked again as this node learns its epoch, or it changes: a connection from
                 // another cluster's node is dropped then.
-                if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frame)).await.is_err() {
+                if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frame, read)).await.is_err() {
                     return;
+                }
+                if read.elapsed() > Duration::from_millis(50) {
+                    eprintln!("DBG node {me}: frame from {from} waited {:?} to enter the input queue", read.elapsed());
                 }
             }
         });
@@ -786,8 +825,10 @@ async fn dial_peer(
     hello: Hello,
     token: Arc<[u8]>,
     tls: Option<ClientTls>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<(Instant, Vec<u8>)>,
 ) {
+    let me = hello.node_id.map_or(0, |n| n.0);
+    let mut last_frame = Instant::now();
     let mut batch = Vec::new();
     let mut redial = REDIAL;
     loop {
@@ -805,7 +846,19 @@ async fn dial_peer(
         }
         redial = REDIAL;
         loop {
-            let Some(frame) = rx.recv().await else { return };
+            let Some((queued, frame)) = rx.recv().await else { return };
+            let now = Instant::now();
+            if now - queued > Duration::from_millis(50) {
+                eprintln!(
+                    "DBG node {me} -> {addr}: frame sat {:?} in the outbound queue, {} more behind it",
+                    now - queued,
+                    rx.len()
+                );
+            }
+            if now - last_frame > Duration::from_millis(100) {
+                eprintln!("DBG node {me} -> {addr}: nothing to send for {:?}", now - last_frame);
+            }
+            last_frame = now;
             // Its epoch changed since its hello said: dialled again, for the peer to check the new
             // one. Else one that said none would go on being taken for one of any cluster.
             if hello.epoch() != epoch {
@@ -814,11 +867,15 @@ async fn dial_peer(
             batch.clear();
             batch.extend_from_slice(&frame);
             while batch.len() < MAX_FRAME_BYTES {
-                let Ok(frame) = rx.try_recv() else { break };
+                let Ok((_, frame)) = rx.try_recv() else { break };
                 batch.extend_from_slice(&frame);
             }
+            let write = Instant::now();
             if write_frames(&mut stream, [&batch[..]]).await.is_err() {
                 break;
+            }
+            if write.elapsed() > Duration::from_millis(50) {
+                eprintln!("DBG node {me} -> {addr}: writing {} bytes took {:?}", batch.len(), write.elapsed());
             }
         }
         tokio::time::sleep(REDIAL).await;
