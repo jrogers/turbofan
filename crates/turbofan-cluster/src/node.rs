@@ -362,6 +362,8 @@ struct State {
     next_proposal: u64,
     applied: u64,
     time: u64,
+    /// The cluster's epoch: 0 until its first leader's `Epoch` entry is applied.
+    epoch: u64,
 }
 
 /// This node's, as leader.
@@ -638,6 +640,13 @@ impl<S: Service> Node<S> {
         self.state.applied
     }
 
+    /// The cluster's epoch, as applied: 0 until its first leader's is. Peers that know different
+    /// ones are of different clusters (one promoted from the other), and don't talk.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.state.epoch
+    }
+
     /// A peer's message.
     pub fn on_peer(&mut self, from: NodeId, message: &wire::Decoded<'_>, now: u64) {
         self.raft.on_message(from, message, now);
@@ -842,6 +851,11 @@ impl<S: Service> Node<S> {
         // Every session gets a full timeout from now: the old leader's view of them is gone.
         self.local.activity = self.state.sessions.keys().map(|&s| (s, self.now)).collect();
         self.propose(&wire::NewTerm { timestamp: self.now });
+        // A new cluster's first leader names it. Another leader may too, before this applies: the
+        // first applied counts.
+        if self.state.epoch == 0 {
+            self.propose(&wire::Epoch { timestamp: self.now, epoch: mint_epoch(self.now, self.raft.id()) });
+        }
     }
 
     /// Clients attached here, and operators waiting on an answer from this leader, go and find
@@ -1008,6 +1022,12 @@ impl<S: Service> Node<S> {
             wire::Decoded::NewTerm(e) => {
                 self.advance_time(e.timestamp());
                 self.local.ready |= ours;
+            }
+            wire::Decoded::Epoch(e) => {
+                self.advance_time(e.timestamp());
+                if self.state.epoch == 0 {
+                    self.state.epoch = e.epoch();
+                }
             }
             wire::Decoded::Activated(e) => {
                 self.advance_time(e.timestamp());
@@ -1221,6 +1241,7 @@ fn encode_state(state: &State) -> Vec<u8> {
         proposals: crate::widen(state.outbox.len()),
         protocol: state.protocol,
         service_version: state.service_version,
+        epoch: state.epoch,
     };
     put(&mut out, &node);
     for (&session, s) in &state.sessions {
@@ -1255,6 +1276,7 @@ fn decode_state(from: &mut dyn Read) -> io::Result<State> {
         next_proposal: n.next_proposal(),
         protocol: n.protocol(),
         service_version: n.service_version(),
+        epoch: n.epoch(),
         ..State::default()
     };
     let (sessions, timers, proposals) = (n.sessions(), n.timers(), n.proposals());
@@ -1292,6 +1314,12 @@ fn decode_state(from: &mut dyn Read) -> io::Result<State> {
         state.outbox.insert(p.id(), p.payload().to_vec());
     }
     Ok(state)
+}
+
+/// An epoch no other cluster has: from the time, and the node naming it, so two learners
+/// promoted at once don't name the same. Never 0, which is none.
+fn mint_epoch(now: u64, id: NodeId) -> u64 {
+    (now ^ (u64::from(id.0) << 56)).max(1)
 }
 
 /// The next framed message of a snapshot, read no further.
@@ -1638,6 +1666,23 @@ mod tests {
         let bytes = encode_state(&node.state);
         let state = decode_state(&mut &bytes[..]).unwrap();
         assert_eq!((state.protocol, state.service_version), (0, 1), "kept in snapshots");
+    }
+
+    /// A new cluster's first leader names its epoch; one named later, by a leader that hadn't
+    /// applied that, doesn't count. Snapshots keep it.
+    #[test]
+    fn the_first_leader_names_the_epoch() {
+        let mut node = leader();
+        let epoch = node.epoch();
+        assert_ne!(epoch, 0);
+        node.propose(&wire::Epoch { timestamp: 1, epoch: epoch + 1 });
+        drive(&mut node);
+        assert_eq!(node.epoch(), epoch, "only the first counts");
+
+        let bytes = encode_state(&node.state);
+        assert_eq!(decode_state(&mut &bytes[..]).unwrap().epoch, epoch, "kept in snapshots");
+        assert_ne!(mint_epoch(5, NodeId(1)), mint_epoch(5, NodeId(2)), "two nodes at once");
+        assert_ne!(mint_epoch(0, NodeId(0)), 0);
     }
 
     /// What a service proposes comes back through the log, once, even when it's logged twice.

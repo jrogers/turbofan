@@ -262,7 +262,8 @@ mod tests {
     /// A hello from before the admin token (version 1) decodes, with none.
     #[test]
     fn an_older_hello_has_no_token() {
-        let hello = wire::Hello { magic: MAGIC, service_id: 7, role: wire::Role::Admin, node_id: 0, token: b"" };
+        let hello =
+            wire::Hello { magic: MAGIC, service_id: 7, role: wire::Role::Admin, node_id: 0, epoch: 0, token: b"" };
         let mut frame = Vec::new();
         encode_frame(&hello, &mut frame).unwrap();
         // Without the token's length byte, and saying version 1.

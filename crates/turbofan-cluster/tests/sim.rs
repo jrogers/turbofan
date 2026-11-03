@@ -1685,7 +1685,9 @@ impl Sim {
         let nodes: Vec<&Node<Echo>> = members.iter().map(|id| self.nodes[id].node.as_ref().unwrap()).collect();
         let disks: Vec<&Disk> = members.iter().map(|id| &self.nodes[id].disk).collect();
         let commit = nodes[0].raft().commit_index();
+        assert_ne!(nodes[0].epoch(), 0, "seed {seed}: no epoch");
         for (node, disk) in nodes.iter().zip(&disks) {
+            assert_eq!(node.epoch(), nodes[0].epoch(), "seed {seed}: node {} of another epoch", node.raft().id());
             let (id, role, term, last) =
                 (node.raft().id(), node.raft().role(), node.raft().term(), node.raft().last_index());
             let got = (node.raft().commit_index(), node.applied());

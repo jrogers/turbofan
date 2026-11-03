@@ -21,19 +21,20 @@ down (`shutdown`); otherwise the admin operations are a snapshot. Nodes report t
 - **A standby in another region.** A cluster that can take over, in another region or cloud, if
   the main one is lost. Learners are in: members that take the log and snapshot but don't vote,
   so the main cluster's commits never wait on the other region (`add-member --learner`, or
-  `serve --learners` to start with some). Left, in order:
+  `serve --learners` to start with some). So is a cluster epoch: a new cluster's first leader
+  names one in the log (an `Epoch` entry, kept in snapshots), every hello carries it, and peers
+  that know different ones don't talk, so a node of an old cluster can't rejoin one promoted
+  from it. Left, in order:
   - *Promotion:* an admin `promote` on a learner makes it the one member of a new cluster, from
-    its log and snapshot as they are, to grow with `add-member`. Never automatic: from the other
-    region a dead cluster and a cut link look alike, and two clusters taking orders fill twice.
-    An operator fences the old one first.
-  - *A cluster epoch:* the hello carries the service ID and node ID only, so a node of the old
-    cluster coming back would talk to the promoted one. Promotion mints a new epoch that peers
-    and clients check.
-  - *Clients:* sessions are replicated, so clients reattach to the promoted cluster and resend
-    what it hasn't applied. What committed but never reached the learner is lost, and clients
-    can't always tell: a response they'd seen means its `egressSeq` is reused, and the new
-    response is dropped as seen. An operator can count the loss from the old leader's commit
-    index and the learner's last index.
+    its log and snapshot as they are, under a new epoch (`node::mint_epoch`), to grow with
+    `add-member`. Never automatic: from the other region a dead cluster and a cut link look
+    alike, and two clusters taking orders fill twice. An operator fences the old one first.
+  - *Clients:* the hello tells them the epoch, which they don't check yet. Sessions are
+    replicated, so clients reattach to the promoted cluster and resend what it hasn't applied.
+    What committed but never reached the learner is lost, and clients can't always tell: a
+    response they'd seen means its `egressSeq` is reused, and the new response is dropped as
+    seen. An operator can count the loss from the old leader's commit index and the learner's
+    last index.
 
   A cluster stretched over three regions would fail over by itself and lose nothing, but every
   commit would wait a round trip between regions.

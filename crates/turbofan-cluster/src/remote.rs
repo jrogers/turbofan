@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::WriteHalf;
@@ -136,9 +137,9 @@ async fn run(
 ) {
     let start = Instant::now();
     let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let hello = Hello { service_id, node_id: None };
+    let hello = Hello { service_id, node_id: None, epoch: Arc::default() };
     loop {
-        let Ok(stream) = handshake(client.target(), hello, wire::Role::Client, &[], tls.as_ref()).await else {
+        let Ok(stream) = handshake(client.target(), &hello, wire::Role::Client, &[], tls.as_ref()).await else {
             client.on_disconnected();
             tokio::time::sleep(RETRY).await;
             continue;
@@ -212,7 +213,7 @@ async fn write(client: &mut Client, writer: &mut WriteHalf<Conn>) -> bool {
 /// none), over TLS if there's `tls`. `PermissionDenied` if the node refused the token.
 async fn handshake(
     addr: &str,
-    hello: Hello,
+    hello: &Hello,
     role: wire::Role,
     token: &[u8],
     tls: Option<&ClientTls>,
@@ -395,12 +396,12 @@ impl Admin {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
         )
         .unwrap_or_default();
-        let hello = Hello { service_id: self.service_id, node_id: None };
+        let hello = Hello { service_id: self.service_id, node_id: None, epoch: Arc::default() };
         let (token, tls) = (&self.token[..], self.tls.as_ref());
         let mut target = self.addr.clone();
         let attempt = async {
             loop {
-                match ask(&target, hello, token, tls, &request(request_id), |reply| answer(reply, request_id)).await {
+                match ask(&target, &hello, token, tls, &request(request_id), |reply| answer(reply, request_id)).await {
                     Some(Ok(answer)) => return answer,
                     Some(Err(leader)) if !leader.is_empty() => target = leader,
                     _ => tokio::time::sleep(RETRY * 4).await,
@@ -485,7 +486,7 @@ fn refused(e: &io::Error) -> bool {
 /// One try: `Ok(answer)`, or `Err(address)` to try instead (empty for none known yet).
 async fn ask(
     addr: &str,
-    hello: Hello,
+    hello: &Hello,
     token: &[u8],
     tls: Option<&ClientTls>,
     request: &[u8],

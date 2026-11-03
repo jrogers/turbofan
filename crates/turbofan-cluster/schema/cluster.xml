@@ -52,12 +52,15 @@
 
     <!-- Handshake: the first frame each way on every connection. `token`: an operator's, to the
          admin listener of a node that requires one; the cluster's peer token, to a peer, if it has
-         one; empty otherwise, and from an older node. -->
+         one; empty otherwise, and from an older node. `epoch`: the cluster's, as the node knows
+         it (0 for not yet, and from a client or operator); peers that know different ones are of
+         different clusters, and don't talk. -->
     <sbe:message name="Hello" id="1">
         <field name="magic" id="1" type="uint32"/>
         <field name="serviceId" id="2" type="uint32"/>
         <field name="role" id="3" type="Role"/>
         <field name="nodeId" id="4" type="uint8"/>
+        <field name="epoch" id="6" type="uint64"/>
         <data name="token" id="5" type="tokenData" sinceVersion="2"/>
     </sbe:message>
     <!-- The admin listener's answer to a hello without its token, instead of a hello; then it
@@ -291,6 +294,12 @@
         <field name="protocol" id="2" type="uint32"/>
         <field name="serviceVersion" id="3" type="uint32"/>
     </sbe:message>
+    <!-- The cluster's epoch, from a new cluster's first leader: only the first one applied
+         counts. -->
+    <sbe:message name="Epoch" id="59">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="epoch" id="2" type="uint64"/>
+    </sbe:message>
     <!-- A service's own message, from `Ctx::propose`: `id` is its place in the outbox. -->
     <sbe:message name="ServiceProposal" id="57">
         <field name="timestamp" id="1" type="uint64"/>
@@ -323,6 +332,7 @@
         <field name="proposals" id="6" type="uint64"/>
         <field name="protocol" id="7" type="uint32"/>
         <field name="serviceVersion" id="8" type="uint32"/>
+        <field name="epoch" id="9" type="uint64"/>
     </sbe:message>
     <!-- `ring` EgressStates follow it. -->
     <sbe:message name="SessionState" id="61">

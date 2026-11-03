@@ -131,16 +131,17 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     let (client_inputs, client_rx) = mpsc::channel(MAX_QUEUED_INPUTS);
     // Every task is in here, so they all stop when `serve` does.
     let mut tasks = JoinSet::new();
-    let hello = Hello { service_id: config.service_id, node_id: Some(id) };
+    let epoch = Arc::new(AtomicU64::new(node.epoch()));
+    let hello = Hello { service_id: config.service_id, node_id: Some(id), epoch };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
     let acceptor = |pick: fn(&tls::Loaded) -> &TlsAcceptor| tls.as_ref().map(|t| pick(t).clone());
-    tasks.spawn(accept_peers(peer_listener, hello, peer_token.clone(), acceptor(|t| &t.peer), inputs.clone()));
+    tasks.spawn(accept_peers(peer_listener, hello.clone(), peer_token.clone(), acceptor(|t| &t.peer), inputs.clone()));
     let next_conn = Arc::new(AtomicU64::new(1));
     let (role, tls_client) = (wire::Role::Client, acceptor(|t| &t.client));
-    tasks.spawn(accept(client_listener, role, hello, None, tls_client, next_conn.clone(), client_inputs));
+    tasks.spawn(accept(client_listener, role, hello.clone(), None, tls_client, next_conn.clone(), client_inputs));
     let token = config.admin_token.as_deref().map(Arc::from);
     let (role, tls_admin) = (wire::Role::Admin, acceptor(|t| &t.admin));
-    tasks.spawn(accept(admin_listener, role, hello, token, tls_admin, next_conn, inputs.clone()));
+    tasks.spawn(accept(admin_listener, role, hello.clone(), token, tls_admin, next_conn, inputs.clone()));
     let contacts = config.peer_addrs.iter().map(|&(m, a)| (m, a.to_string())).collect();
     let mut core = Core {
         node,
@@ -261,6 +262,7 @@ impl<S: Service + 'static> Core<S> {
     /// them while it does.
     fn flush(&mut self) {
         let taken = self.pipeline.take(&mut self.node);
+        self.hello.epoch.store(self.node.epoch(), Ordering::Relaxed);
         for &ns in &taken.commit_latencies {
             metrics::record_commit_latency(ns);
         }
@@ -335,7 +337,7 @@ impl<S: Service + 'static> Core<S> {
                 let (tx, rx) = mpsc::channel(MAX_QUEUED_FRAMES);
                 let task = self.dials.spawn(dial_peer(
                     addr.clone(),
-                    self.hello,
+                    self.hello.clone(),
                     self.peer_token.clone(),
                     self.tls.clone(),
                     rx,
@@ -492,11 +494,14 @@ fn wall_ns() -> u64 {
 }
 
 /// What a node says, and checks, in the handshake.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Hello {
     pub(crate) service_id: u32,
     /// None for a client or an operator.
     pub(crate) node_id: Option<NodeId>,
+    /// The cluster's epoch ([`Node::epoch`]), as the node last applied it: 0 for none yet, and
+    /// for a client or an operator.
+    pub(crate) epoch: Arc<AtomicU64>,
 }
 
 impl Hello {
@@ -505,21 +510,33 @@ impl Hello {
     /// # Panics
     ///
     /// If the token is over [`MAX_TOKEN_BYTES`].
-    pub(crate) fn frame(self, role: wire::Role, token: &[u8]) -> Vec<u8> {
+    pub(crate) fn frame(&self, role: wire::Role, token: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
         let hello = wire::Hello {
             magic: MAGIC,
             service_id: self.service_id,
             role,
             node_id: NodeId::to_wire(self.node_id),
+            epoch: self.epoch(),
             token,
         };
         codec::encode_frame(&hello, &mut frame).expect("a token of at most 255 bytes");
         frame
     }
 
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Whether a peer that knows epoch `theirs` is of this cluster: unless both know one, and
+    /// they differ.
+    fn same_cluster(&self, theirs: u64) -> bool {
+        let ours = self.epoch();
+        ours == 0 || theirs == 0 || ours == theirs
+    }
+
     /// The hello in `frame`, if it's one for this service from `role`.
-    pub(crate) fn check(self, frame: &[u8], role: wire::Role) -> Option<wire::HelloRef<'_>> {
+    pub(crate) fn check<'a>(&self, frame: &'a [u8], role: wire::Role) -> Option<wire::HelloRef<'a>> {
         let Ok(Some((wire::Decoded::Hello(h), _))) = codec::decode_frame(frame) else { return None };
         (h.magic() == MAGIC && h.service_id() == self.service_id && h.role() == role).then_some(h)
     }
@@ -584,7 +601,7 @@ async fn accept_peers(
     let mut conns = JoinSet::new();
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
-        let (inputs, token, tls) = (inputs.clone(), token.clone(), tls.clone());
+        let (inputs, token, tls, hello) = (inputs.clone(), token.clone(), tls.clone(), hello.clone());
         conns.spawn(async move {
             let handshake = async {
                 let mut stream = tls::accept(stream, tls.as_ref()).await?;
@@ -594,12 +611,17 @@ async fn accept_peers(
             let Ok(Ok((mut stream, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else { return };
             let theirs = hello.check(&first, wire::Role::Peer);
             let theirs = theirs.filter(|h| token.as_ref().is_none_or(|token| same(h.token(), token)));
-            let from = theirs.and_then(|h| NodeId::from_wire(h.node_id()));
-            let Some(from) = from.filter(|&p| Some(p) != hello.node_id) else {
+            let theirs = theirs.filter(|h| hello.same_cluster(h.epoch()));
+            let Some((from, epoch)) = theirs.and_then(|h| Some((NodeId::from_wire(h.node_id())?, h.epoch()))) else {
                 return;
             };
+            if Some(from) == hello.node_id {
+                return;
+            }
             while let Ok(frame) = read_valid_frame(&mut stream).await {
-                if inputs.send(Input::Peer(from, frame)).await.is_err() {
+                // Checked again as this node learns its epoch, or it changes: a connection from
+                // another cluster's node is dropped then.
+                if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frame)).await.is_err() {
                     return;
                 }
             }
@@ -623,7 +645,7 @@ async fn accept(
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
         let conn = next_conn.fetch_add(1, Ordering::Relaxed);
-        conns.spawn(serve_connection(stream, conn, role, hello, token.clone(), tls.clone(), inputs.clone()));
+        conns.spawn(serve_connection(stream, conn, role, hello.clone(), token.clone(), tls.clone(), inputs.clone()));
         while conns.try_join_next().is_some() {}
     }
 }
@@ -726,6 +748,22 @@ async fn dial_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Peers are of one cluster unless both know its epoch, and they differ: a node that knows
+    /// none yet (joining, or a new cluster's before its first leader names it) talks to any.
+    #[test]
+    fn peers_of_another_epoch_are_of_another_cluster() {
+        let hello = |epoch| Hello { service_id: 1, node_id: Some(NodeId(1)), epoch: Arc::new(AtomicU64::new(epoch)) };
+        assert!(hello(7).same_cluster(7));
+        assert!(!hello(7).same_cluster(8));
+        assert!(hello(7).same_cluster(0));
+        assert!(hello(0).same_cluster(8));
+        let ours = hello(0);
+        let theirs = 8;
+        assert!(ours.same_cluster(theirs));
+        ours.epoch.store(7, Ordering::Relaxed);
+        assert!(!ours.same_cluster(theirs), "once this node learns its epoch");
+    }
 
     /// A connection from a newer node isn't dropped for a message this one doesn't know: it's
     /// skipped, and the next read.
