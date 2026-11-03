@@ -160,6 +160,8 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
         inputs,
         clock,
         published: Instant::now(),
+        dbg_peers: HashMap::new(),
+        dbg_loop: (Duration::ZERO, Instant::now(), 0),
         hello,
         peer_token: peer_token.unwrap_or_else(|| Arc::from(&[][..])),
         tls: tls.map(|t| t.dial),
@@ -188,6 +190,8 @@ struct Core<S> {
     clock: Clock,
     /// When the gauges were last published.
     published: Instant,
+    dbg_peers: HashMap<NodeId, (Instant, Duration)>,
+    dbg_loop: (Duration, Instant, u64),
     hello: Hello,
     /// What its hellos to peers carry: [`Config::peer_token`], or nothing.
     peer_token: Arc<[u8]>,
@@ -204,6 +208,16 @@ struct Core<S> {
 impl<S: Service + 'static> Core<S> {
     async fn run(mut self, mut rx: mpsc::Receiver<Input>, mut client_rx: mpsc::Receiver<Input>) -> io::Result<()> {
         loop {
+            let dbg_t0 = Instant::now();
+            if self.dbg_loop.1.elapsed() >= Duration::from_secs(1) {
+                let mut gaps: Vec<_> = self.dbg_peers.iter().map(|(p, (_, g))| (p.0, *g)).collect();
+                gaps.sort();
+                eprintln!("DBG node {} {:?} term {}: max loop {:?}, {} terms changed, longest silence by peer {:?}",
+                    self.node.raft().id(), self.node.raft().role(), self.node.raft().term(), self.dbg_loop.0, self.dbg_loop.2, gaps);
+                for v in self.dbg_peers.values_mut() { v.1 = Duration::ZERO; }
+                self.dbg_loop = (Duration::ZERO, Instant::now(), 0);
+            }
+            let dbg_term = self.node.raft().term();
             self.flush();
             if self.published.elapsed() >= METRICS_EVERY {
                 self.published = Instant::now();
@@ -244,13 +258,21 @@ impl<S: Service + 'static> Core<S> {
                 }
                 () = tokio::time::sleep_until(wake.into()), if take_inputs => self.node.on_tick(self.clock.now()),
             }
+            self.dbg_loop.0 = self.dbg_loop.0.max(dbg_t0.elapsed());
+            self.dbg_loop.2 += u64::from(self.node.raft().term() != dbg_term);
         }
     }
 
     fn handle(&mut self, input: Input) -> io::Result<()> {
         let now = self.clock.now();
         match input {
-            Input::Peer(from, frame) => self.node.on_peer(from, &decode(&frame), now),
+            Input::Peer(from, frame) => {
+                let t = Instant::now();
+                let last = self.dbg_peers.entry(from).or_insert((t, Duration::ZERO));
+                last.1 = last.1.max(t - last.0);
+                last.0 = t;
+                self.node.on_peer(from, &decode(&frame), now)
+            }
             Input::Client(conn, frame) => self.node.on_client(conn, &decode(&frame), now),
             Input::Admin(conn, frame) => self.node.on_admin(conn, &decode(&frame), now),
             Input::Open(conn, tx) => {
