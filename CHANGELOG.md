@@ -18,6 +18,9 @@ a patch version (0.1.1) doesn't.
   others. Before, only damage with nothing whole after it was truncated, and any other refused to
   start, for the node to be wiped and replaced. Bit rot of synced records is now taken the same
   way, which doubt keeps safe however much is dropped.
+- Connections over plain TCP are buffered, as TLS already was: each frame was a system call to
+  write and two to read. Throughput under load (the benchmark's 8 × 256) about triples, from
+  155,000 messages a second to 455,000 on an M4 Mac mini, and is no longer below TLS's.
 
 ### Fixed
 

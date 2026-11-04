@@ -18,7 +18,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, BufStream};
 use tokio::net::TcpStream;
 
 #[cfg(feature = "tls")]
@@ -114,8 +114,14 @@ pub(crate) async fn connect(addr: &str, tls: Option<&ClientTls>) -> io::Result<C
     let _ = stream.set_nodelay(true);
     match tls {
         Some(tls) => imp::connect(&tls.0, addr, stream).await,
-        None => Ok(Box::new(stream)),
+        None => Ok(plain(stream)),
     }
+}
+
+/// Plain TCP, buffered both ways as rustls buffers TLS: else every frame written is a system
+/// call, and every one read two. Whatever writes to a [`Conn`] flushes it, as TLS needs too.
+fn plain(stream: TcpStream) -> Conn {
+    Box::new(BufStream::new(stream))
 }
 
 /// An accepted TCP connection, over TLS if there's `tls`.
@@ -123,7 +129,7 @@ pub(crate) async fn accept(stream: TcpStream, tls: Option<&Acceptor>) -> io::Res
     let _ = stream.set_nodelay(true);
     match tls {
         Some(tls) => imp::accept(tls, stream).await,
-        None => Ok(Box::new(stream)),
+        None => Ok(plain(stream)),
     }
 }
 
