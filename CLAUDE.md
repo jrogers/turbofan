@@ -40,4 +40,5 @@ before writing code.
   deploys the website (`.github/workflows/site.yml`), built from the tag's docs.
 - CI runs the simulation's fixed seeds and the fuzz targets' build in jobs of their own on every push;
   fresh seeds (`simulate.yml`) and fuzzing (`fuzz.yml`) run nightly, and a failing night opens an issue
-  (`scripts/nightly-report.sh`).
+  (`scripts/nightly-report.sh`). `scripts/nightly.sh [run]` shows how they went, and fetches a failed
+  one's seed or inputs and prints the commands that replay it.

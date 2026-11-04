@@ -14,7 +14,7 @@ issue=$(gh issue list --state open --limit 100 --json number,title \
 
 case $result in
 failure)
-    body="$url failed: its log names the failing seed (Simulate), or its fuzz-artifacts hold the inputs (Fuzz)."
+    body="$url failed. To replay it locally: \`scripts/nightly.sh ${url##*/}\`."
     if [ -n "$issue" ]; then
         gh issue comment "$issue" --body "Failed again: $body"
     else
