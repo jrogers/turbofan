@@ -59,6 +59,14 @@ const STOP_GRACE: Duration = Duration::from_millis(200);
 const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// How long a new connection has to say hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Client connections kept at once: one a session, and there are at most [`node::MAX_SESSIONS`].
+/// At the limit a listener accepts no more until one closes, so the file descriptors a node holds
+/// are bounded (raise its `ulimit -n` to match).
+const MAX_CLIENT_CONNECTIONS: usize = node::MAX_SESSIONS;
+/// Peer or operator connections kept at once: a cluster has a few nodes and fewer operators.
+/// Neither is timed out for being idle (a follower says nothing to another while a leader lasts,
+/// and an operator waits on a snapshot), so keep strangers out with tokens or TLS.
+const MAX_OTHER_CONNECTIONS: usize = 256;
 
 /// Where a node keeps its state, and where it listens.
 ///
@@ -123,6 +131,17 @@ impl Config {
     }
 }
 
+/// Refuses a token over [`MAX_TOKEN_BYTES`].
+fn check_tokens(config: &Config) -> io::Result<()> {
+    for (name, token) in [("admin_token", &config.admin_token), ("peer_token", &config.peer_token)] {
+        if token.as_ref().is_some_and(|t| t.len() > MAX_TOKEN_BYTES) {
+            let message = format!("{name}: at most {MAX_TOKEN_BYTES} bytes");
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+    }
+    Ok(())
+}
+
 /// The longest token a hello carries.
 pub const MAX_TOKEN_BYTES: usize = 255;
 
@@ -184,12 +203,7 @@ enum Input {
 /// or the disk fails. A failed write or sync leaves the node's durable state unknown, so it
 /// stops; restart it, and it recovers from what's on disk.
 pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Result<()> {
-    for (name, token) in [("admin_token", &config.admin_token), ("peer_token", &config.peer_token)] {
-        if token.as_ref().is_some_and(|t| t.len() > MAX_TOKEN_BYTES) {
-            let message = format!("{name}: at most {MAX_TOKEN_BYTES} bytes");
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
-        }
-    }
+    check_tokens(&config)?;
     let tls = config.tls.as_ref().map(tls::Loaded::load).transpose()?;
     let id = config.node.raft.id;
     let (mut storage, meta, snapshot, log) =
@@ -219,13 +233,18 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     let hello = Hello { service_id: config.service_id, node_id: Some(id), epoch };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
     let acceptor = |pick: fn(&tls::Loaded) -> &TlsAcceptor| tls.as_ref().map(|t| pick(t).clone());
+    let dial = tls.as_ref().map(|t| t.dial.clone());
     tasks.spawn(accept_peers(peer_listener, hello.clone(), peer_token.clone(), acceptor(|t| &t.peer), inputs.clone()));
     let next_conn = Arc::new(AtomicU64::new(1));
-    let (role, tls_client) = (wire::Role::Client, acceptor(|t| &t.client));
-    tasks.spawn(accept(client_listener, role, hello.clone(), None, tls_client, next_conn.clone(), client_inputs));
+    let (tls, idle) = (acceptor(|t| &t.client), Some(config.node.session_timeout));
+    let clients =
+        Gate { role: wire::Role::Client, hello: hello.clone(), token: None, tls, inputs: client_inputs, idle };
     let token = config.admin_token.as_deref().map(Arc::from);
-    let (role, tls_admin) = (wire::Role::Admin, acceptor(|t| &t.admin));
-    tasks.spawn(accept(admin_listener, role, hello.clone(), token, tls_admin, next_conn, inputs.clone()));
+    let (tls_admin, admin_inputs) = (acceptor(|t| &t.admin), inputs.clone());
+    let operators =
+        Gate { role: wire::Role::Admin, token, tls: tls_admin, inputs: admin_inputs, idle: None, ..clients.clone() };
+    tasks.spawn(accept(client_listener, clients, next_conn.clone()));
+    tasks.spawn(accept(admin_listener, operators, next_conn));
     let contacts = config.peer_addrs.iter().map(|&(m, a)| (m, a.to_string())).collect();
     let mut core = Core {
         node,
@@ -238,7 +257,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
         published: Instant::now(),
         hello,
         peer_token: peer_token.unwrap_or_else(|| Arc::from(&[][..])),
-        tls: tls.map(|t| t.dial),
+        tls: dial,
         contacts,
         peers: HashMap::new(),
         dials: JoinSet::new(),
@@ -700,6 +719,12 @@ async fn read_valid_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<V
     }
 }
 
+/// [`read_valid_frame`], failing if none comes within `idle`.
+async fn read_within(reader: &mut (impl AsyncRead + Unpin), idle: Option<Duration>) -> io::Result<Vec<u8>> {
+    let Some(idle) = idle else { return read_valid_frame(reader).await };
+    tokio::time::timeout(idle, read_valid_frame(reader)).await.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+}
+
 /// Reads from peers: any node of this service whose hello has `token`, if there is one, since a
 /// member this node hasn't heard was added may lead.
 async fn accept_peers(
@@ -711,6 +736,7 @@ async fn accept_peers(
 ) {
     let mut conns = JoinSet::new();
     loop {
+        room(&mut conns, MAX_OTHER_CONNECTIONS).await;
         let Ok((stream, _)) = listener.accept().await else {
             // Out of file descriptors, say: not again at once, in a loop that holds a core.
             tokio::time::sleep(ACCEPT_RETRY).await;
@@ -741,45 +767,51 @@ async fn accept_peers(
                 }
             }
         });
-        // Reap finished connections.
-        while conns.try_join_next().is_some() {}
     }
 }
 
-/// Takes clients or operators: those whose hello has `token`, if there is one.
-async fn accept(
-    listener: TcpListener,
+/// Waits until `conns` has fewer than `max` running, reaping the finished.
+async fn room(conns: &mut JoinSet<()>, max: usize) {
+    while conns.try_join_next().is_some() {}
+    while conns.len() >= max {
+        conns.join_next().await;
+    }
+}
+
+/// What a client or operator listener's connections share.
+#[derive(Clone)]
+struct Gate {
     role: wire::Role,
     hello: Hello,
+    /// The token their hellos must have, if there is one.
     token: Option<Arc<[u8]>>,
     tls: Option<TlsAcceptor>,
-    next_conn: Arc<AtomicU64>,
     inputs: mpsc::Sender<Input>,
-) {
+    /// How long a connection may say nothing: for a client the session timeout, by which its
+    /// session is gone.
+    idle: Option<Duration>,
+}
+
+/// Takes clients or operators, through `gate`.
+async fn accept(listener: TcpListener, gate: Gate, next_conn: Arc<AtomicU64>) {
+    let max = if gate.role == wire::Role::Client { MAX_CLIENT_CONNECTIONS } else { MAX_OTHER_CONNECTIONS };
     let mut conns = JoinSet::new();
     loop {
+        room(&mut conns, max).await;
         let Ok((stream, _)) = listener.accept().await else {
             // Out of file descriptors, say: not again at once, in a loop that holds a core.
             tokio::time::sleep(ACCEPT_RETRY).await;
             continue;
         };
         let conn = next_conn.fetch_add(1, Ordering::Relaxed);
-        conns.spawn(serve_connection(stream, conn, role, hello.clone(), token.clone(), tls.clone(), inputs.clone()));
-        while conns.try_join_next().is_some() {}
+        conns.spawn(serve_connection(stream, conn, gate.clone()));
     }
 }
 
 /// A client's or operator's connection: hello each way, then frames in to the node and out from
-/// it, until either side closes.
-async fn serve_connection(
-    stream: TcpStream,
-    conn: ConnId,
-    role: wire::Role,
-    hello: Hello,
-    token: Option<Arc<[u8]>>,
-    tls: Option<TlsAcceptor>,
-    inputs: mpsc::Sender<Input>,
-) {
+/// it, until either side closes or nothing comes for `idle`.
+async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
+    let Gate { role, hello, token, tls, inputs, idle } = gate;
     let handshake = async {
         let mut stream = tls::accept(stream, tls.as_ref()).await?;
         let first = read_frame(&mut stream).await?;
@@ -814,7 +846,7 @@ async fn serve_connection(
     });
     loop {
         tokio::select! {
-            frame = read_valid_frame(&mut reader) => {
+            frame = read_within(&mut reader, idle) => {
                 let Ok(frame) = frame else { break };
                 let input = if role == wire::Role::Admin { Input::Admin(conn, frame) } else { Input::Client(conn, frame) };
                 if inputs.send(input).await.is_err() {
@@ -941,6 +973,33 @@ mod tests {
         let mut malformed = known.clone();
         malformed[8..10].copy_from_slice(&7_u16.to_le_bytes());
         assert!(read_valid_frame(&mut &malformed[..]).await.is_err(), "another schema's");
+    }
+
+    /// A listener at its limit waits for a connection to close before it takes another.
+    #[tokio::test]
+    async fn a_listener_at_its_limit_waits_for_room() {
+        let mut conns = JoinSet::new();
+        let (close, closed) = tokio::sync::oneshot::channel::<()>();
+        conns.spawn(async {
+            let _ = closed.await;
+        });
+        conns.spawn(std::future::pending());
+        let wait = Duration::from_millis(50);
+        tokio::time::timeout(wait, room(&mut conns, 3)).await.expect("room under the limit");
+        assert!(tokio::time::timeout(wait, room(&mut conns, 2)).await.is_err(), "none at the limit");
+        close.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), room(&mut conns, 2)).await.expect("room once one closes");
+        assert_eq!(conns.len(), 1, "the closed one reaped");
+    }
+
+    /// A connection that says nothing for `idle` fails to read; with no `idle`, it waits on.
+    #[tokio::test]
+    async fn a_silent_connection_times_out() {
+        let (_theirs, mut ours) = tokio::io::duplex(64);
+        let idle = Duration::from_millis(50);
+        let read = read_within(&mut ours, Some(idle)).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(tokio::time::timeout(idle * 2, read_within(&mut ours, None)).await.is_err(), "no idle limit");
     }
 
     const SECOND: u64 = 1_000_000_000;

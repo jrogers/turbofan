@@ -34,9 +34,6 @@ From a review of the crate, still open:
   cut can leave a gap between them, refused too. Nothing wrong is served, but the node needs
   wiping. A fix: know how far the log is synced, and take damage past it for a torn write; or,
   unsynced, truncate at damage and doubt the log, which that mode already allows.
-- **Connections idle after the hello are kept for ever.** Nothing times out a client, operator or
-  peer connection that says nothing after its hello, nor limits how many there are
-  (`src/driver.rs`), so they can use up the file descriptors.
 - **A pre-vote granted in an earlier round can count in a later one.** A `Vote` doesn't say which
   round it answers (`on_vote`, `src/raft/election.rs`): one delayed past an election timeout can
   let a node cut off from the leader win a pre-vote, then depose it. A schema change.

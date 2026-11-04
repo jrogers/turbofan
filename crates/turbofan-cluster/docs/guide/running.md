@@ -96,7 +96,7 @@ For full control, call `driver::serve` with a `driver::Config` from a `main` of 
 | `node.raft.log_window_bytes` | 64 MiB | Applied records kept in memory, for followers a little behind; older ones are read back from disk. |
 | `node.raft.log_tail_entries` | 100,000 | Entries kept before a snapshot, so a follower that far behind is sent the log, not the snapshot. |
 | `node.raft.max_uncommitted_bytes` | 64 MiB | A leader with this much proposed and not yet committed takes nothing more from clients. |
-| `node.session_timeout` | 10 s | A session the leader hears nothing from for this long is closed. |
+| `node.session_timeout` | 10 s | A session the leader hears nothing from for this long is closed, and so is a client connection any node hears nothing on. |
 | `node.snapshot_every_entries` | 100,000 | Each node snapshots once this many entries follow its last snapshot. |
 | `node.snapshots_kept` | 1 | The newest snapshots each node keeps on disk (`--keep-snapshots`): see [Operations][operations]. |
 | `node.egress_ring_entries` | 8192 | Responses kept per session for a client that reattaches (up to `MAX_EGRESS_RING`). |

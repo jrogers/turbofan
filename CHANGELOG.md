@@ -4,6 +4,16 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Fixed
+
+- Connections idle after their hello were kept for ever, and as many as came, so they could use
+  up a node's file descriptors. A client connection silent for `session_timeout` is closed (its
+  session is gone by then), and each listener keeps at most so many at once: `MAX_SESSIONS`
+  clients, 256 peers, 256 operators. Peer and operator connections aren't timed out for being
+  idle, so keep strangers off them with `peer_token`, `admin_token` or TLS.
+
 ## 0.3.0 (2026-11-04)
 
 ### Breaking
