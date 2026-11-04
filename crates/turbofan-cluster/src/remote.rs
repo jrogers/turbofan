@@ -33,6 +33,36 @@ enum Command {
 /// A session with a cluster, kept open across failovers: messages are applied exactly once, in
 /// order, and responses arrive exactly once, in order. It runs on a task of its own, which
 /// stops when this is dropped.
+///
+/// # Examples
+///
+/// Send a message to the cluster of service 1, and print the responses until the session
+/// closes. The [guide](crate::guide::clients) says what's guaranteed, and when it isn't.
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use turbofan_cluster::ClusterClient;
+/// use turbofan_cluster::client::Event;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let members = ["10.0.0.1:7101", "10.0.0.2:7101", "10.0.0.3:7101"];
+///     let mut session = ClusterClient::connect(members, 1, b"desk1:secret", Duration::from_millis(500))?;
+///     session.send(b"hello".to_vec()).await?;
+///     while let Some(event) = session.recv().await {
+///         match event {
+///             Event::Message(response) => println!("{} bytes", response.len()),
+///             Event::Closed { reason, .. } => {
+///                 println!("closed: {reason:?}");
+///                 break;
+///             }
+///             _ => {}
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
 #[derive(Debug)]
 pub struct ClusterClient {
     commands: mpsc::Sender<Command>,

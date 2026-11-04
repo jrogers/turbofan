@@ -4,6 +4,10 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+Documentation only: examples on `Service`, `Ctx` and `ClusterClient`.
+
 ## 0.1.1 (2026-11-03)
 
 Documentation only: the READMEs, guide and architecture overview no longer link to the OMS, whose

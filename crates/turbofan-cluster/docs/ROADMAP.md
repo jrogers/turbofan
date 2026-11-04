@@ -63,11 +63,10 @@ A service upgrades by `Service::version` and `activate`, and the cluster's proto
 What Turbojet did for its own launch (its `site/` and `docs/guide/`), done again here.
 
 - **A guide.** Done: `docs/guide`, in the crate docs as `turbofan_cluster::guide`, with its
-  examples run as doctests. Left: examples in the crate docs for `Service`, `Ctx` and
-  `ClusterClient`.
-- **A public website.** A landing page, the guide and ARCHITECTURE.md as a book, the benchmark
-  numbers, and links to the crates and the repository. Build it from the repository's own docs,
-  as Turbojet's `site/build.py` does, so it can't drift from them, with `llms.txt` beside it.
+  examples run as doctests, and examples on `Service`, `Ctx` and `ClusterClient`.
+- **A public website.** Done: a landing page, and the guide and ARCHITECTURE.md as a book,
+  built from the repository's docs by `site/build.py`, with `llms.txt` beside them. Left: the
+  benchmark's numbers, measured somewhere steadier than a laptop.
 - **Announcement posts.** Posts introducing Turbofan where Rust and trading-systems developers
   read, linking to the website and guide. Wait until those are up.
 

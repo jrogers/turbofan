@@ -17,6 +17,39 @@ impl fmt::Display for SessionId {
 /// It must depend only on what it's given, never on a clock, randomness, IO or iteration order
 /// of a hash map. Time comes from [`Ctx::now`], which is the leader's clock stamped into the
 /// log. It's `Send`, as the driver runs it on a tokio task.
+///
+/// # Examples
+///
+/// A service that answers each message with the message, and has no state to snapshot. The
+/// [guide](crate::guide::first_service) builds up one with state.
+///
+/// ```no_run
+/// use std::io::{self, Read};
+/// use std::process::ExitCode;
+///
+/// use turbofan_cluster::{Ctx, Service, SessionId, SnapshotWriter};
+///
+/// struct Echo;
+///
+/// impl Service for Echo {
+///     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
+///         // No longer than what came in, so never too long to send.
+///         ctx.send(session, payload).expect("as long as a message in");
+///     }
+///
+///     fn snapshot(&self) -> SnapshotWriter {
+///         Box::new(|_out| Ok(()))
+///     }
+///
+///     fn restore(&mut self, _from: &mut dyn Read) -> io::Result<()> {
+///         Ok(())
+///     }
+/// }
+///
+/// fn main() -> ExitCode {
+///     turbofan_cluster::run(1, Echo)
+/// }
+/// ```
 pub trait Service: Send {
     /// Whether a client with `credentials` may open a session, or reattach to one, and who it
     /// is: its principal (a user name, say, at most [`MAX_PRINCIPAL_BYTES`]), or `None` to refuse
@@ -60,6 +93,26 @@ pub trait Service: Send {
 
 /// What a [`Service`] can do from a callback. Its effects take place after the callback
 /// returns, in order.
+///
+/// # Examples
+///
+/// A context of its own, [`Ctx::new`], tests a service without a cluster: call a callback with
+/// it, then look at what it did.
+///
+/// ```
+/// use turbofan_cluster::{Ctx, Effect, SessionId};
+///
+/// let session = SessionId(7);
+/// let mut ctx = Ctx::new(1_000_000_000);
+/// // What a service's `on_message` might do: answer, and wake itself a second later.
+/// ctx.send(session, b"ack".to_vec())?;
+/// ctx.schedule_timer(1, ctx.now() + 1_000_000_000);
+/// assert_eq!(
+///     ctx.take_effects(),
+///     [Effect::Send(session, b"ack".to_vec()), Effect::Schedule { id: 1, at: 2_000_000_000 }],
+/// );
+/// # Ok::<(), turbofan_cluster::PayloadTooLong>(())
+/// ```
 #[derive(Debug, Default)]
 pub struct Ctx {
     pub(super) now: u64,
