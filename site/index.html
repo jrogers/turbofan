@@ -102,6 +102,10 @@
   .icon { width: 36px; height: 36px; border-radius: 9px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-ink); }
   .icon svg { width: 20px; height: 20px; }
 
+  /* Performance */
+  .stat b { display: block; font-size: 2rem; letter-spacing: -0.03em; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .stat span { display: block; color: var(--ink-3); font-size: 0.88rem; margin-bottom: 10px; }
+
   /* Crates */
   .crate { display: block; color: var(--ink); }
   .crate:hover { text-decoration: none; border-color: var(--ink-3); }
@@ -223,6 +227,30 @@
     <div class="window" aria-label="A counter service in Turbofan">
       <div class="title"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span>counter.rs</span></div>
       <pre><code>{{counter}}</code></pre>
+    </div>
+  </section>
+
+  <section>
+    <h2>Performance</h2>
+    <p class="sub">Three nodes on one machine ({{bench.machine}}) over loopback TCP, 64-byte
+    messages, from the repository's benchmark. A real cluster adds its network's round trips: the
+    <a href="guide/performance.html">guide's performance chapter</a> has every run, and how to
+    measure your own.</p>
+    <div class="grid">
+      <div class="card stat">
+        <b>{{bench.throughput}}</b><span>messages a second</span>
+        <p>Eight clients with 256 in flight each. p99 latency {{bench.throughput.p99}}.</p>
+      </div>
+      <div class="card stat">
+        <b>{{bench.latency}}</b><span>p50 round trip</span>
+        <p>One message at a time, from the client to its response, committed on two nodes of three
+        and applied. p99 {{bench.latency.p99}}.</p>
+      </div>
+      <div class="card stat">
+        <b>{{bench.fsync}}</b><span>messages a second, synced</span>
+        <p>With <code>--fsync</code>: every batch on disk before it's acknowledged, one sync for
+        all that arrived during the last.</p>
+      </div>
     </div>
   </section>
 

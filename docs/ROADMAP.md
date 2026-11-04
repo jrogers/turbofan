@@ -30,10 +30,10 @@ down when they show.
 
 ## 3. Docs and outreach
 
-- **Benchmark numbers** in the guide's performance chapter and on the website's landing page,
-  measured somewhere steadier than a laptop.
+- **Benchmark numbers from a Linux server**, beside the Mac mini's in the guide's performance
+  chapter: macOS's `F_FULLFSYNC` says little of fsync on a server's NVMe drive.
 - **Announcement posts.** Posts introducing Turbofan where Rust and trading-systems developers
-  read, linking to the website and guide. Wait for the benchmark numbers.
+  read, linking to the website and guide.
 
 ## Not planned
 

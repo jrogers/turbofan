@@ -7,7 +7,8 @@ Called by scripts/site.sh, which runs mdBook after it:
   (docs/ARCHITECTURE.md). A link to a file outside the book (WIRE.md, say)
   goes to it on GitHub, at REF.
 - the landing page, OUT/index.html: site/index.html with the version, and the counter example
-  (crates/turbofan-cluster/examples/counter.rs) and the command line that runs it, filled in.
+  (crates/turbofan-cluster/examples/counter.rs) and the command line that runs it, filled in, and
+  the benchmark's figures, from the results in the guide's performance chapter.
 
 Then, with --finish, after mdBook has built the book into OUT/guide:
 
@@ -63,6 +64,8 @@ def main(book: Path, out: Path, ref: str) -> None:
     page = page.replace("{{version}}", version())
     page = page.replace("{{counter}}", highlight(counter()))
     page = page.replace("{{serve}}", html.escape(serve(), quote=False))
+    for name, value in bench().items():
+        page = page.replace(f"{{{{bench.{name}}}}}", html.escape(value, quote=False))
     assert "{{" not in page, "a placeholder in site/index.html has nothing to fill it"
     (out / "index.html").write_text(page)
 
@@ -196,6 +199,31 @@ def serve() -> str:
     match = re.search(r"^//! ```sh\n((?://!.*\n)+?)//! ```", example, re.M)
     assert match, "examples/counter.rs no longer shows its command line: update site/build.py's serve"
     return "".join(line[4:] + "\n" for line in match.group(1).splitlines())
+
+
+def bench() -> dict[str, str]:
+    """The landing page's figures, from the results in the guide's performance chapter: the
+    machine they're from, and cells of its table, which has a row per run and a column per figure."""
+    chapter = (ROOT / CLUSTER_DOCS / "guide" / "performance.md").read_text()
+    _, found, results = chapter.partition("\n## Results\n")
+    assert found, "the performance chapter has no Results section: update site/build.py's bench"
+    machine = re.search(r"^On (?:an? )?(.+?): ", results, re.M)
+    assert machine, "the performance chapter's results no longer start 'On <machine>: '"
+    rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in results.splitlines() if line.startswith("|")]
+    header, table = rows[0], {row[0]: dict(zip(rows[0], row)) for row in rows[2:]}
+
+    def cell(run: str, column: str) -> str:
+        assert column in header and run in table, f"the performance chapter's table has no {column} for {run}"
+        return table[run][column]
+
+    return {
+        "machine": machine.group(1),
+        "throughput": cell("throughput", "msgs/s"),
+        "throughput.p99": cell("throughput", "p99"),
+        "latency": cell("latency", "p50"),
+        "latency.p99": cell("latency", "p99"),
+        "fsync": cell("throughput, fsync", "msgs/s"),
+    }
 
 
 RUST_KEYWORDS = {
