@@ -317,14 +317,22 @@ async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
     let addrs: Vec<String> = cluster.configs.iter().map(|c| c.admin_listen.to_string()).collect();
     let admin = |i: usize| Admin::new(&addrs[i], SERVICE_ID).with_token(TOKEN).with_timeout(Duration::from_secs(20));
     let asked = admin(0).request_snapshot().await.unwrap();
-    // The newest snapshot in its directory: at least the one asked for, and whole.
+    // The newest snapshot in its directory, once it's the one asked for or later, as an operator
+    // checks by its name: a quorum has it, this node perhaps only in a moment.
     let snapshots = cluster.configs[0].data_dir.join("snapshots");
-    let newest = std::fs::read_dir(&snapshots)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "snapshot"))
-        .max()
-        .unwrap();
+    let newest = loop {
+        let newest = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "snapshot"))
+            .max()
+            .unwrap();
+        let index: u64 = newest.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+        if index >= asked {
+            break newest;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     let backup = dir.path().join("backup.snapshot");
     std::fs::copy(newest, &backup).unwrap();
     // Applied after the backup: lost with the cluster.
@@ -336,7 +344,7 @@ async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
     let mut restored = cluster.configs[0].clone();
     restored.data_dir = dir.path().join("restored");
     let (index, _) = driver::restore(&backup, &restored).unwrap();
-    assert!(index >= asked, "the newest snapshot, {index}, is at least the one asked for, {asked}");
+    assert!(index >= asked, "the snapshot copied, {index}, is at least the one asked for, {asked}");
     let again = driver::restore(&backup, &restored).unwrap_err();
     assert_eq!(again.kind(), io::ErrorKind::AlreadyExists, "a data directory is never overwritten");
     cluster.configs[0] = restored;

@@ -50,8 +50,10 @@ $ scp 10.0.0.1:/var/lib/my-service/snapshots/00000000000001830413.snapshot backu
 ```
 
 Copy the newest rather than the one named by the index: a node snapshots on its own too, and
-then deletes the older one, unless `--keep-snapshots` keeps it. The newest is at least as
-recent. Run this on a schedule; what's applied after the last backup is what a restore loses.
+then deletes the older one, unless `--keep-snapshots` keeps it. `snapshot` answers once a
+quorum has it, so a node not among them may take a moment more: the index is in the file's name,
+so wait until the newest's is the one you asked for or later. Any whole snapshot is a backup, just
+an older one. Run this on a schedule; what's applied after the last backup is what a restore loses.
 For a loss measured in milliseconds, keep a standby instead (see [Members][membership]).
 
 With the cluster lost, `restore` makes a data directory from a backup, for one node, with
