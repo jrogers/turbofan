@@ -16,6 +16,9 @@ a patch version (0.1.1) doesn't.
 - Backup and restore. A snapshot copied off a node is a backup; `driver::restore` (`restore
   --from <file>` with `serve`'s flags) makes a data directory of it for one node, which `serve`
   runs as the one member of a new cluster, of a new epoch, to grow with `add-member`.
+- `run_with`: `run` with a closure that changes each node's configuration before it serves, for
+  the settings that are the service's to choose. `serve --election-timeout <ms> --heartbeat <ms>`
+  apply over it, for an operator's network; a heartbeat not under half the timeout is refused.
 - `node::Config::snapshots_kept` (`serve --keep-snapshots <n>`): the newest snapshots each node
   keeps on disk, for copying off it or restoring from. 1 by default, as before.
 

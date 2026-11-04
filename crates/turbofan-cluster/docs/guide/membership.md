@@ -36,7 +36,9 @@ my-service add-member --admin 10.0.0.1:7201 --member 4=10.0.0.4:7001,10.0.0.4:71
 `--member` gives its ID, then its peer, client and admin addresses. The leader sends it the log,
 or its snapshot if it's far behind, and adds it once it has caught up, so the change never leaves
 the cluster waiting on a voter that has nothing. `add-member` returns once the change is
-committed, and waits up to two minutes for that.
+committed, and waits up to two minutes for that. A voter that hasn't caught up within 100
+election timeouts (30 s by default) isn't added: for a big state over a slow link, add it as a
+learner, which nothing waits for, then make it a voter with `set-role` once it's caught up.
 
 `add-member --learner` adds it as a learner instead. Nothing waits for a learner to catch up, so
 `add-member` returns at once; `--wait <entries>` waits until it's within that many entries of the

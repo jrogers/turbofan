@@ -61,13 +61,37 @@ once, which may lose entries already committed. Spread the nodes over power doma
 
 ## Configuration
 
-`run` uses `NodeConfig::new`'s defaults. For any other, call `driver::serve` with a
-`driver::Config` from a `main` of your own:
+`run` uses `NodeConfig::new`'s defaults. `run_with` changes them in code, for the settings that
+are the service's to choose; `serve`'s flags then apply over them, for what an operator chooses
+for a deployment (`--election-timeout <ms>`, `--heartbeat <ms>`, `--keep-snapshots <n>`,
+`--fsync`):
+
+```rust,no_run
+# use std::io::{self, Read};
+# use std::time::Duration;
+# use turbofan_cluster::{Ctx, Service, SessionId, SnapshotWriter};
+# #[derive(Debug, Default)]
+# struct Counter;
+# impl Service for Counter {
+#     fn on_message(&mut self, _ctx: &mut Ctx, _session: SessionId, _payload: &[u8]) {}
+#     fn snapshot(&self) -> SnapshotWriter { Box::new(|_| Ok(())) }
+#     fn restore(&mut self, _from: &mut dyn Read) -> io::Result<()> { Ok(()) }
+# }
+fn main() -> std::process::ExitCode {
+    turbofan_cluster::run_with(1, Counter::default(), |config| {
+        // Its gateways reconnect within 30 s, and may miss up to 20,000 responses meanwhile.
+        config.node.session_timeout = Duration::from_secs(30);
+        config.node.egress_ring_entries = 20_000;
+    })
+}
+```
+
+For full control, call `driver::serve` with a `driver::Config` from a `main` of your own:
 
 | Setting | Default | |
 |---|---|---|
-| `node.raft.election_timeout` | 300 ms | A follower that hears no leader for between this and twice this stands for election: the time a failover takes. |
-| `node.raft.heartbeat` | 50 ms | How often a leader heartbeats: well under the election timeout. |
+| `node.raft.election_timeout` | 300 ms | A follower that hears no leader for between this and twice this stands for election: the time a failover takes. `--election-timeout`. |
+| `node.raft.heartbeat` | 50 ms | How often a leader heartbeats: under half the election timeout. `--heartbeat`. |
 | `node.raft.seed` | the node's ID | Seeds the election timeout's jitter: make it differ between nodes. `run` mixes in the time. |
 | `node.raft.log_window_bytes` | 64 MiB | Applied records kept in memory, for followers a little behind; older ones are read back from disk. |
 | `node.raft.log_tail_entries` | 100,000 | Entries kept before a snapshot, so a follower that far behind is sent the log, not the snapshot. |

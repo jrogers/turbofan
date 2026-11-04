@@ -39,6 +39,10 @@
 //! one member of a new cluster, of a new epoch, from its log as it is: fence the old cluster first.
 //! Its nodes can't talk to the new one, which grows with `add-member`.
 //!
+//! A binary built on [`run`] uses [`NodeConfig::new`](crate::NodeConfig::new)'s defaults, and one on
+//! [`run_with`] its own; then `serve --election-timeout <ms> --heartbeat <ms>` sets the timing,
+//! which depends on the network between the voters.
+//!
 //! A snapshot is a backup: `snapshot --admin <addr>` takes one, which the node writes to
 //! `<data>/snapshots/`, whole and checked, and the newest there is a file to copy off the node.
 //! `serve --keep-snapshots <n>` keeps the newest `n` (1 by default). With the cluster lost,
@@ -91,6 +95,7 @@ const WAIT_POLL: Duration = Duration::from_secs(2);
 const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
         [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
+        [--election-timeout <ms>] [--heartbeat <ms>]
         [--tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca <pem>]
   restore --from <snapshot file>, then serve's flags: a new cluster of one, this node
   snapshot --admin <addr>
@@ -105,12 +110,31 @@ const USAGE: &str = "usage:
   activate --admin <addr> [--protocol <n>] [--service <n>]
 an operator's command, over TLS: [--tls-ca <pem> --tls-cert <pem> --tls-key <pem>]";
 
-/// Runs the command line for a node of `service`, which serves cluster `service_id`.
+/// Runs the command line for a node of `service`, which serves cluster `service_id`, with
+/// [`NodeConfig::new`](crate::NodeConfig::new)'s defaults: [`run_with`] to change them.
 #[must_use]
 pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
+    run_with(service_id, service, |_| {})
+}
+
+/// As [`run`], with `configure` changing a node's configuration before it serves: the settings
+/// that are the service's to choose, such as [`NodeConfig::session_timeout`] or
+/// [`NodeConfig::egress_ring_entries`]. `serve`'s own flags (`--election-timeout`, `--heartbeat`,
+/// `--keep-snapshots`, `--fsync`) apply after it, for what an operator chooses for a deployment.
+///
+/// [`NodeConfig::session_timeout`]: crate::NodeConfig::session_timeout
+/// [`NodeConfig::egress_ring_entries`]: crate::NodeConfig::egress_ring_entries
+#[must_use]
+pub fn run_with<S: Service + 'static>(
+    service_id: u32,
+    service: S,
+    configure: impl FnOnce(&mut driver::Config),
+) -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("serve") => serve_config(&args[1..], service_id).and_then(|mut config| {
+            configure(&mut config);
+            tune(&args[1..], &mut config)?;
             (config.admin_token, config.peer_token) = (token(ADMIN_TOKEN)?, token(PEER_TOKEN)?);
             if config.admin_token.is_none() && config.tls.is_none() {
                 eprintln!("warning: {ADMIN_TOKEN} isn't set, so anyone who can reach the admin listener can run it");
@@ -289,16 +313,12 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
             .collect()
     };
     let mut node = node::Config::new(id, members);
-    if args.iter().any(|a| a == "--keep-snapshots") {
-        let kept = flag(args, "--keep-snapshots")?.parse().ok().filter(|&n| n > 0);
-        node.snapshots_kept = kept.ok_or("--keep-snapshots: a number from 1")?;
-    }
     node.raft.seed ^= nanos(std::time::UNIX_EPOCH.elapsed().unwrap_or_default());
     Ok(driver::Config {
         node,
         service_id,
         data_dir: flag(args, "--data")?.into(),
-        log_fsync: if args.iter().any(|a| a == "--fsync") { driver::Fsync::EachBatch } else { driver::Fsync::Never },
+        log_fsync: driver::Fsync::Never,
         client_listen: own(&clients),
         admin_listen: own(&admins),
         peer_addrs: peers,
@@ -313,6 +333,36 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
             },
         ),
     })
+}
+
+/// `serve`'s flags for what an operator tunes, over `config`, which [`run_with`]'s closure may
+/// have changed; then checks the timing makes sense, which Raft would otherwise panic at.
+fn tune(args: &[String], config: &mut driver::Config) -> Result<(), String> {
+    let given = |name: &str| args.iter().any(|a| a == name);
+    let number = |name: &str| -> Result<u64, String> {
+        flag(args, name)?.parse().ok().filter(|&n| n > 0).ok_or_else(|| format!("{name}: a number from 1"))
+    };
+    let node = &mut config.node;
+    if given("--election-timeout") {
+        node.raft.election_timeout = Duration::from_millis(number("--election-timeout")?);
+    }
+    if given("--heartbeat") {
+        node.raft.heartbeat = Duration::from_millis(number("--heartbeat")?);
+    }
+    if given("--keep-snapshots") {
+        node.snapshots_kept = usize::try_from(number("--keep-snapshots")?).map_err(|_| "--keep-snapshots: too many")?;
+    }
+    if given("--fsync") {
+        config.log_fsync = driver::Fsync::EachBatch;
+    }
+    let (timeout, heartbeat) = (node.raft.election_timeout, node.raft.heartbeat);
+    if heartbeat * 2 >= timeout || timeout >= raft::MAX_TIMEOUT {
+        return Err(format!(
+            "an election timeout of {timeout:?} and heartbeat of {heartbeat:?}: the heartbeat must be under half the \
+             timeout, and the timeout under a year"
+        ));
+    }
+    Ok(())
 }
 
 /// The values of the TLS flags `names`: all of them, or none for no TLS.
@@ -391,8 +441,39 @@ fn members(list: &str) -> Result<Vec<(NodeId, SocketAddr)>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{learners, tls_flags};
+    use std::time::Duration;
+
+    use super::{learners, serve_config, tls_flags, tune};
+    use crate::driver::Fsync;
     use crate::raft::NodeId;
+
+    /// The operator's flags override what the service set, and timing that would make Raft panic
+    /// is refused.
+    #[test]
+    fn serve_flags_tune_over_the_service_and_are_checked() {
+        let args = |extra: &[&str]| {
+            let base = ["--id", "1", "--data", "d", "--peers", "1=127.0.0.1:1", "--clients", "1=127.0.0.1:2"];
+            base.iter().chain(&["--admin", "1=127.0.0.1:3"]).chain(extra).map(|&s| s.to_owned()).collect::<Vec<_>>()
+        };
+        let tuned = |extra: &[&str]| {
+            let args = args(extra);
+            let mut config = serve_config(&args, 7).unwrap();
+            // As a service's `run_with` might.
+            config.node.raft.election_timeout = Duration::from_secs(2);
+            tune(&args, &mut config).map(|()| config)
+        };
+        let config = tuned(&[]).unwrap();
+        assert_eq!((config.node.raft.election_timeout, config.node.snapshots_kept), (Duration::from_secs(2), 1));
+        assert_eq!(config.log_fsync, Fsync::Never);
+        let config = tuned(&["--election-timeout", "900", "--heartbeat", "100", "--keep-snapshots", "3", "--fsync"]);
+        let config = config.unwrap();
+        assert_eq!(config.node.raft.election_timeout, Duration::from_millis(900));
+        assert_eq!((config.node.raft.heartbeat, config.node.snapshots_kept), (Duration::from_millis(100), 3));
+        assert_eq!(config.log_fsync, Fsync::EachBatch);
+        assert!(tuned(&["--heartbeat", "1000"]).is_err(), "a heartbeat not under half the timeout");
+        assert!(tuned(&["--election-timeout", "0"]).is_err());
+        assert!(tuned(&["--keep-snapshots", "x"]).is_err());
+    }
 
     /// All the TLS flags or none; one without its value is refused, never read as no TLS.
     #[test]

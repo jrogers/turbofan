@@ -54,7 +54,7 @@ pub mod raft;
 #[doc(hidden)]
 pub mod snapshot;
 
-pub use cli::run;
+pub use cli::{run, run_with};
 pub use node::{
     Config as NodeConfig, Ctx, Effect, MAX_EGRESS_RING, MAX_PRINCIPAL_BYTES, MAX_SESSIONS, PROTOCOL, PayloadTooLong,
     Service, SessionId, SnapshotWriter,
