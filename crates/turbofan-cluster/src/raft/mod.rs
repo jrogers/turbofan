@@ -441,6 +441,9 @@ pub struct Raft {
     votes: Vec<NodeId>,
     /// How many of `votes` are in doubt: winning takes one more for each.
     doubted: usize,
+    /// The pre-vote under way: when it started, which is never the same twice, nor before a
+    /// restart, since the time never goes backwards.
+    round: u64,
     /// In doubt since restarting in this term ([`Entries::doubt`]).
     doubt: Option<u64>,
     election_at: u64,
@@ -523,6 +526,7 @@ impl Raft {
             peers: Vec::new(),
             votes: Vec::new(),
             doubted: 0,
+            round: 0,
             doubt,
             election_at: 0,
             heartbeat_at: 0,

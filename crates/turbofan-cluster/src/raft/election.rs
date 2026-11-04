@@ -31,7 +31,8 @@ impl Raft {
             granted
         };
         let doubt = u8::from(self.doubt.is_some());
-        let vote = wire::Vote { term: self.meta.term, granted: u8::from(granted), pre_vote: u8::from(pre_vote), doubt };
+        let (term, granted, pre_vote) = (self.meta.term, u8::from(granted), u8::from(pre_vote));
+        let vote = wire::Vote { term, granted, pre_vote, doubt, round: m.round().unwrap_or(0) };
         self.send(from, &vote);
     }
 
@@ -41,7 +42,8 @@ impl Raft {
             return;
         }
         let counts = match self.role {
-            Role::PreCandidate => m.pre_vote() == 1,
+            // An older node's, without a round, counts in any.
+            Role::PreCandidate => m.pre_vote() == 1 && m.round().is_none_or(|round| round == self.round),
             Role::Candidate => m.pre_vote() == 0 && m.term() == self.meta.term,
             Role::Follower | Role::Leader => false,
         };
@@ -66,12 +68,15 @@ impl Raft {
         self.votes = if self.is_voter(self.config.id) { vec![self.config.id] } else { Vec::new() };
         self.doubted = usize::from(self.doubt.is_some() && !self.votes.is_empty());
         self.reset_election(now);
+        assert!(now > self.round || self.round == 0, "a pre-vote round named twice");
+        self.round = now;
         let request = wire::RequestVote {
             term: self.meta.term + 1,
             candidate: self.config.id.0,
             last_index: self.last_index(),
             last_term: self.last_term(),
             pre_vote: 1,
+            round: now,
         };
         for i in 0..self.peers.len() {
             self.send(self.peers[i].id, &request);
@@ -95,6 +100,7 @@ impl Raft {
             last_index: self.last_index(),
             last_term: self.last_term(),
             pre_vote: 0,
+            round: 0,
         };
         for i in 0..self.peers.len() {
             self.send(self.peers[i].id, &request);

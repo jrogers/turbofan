@@ -3,7 +3,7 @@
      Every frame is a u32 length and one of these messages. Services' own payloads are opaque
      `payload` bytes here; each service has a schema of its own. Change it only as WIRE.md says:
      old and new nodes run side by side. -->
-<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="4"
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="5"
                    byteOrder="littleEndian">
     <types>
         <composite name="messageHeader">
@@ -73,21 +73,27 @@
     </sbe:message>
 
     <!-- Peer to peer. -->
+    <!-- `round`: which of the candidate's pre-votes this is, for the `Vote` to echo. Absent from an
+         older node. -->
     <sbe:message name="RequestVote" id="10">
         <field name="term" id="1" type="uint64"/>
         <field name="candidate" id="2" type="uint8"/>
         <field name="lastIndex" id="3" type="uint64"/>
         <field name="lastTerm" id="4" type="uint64"/>
         <field name="preVote" id="5" type="uint8"/>
+        <field name="round" id="6" type="uint64" sinceVersion="5"/>
     </sbe:message>
     <!-- `doubt`: the voter's log dropped a damaged tail, which may have held entries it
          acknowledged, and it hasn't caught up since: an election counting its vote needs one more.
-         Absent from an older node, which never doubts. -->
+         Absent from an older node, which never doubts. `round`: the request's, so a pre-vote
+         delayed past the round it answers doesn't count in a later one. Absent from an older node,
+         whose pre-vote counts in any round, as before. -->
     <sbe:message name="Vote" id="11">
         <field name="term" id="1" type="uint64"/>
         <field name="granted" id="2" type="uint8"/>
         <field name="preVote" id="3" type="uint8"/>
         <field name="doubt" id="4" type="uint8" sinceVersion="1"/>
+        <field name="round" id="5" type="uint64" sinceVersion="5"/>
     </sbe:message>
     <!-- `entries` is `count` log records, as stored. None is a heartbeat. `lastIndex`: the
          leader's, so a follower in doubt knows when it has the leader's whole log. Absent from an

@@ -8,6 +8,10 @@ a patch version (0.1.1) doesn't.
 
 ### Fixed
 
+- A pre-vote granted in an earlier round counted in a later one, so one delayed past an election
+  timeout could let a node cut off from the leader win a pre-vote, then depose it. `RequestVote`
+  names its round and `Vote` echoes it (schema version 5); a vote from an older node, without
+  one, counts as before.
 - Connections idle after their hello were kept for ever, and as many as came, so they could use
   up a node's file descriptors. A client connection silent for `session_timeout` is closed (its
   session is gone by then), and each listener keeps at most so many at once: `MAX_SESSIONS`

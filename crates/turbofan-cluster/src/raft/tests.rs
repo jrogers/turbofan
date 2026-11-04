@@ -200,7 +200,7 @@ fn an_earlier_terms_entry_does_not_commit_by_counting_replicas() {
 fn a_vote_is_persisted_in_the_batch_that_grants_it() {
     let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 4, vote: None }, None, entries(&[1]), 0);
     let mut frame = Vec::new();
-    let request = wire::RequestVote { term: 5, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0 };
+    let request = wire::RequestVote { term: 5, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0, round: 0 };
     codec::encode_frame(&request, &mut frame).unwrap();
     raft.on_message(NodeId(2), &decode(&frame), 0);
     let out = raft.take_outputs();
@@ -209,7 +209,7 @@ fn a_vote_is_persisted_in_the_batch_that_grants_it() {
     assert_eq!((vote.term(), vote.granted()), (5, 1));
 
     // And not again to someone else in the term.
-    let request = wire::RequestVote { term: 5, candidate: 3, last_index: 1, last_term: 1, pre_vote: 0 };
+    let request = wire::RequestVote { term: 5, candidate: 3, last_index: 1, last_term: 1, pre_vote: 0, round: 0 };
     frame.clear();
     codec::encode_frame(&request, &mut frame).unwrap();
     raft.on_message(NodeId(3), &decode(&frame), 0);
@@ -226,7 +226,7 @@ fn a_node_that_knows_no_members_doesnt_vote() {
     let mut raft = Raft::new(config(3, &[]), Meta::default(), None, Entries::default(), 0);
     for pre_vote in [1, 0] {
         let mut frame = Vec::new();
-        let request = wire::RequestVote { term: 5, candidate: 1, last_index: 9, last_term: 4, pre_vote };
+        let request = wire::RequestVote { term: 5, candidate: 1, last_index: 9, last_term: 4, pre_vote, round: 0 };
         codec::encode_frame(&request, &mut frame).unwrap();
         raft.on_message(NodeId(1), &decode(&frame), 0);
         let out = raft.take_outputs();
@@ -295,19 +295,52 @@ fn a_node_in_doubt_trusts_its_log_once_it_has_the_leaders_whole_log() {
 #[test]
 fn each_voter_in_doubt_takes_one_more_vote() {
     let mut raft = Raft::new(config(1, &[1, 2, 3, 4, 5]), Meta { term: 1, vote: None }, None, entries(&[1]), 0);
-    raft.on_tick(raft.next_deadline());
+    let round = raft.next_deadline();
+    raft.on_tick(round);
     raft.take_outputs();
     assert_eq!(raft.role(), Role::PreCandidate);
     for (from, doubt) in [(2, 1), (3, 1), (4, 0)] {
         let mut frame = Vec::new();
-        codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt }, &mut frame).unwrap();
+        codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt, round }, &mut frame).unwrap();
         raft.on_message(NodeId(from), &decode(&frame), 0);
     }
     assert_eq!(raft.role(), Role::PreCandidate, "four of five, two in doubt");
     let mut frame = Vec::new();
-    codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt: 0 }, &mut frame).unwrap();
+    codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt: 0, round }, &mut frame).unwrap();
     raft.on_message(NodeId(5), &decode(&frame), 0);
     assert_eq!(raft.role(), Role::Candidate, "every member");
+}
+
+/// A pre-vote delayed past its round doesn't count in the next: granted while no leader was
+/// heard, it would let a node cut off from one depose it. An older node's, with no round, counts.
+#[test]
+fn a_pre_vote_counts_only_in_its_own_round() {
+    let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 1, vote: None }, None, entries(&[1]), 0);
+    let first = raft.next_deadline();
+    raft.on_tick(first);
+    let second = raft.next_deadline();
+    raft.on_tick(second);
+    let requests = raft.take_outputs().sends;
+    assert_eq!(requests.len(), 4, "two rounds of two");
+    let wire::Decoded::RequestVote(request) = decode(&requests[3].1) else { panic!() };
+    assert_eq!((request.pre_vote(), request.round()), (1, Some(second)));
+    let vote = |round| {
+        let mut frame = Vec::new();
+        codec::encode_frame(&wire::Vote { term: 1, granted: 1, pre_vote: 1, doubt: 0, round }, &mut frame).unwrap();
+        frame
+    };
+    raft.on_message(NodeId(2), &decode(&vote(first)), second);
+    assert_eq!(raft.role(), Role::PreCandidate, "the first round's");
+    // Cut to before `round`, as an older node sends it.
+    let mut older = vote(second);
+    older.truncate(older.len() - 8);
+    let len = u32::try_from(older.len() - 4).unwrap();
+    older[..4].copy_from_slice(&len.to_le_bytes());
+    let block_len = u16::from_le_bytes([older[4], older[5]]) - 8;
+    older[4..6].copy_from_slice(&block_len.to_le_bytes());
+    older[10..12].copy_from_slice(&4_u16.to_le_bytes());
+    raft.on_message(NodeId(2), &decode(&older), second);
+    assert_eq!(raft.role(), Role::Candidate, "an older node's");
 }
 
 /// A vote from a node in doubt says so; an older node's, without the field, doesn't.
@@ -317,7 +350,7 @@ fn a_vote_from_a_node_in_doubt_says_so() {
     log.doubt();
     let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 1, vote: None }, None, log, 0);
     let mut frame = Vec::new();
-    let request = wire::RequestVote { term: 2, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0 };
+    let request = wire::RequestVote { term: 2, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0, round: 0 };
     codec::encode_frame(&request, &mut frame).unwrap();
     raft.on_message(NodeId(2), &decode(&frame), 0);
     let out = raft.take_outputs();
@@ -341,7 +374,7 @@ fn a_vote_is_refused_to_a_candidate_with_an_older_log() {
     let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 2, vote: None }, None, entries(&[1, 2]), 0);
     for (last_index, last_term) in [(1, 2), (5, 1)] {
         let mut frame = Vec::new();
-        let request = wire::RequestVote { term: 3, candidate: 2, last_index, last_term, pre_vote: 0 };
+        let request = wire::RequestVote { term: 3, candidate: 2, last_index, last_term, pre_vote: 0, round: 0 };
         codec::encode_frame(&request, &mut frame).unwrap();
         raft.on_message(NodeId(2), &decode(&frame), 0);
         let out = raft.take_outputs();
