@@ -1,12 +1,12 @@
 # Turbofan style
 
-How Turbofan is written, and why. It is Turbojet's style guide adapted to this repository. Both
-borrow from TigerBeetle's [Tiger Style](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md),
+How Turbofan is written, and why. It borrows from TigerBeetle's
+[Tiger Style](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md),
 which applies NASA's [Power of Ten](https://spinroot.com/gerard/pdf/P10.pdf) rules to a
 database. The last section says where Turbofan departs from Tiger Style, and why.
 
-Turbofan replicates a service's state across a cluster, and an OMS runs on it. A bug in it can
-apply an order twice, lose one that was acknowledged, or let two leaders take orders. So the
+Turbofan replicates a service's state across a cluster. A bug in it can apply a message twice,
+lose one that was acknowledged, or let two leaders take messages at once. So the
 priorities, in order, are **safety, performance and developer experience**. Where they conflict,
 safety wins. Mostly they don't: simple code tends to be easier to make correct, to make fast and
 to read.
@@ -156,7 +156,7 @@ points come before the helpers.
 
 ## Where Turbofan differs from Tiger Style, and why
 
-- **120 columns, not 100.** rustfmt enforces 120, as in Turbojet. Prose and comments wrap at
+- **120 columns, not 100.** rustfmt enforces 120. Prose and comments wrap at
   about 100.
 - **`usize` for indexing.** Tiger Style avoids architecture-sized integers. Rust indexes with
   `usize`, so Turbofan uses it for indices and lengths in memory, and fixed-size types for
