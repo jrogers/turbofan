@@ -14,7 +14,7 @@ Nodes and clients run on [tokio](https://docs.rs/tokio):
 
 ```toml
 [dependencies]
-turbofan-cluster = "0.1"
+turbofan-cluster = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
