@@ -440,7 +440,12 @@ fn a_promoted_learner_names_a_new_epoch() {
     config.raft.members = vec![member(1), Member { learner: true, ..member(2) }];
     let mut node = Node::new(config, Recorder::default(), Meta::default(), None, Entries::default(), 0);
     node.state.epoch = 5;
+    // Asked first on a connection that then dropped: answered on the one it's asked again on.
+    let mut frame = Vec::new();
+    codec::encode_frame(&wire::Promote { request_id: 9 }, &mut frame).unwrap();
+    node.on_admin(98, &codec::decode_frame(&frame).unwrap().unwrap().0, 1_000_000_000);
     let answer = promote(&mut node);
+    assert!(answer.starts_with("99: ") && !answer.contains("index: 0,"), "{answer}");
     assert!(node.is_ready(), "it leads");
     assert_ne!(node.epoch(), 5, "a new epoch");
     let promoted = format!("index: {}, epoch: {}", node.applied() - 1, node.epoch());
@@ -570,10 +575,12 @@ fn an_operator_snapshot_is_answered_once_durable() {
 /// once, on the new connection: not ignored as one already under way.
 #[test]
 fn a_request_sent_again_is_answered_on_the_new_connection() {
-    let (mut snapshot, mut shutdown) = (Vec::new(), Vec::new());
+    let (mut snapshot, mut shutdown, mut activate) = (Vec::new(), Vec::new(), Vec::new());
     codec::encode_frame(&wire::SnapshotRequest { request_id: 42 }, &mut snapshot).unwrap();
     codec::encode_frame(&wire::Shutdown { request_id: 43 }, &mut shutdown).unwrap();
-    for (frame, answer) in [(snapshot, "SnapshotTaken"), (shutdown, "ShutDown")] {
+    let versions = wire::Activate { request_id: 44, protocol: PROTOCOL, service_version: 0 };
+    codec::encode_frame(&versions, &mut activate).unwrap();
+    for (frame, answer) in [(snapshot, "SnapshotTaken"), (shutdown, "ShutDown"), (activate, "Activation")] {
         let mut node = leader();
         for conn in [99, 100] {
             node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
@@ -581,7 +588,21 @@ fn a_request_sent_again_is_answered_on_the_new_connection() {
         let sent = drive(&mut node);
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert!(sent[0].starts_with("100: ") && sent[0].contains(answer), "{sent:?}");
+        assert!(!sent[0].contains("index: 0,"), "not refused: {sent:?}");
     }
+
+    // A change of members sent again isn't refused as one already under way.
+    let mut node = leader();
+    let m = member(2);
+    let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
+    let mut add = Vec::new();
+    codec::encode_frame(&wire::AddMember { request_id: 45, id: 2, learner: 1, peer, client, admin }, &mut add).unwrap();
+    for conn in [99, 100] {
+        node.on_admin(conn, &codec::decode_frame(&add).unwrap().unwrap().0, 0);
+    }
+    let sent = drive(&mut node);
+    assert!(!sent.iter().any(|s| s.contains("MembersRefused")), "{sent:?}");
+    assert_eq!(node.local.changing.map(|(conn, id, _)| (conn, id)), Some((100, 45)), "under way, for 100");
 }
 
 /// A connection that opens a second session leaves the first for its client to reattach to; one
