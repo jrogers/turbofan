@@ -3,7 +3,7 @@
      Every frame is a u32 length and one of these messages. Services' own payloads are opaque
      `payload` bytes here; each service has a schema of its own. Change it only as WIRE.md says:
      old and new nodes run side by side. -->
-<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="3"
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="4"
                    byteOrder="littleEndian">
     <types>
         <composite name="messageHeader">
@@ -47,6 +47,10 @@
             <validValue name="NoSession">4</validValue>
             <!-- The service didn't accept the credentials. -->
             <validValue name="Refused">5</validValue>
+            <!-- The client's own, never sent: the cluster it reattached to has less of the
+                 session than it saw (a standby promoted without all of it), so it closed the
+                 session. -->
+            <validValue name="Diverged">6</validValue>
         </enum>
     </types>
 
@@ -174,9 +178,12 @@
         <field name="leader" id="1" type="uint8"/>
         <data name="addr" id="2" type="addrData"/>
     </sbe:message>
+    <!-- `lastEgressSeq`: the session's last response. A client that knows of more applied than
+         `appliedSeq`, or has seen more responses, has seen what this cluster lost. -->
     <sbe:message name="Opened" id="31">
         <field name="session" id="1" type="uint64"/>
         <field name="appliedSeq" id="2" type="uint64"/>
+        <field name="lastEgressSeq" id="3" type="uint64" sinceVersion="4"/>
     </sbe:message>
     <sbe:message name="Egress" id="32">
         <field name="session" id="1" type="uint64"/>

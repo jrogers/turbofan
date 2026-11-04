@@ -99,4 +99,6 @@ The new cluster has a new epoch, which every hello carries: the old cluster's no
 back, can't talk to it. It grows with `add-member` as any cluster does. Sessions are replicated,
 so clients reattach to it and resend what it hasn't applied. What the old cluster committed past
 what the learner had is lost: count it from the old leader's commit index and the learner's last
-index, from `status` before the loss, or the metrics. Keep the learner close: watch its lag.
+index, from `status` before the loss, or the metrics. A client whose messages or responses were among it
+closes its session, `CloseReason::Diverged` (see [Clients][clients]), to open another and ask the
+service what it has. Keep the learner close: watch its lag.

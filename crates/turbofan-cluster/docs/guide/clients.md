@@ -88,6 +88,11 @@ A session is the unit of the guarantee. It ends when:
 - **The service refuses its credentials**: `CloseReason::Refused`, with no session opened. A
   cluster at `MAX_SESSIONS` refuses with `CloseReason::NoSession`, which is also the answer to
   reattaching to a session that has since closed.
+- **The client reattaches to a cluster that has less of the session than it saw**: messages it
+  knew applied, or responses, that a standby promoted without all of it lost (see
+  [Members][membership]). It can't resend messages it had let go of, nor the cluster the
+  responses again, so it closes the session, with `CloseReason::Diverged`; `unapplied` counts
+  the messages the new cluster never applied.
 
 And within a session, responses can be lost: the cluster keeps `egress_ring_entries` (8192 by
 default) for each session, so a client away while more were sent misses some. It gets

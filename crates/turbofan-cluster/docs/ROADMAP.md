@@ -38,12 +38,11 @@ are a snapshot. Nodes report through the
   returns once it's within `n` entries. A snapshot keeps a tail of the log before it, so a
   learner briefly cut off is sent the entries it missed rather than the whole snapshot, and
   `set-role` makes a learner a voter, or a voter a learner, in place. Left:
-  - *Clients:* the hello tells them the epoch, which they don't check yet. Sessions are
-    replicated, so clients reattach to the promoted cluster and resend what it hasn't applied.
-    What committed but never reached the learner is lost, and clients can't always tell: a
-    response they'd seen means its `egressSeq` is reused, and the new response is dropped as
-    seen. An operator can count the loss from the old leader's commit index and the learner's
-    last index.
+  - *Clients:* sessions are replicated, so clients reattach to the promoted cluster and resend
+    what it hasn't applied. A client whose messages or responses the learner lost (`Opened`'s
+    `appliedSeq` or `lastEgressSeq` behind what it saw) closes its session,
+    `CloseReason::Diverged`, rather than go on with a gap. An operator can count the loss from
+    the old leader's commit index and the learner's last index.
 
   A cluster stretched over three regions would fail over by itself and lose nothing, but every
   commit would wait a round trip between regions.

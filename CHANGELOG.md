@@ -6,7 +6,23 @@ a patch version (0.1.1) doesn't.
 
 ## Unreleased
 
-Documentation only: examples on `Service`, `Ctx` and `ClusterClient`.
+### Breaking
+
+- `CloseReason` has a new value, `Diverged`: a `match` on it without a wildcard needs an arm for it.
+
+### Fixed
+
+- A client that reattached to a promoted standby missing some of the session was stuck. Lost
+  messages it had let go of once applied, so it couldn't resend them, and the cluster dropped
+  every later one as out of order; lost responses made the cluster reuse their `egressSeq`, and
+  the client dropped every later one as seen. It now closes the session, with `Event::Closed`
+  and `CloseReason::Diverged`, counting what the new cluster never applied in `unapplied`.
+  `Opened` carries the session's last `egressSeq` for it (schema version 4): from an older node,
+  only lost messages are caught.
+
+### Docs
+
+- Examples on `Service`, `Ctx` and `ClusterClient`.
 
 ## 0.1.1 (2026-11-03)
 

@@ -34,9 +34,12 @@ pub enum Event {
     },
     /// The session closed. Messages not yet applied (`unapplied` of them) never will be.
     Closed {
-        /// Why.
+        /// Why. [`CloseReason::Diverged`] is the client's own: it reattached to a cluster that has
+        /// less of the session than it saw, messages applied or responses (a standby promoted
+        /// without all of it).
         reason: CloseReason,
-        /// Sent but not applied.
+        /// Sent but not applied: for `Diverged`, not applied by the cluster it reattached to,
+        /// which counts what that cluster lost.
         unapplied: usize,
     },
 }
@@ -215,6 +218,21 @@ impl Client {
                     None => ((self.target + 1) % self.addrs.len(), Some(Reconnect::Later)),
                 };
             }
+            // Has less of the session than it saw: a standby promoted without all of it (a leader
+            // of the same cluster takes clients only once it has all its predecessors applied).
+            // Messages it lost can't be resent (they're let go of once applied), and later ones
+            // would wait on them for ever; responses would be dropped as seen. The session's
+            // guarantees are over, so it's closed. An older node doesn't say its last response.
+            wire::Decoded::Opened(m)
+                if m.applied_seq() < self.applied || m.last_egress_seq().is_some_and(|e| e < self.last_egress) =>
+            {
+                self.frame(&wire::Close { session: m.session() });
+                self.open = false;
+                self.closed = true;
+                self.unacked.clear();
+                let unapplied = usize::try_from(self.next_seq - 1 - m.applied_seq()).unwrap_or(usize::MAX);
+                self.events.push_back(Event::Closed { reason: CloseReason::Diverged, unapplied });
+            }
             wire::Decoded::Opened(m) => {
                 self.session = Some(SessionId(m.session()));
                 self.open = true;
@@ -237,7 +255,7 @@ impl Client {
                 self.events.push_back(Event::Message(m.payload().to_vec()));
             }
             wire::Decoded::KeepAliveAck(m) => self.trim(m.applied_seq()),
-            wire::Decoded::Closed(m) if self.session.is_none_or(|s| s == SessionId(m.session())) => {
+            wire::Decoded::Closed(m) if !self.closed && self.session.is_none_or(|s| s == SessionId(m.session())) => {
                 self.open = false;
                 self.closed = true;
                 let unapplied = self.unacked.len();
@@ -337,4 +355,94 @@ fn push_frame(frames: &mut Vec<Vec<u8>>, message: &impl turbofan_sbe::Encode) {
     let mut frame = Vec::new();
     codec::encode_frame(message, &mut frame).expect("client messages are within their limits");
     frames.push(frame);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(message: &impl turbofan_sbe::Encode) -> Vec<u8> {
+        let mut frame = Vec::new();
+        codec::encode_frame(message, &mut frame).unwrap();
+        frame
+    }
+
+    fn deliver(client: &mut Client, frame: &[u8]) {
+        let (decoded, _) = codec::decode_frame(frame).unwrap().unwrap();
+        client.on_frame(&decoded);
+    }
+
+    /// A client with session 9 open, four messages sent, three of them applied and two responses
+    /// seen, reconnected: then given `opened`, what a standby promoted with some of that says.
+    fn reattached_to(opened: &[u8]) -> Client {
+        let mut client = Client::new(["a", "b"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
+        client.on_connected(0);
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0 }));
+        for _ in 0..4 {
+            client.send(b"order".to_vec()).unwrap();
+        }
+        for egress_seq in 1..=2 {
+            deliver(&mut client, &frame(&wire::Egress { session: 9, egress_seq, applied_seq: 3, payload: b"fill" }));
+        }
+        client.on_disconnected();
+        client.on_connected(1);
+        while client.poll_event().is_some() {}
+        client.take_frames();
+        deliver(&mut client, opened);
+        client
+    }
+
+    fn opened(applied_seq: u64, last_egress_seq: u64) -> Vec<u8> {
+        frame(&wire::Opened { session: 9, applied_seq, last_egress_seq })
+    }
+
+    /// A cluster with everything the client saw carries the session on, and is sent what it
+    /// hasn't applied.
+    #[test]
+    fn a_cluster_with_all_of_the_session_carries_it_on() {
+        let mut client = reattached_to(&opened(3, 2));
+        assert_eq!(client.poll_event(), Some(Event::Opened(SessionId(9))));
+        assert_eq!(client.take_frames().len(), 1, "the fourth, resent");
+        assert!(client.send(b"order".to_vec()).is_ok());
+    }
+
+    /// One that has applied fewer of its messages (a standby promoted without all of it) closes
+    /// the session: the client has let go of what it lost, and couldn't resend it.
+    #[test]
+    fn a_cluster_missing_messages_closes_the_session() {
+        let mut client = reattached_to(&opened(1, 2));
+        assert_eq!(client.poll_event(), Some(Event::Closed { reason: CloseReason::Diverged, unapplied: 3 }));
+        let frames = client.take_frames();
+        assert_eq!(frames.len(), 1);
+        let (close, _) = codec::decode_frame(&frames[0]).unwrap().unwrap();
+        assert!(matches!(close, wire::Decoded::Close(c) if c.session() == 9), "only a close");
+        assert_eq!(client.send(b"order".to_vec()), Err(SendError::Closed));
+        // The cluster closing it in turn says nothing new.
+        deliver(&mut client, &frame(&wire::Closed { session: 9, reason: CloseReason::Client }));
+        assert_eq!(client.poll_event(), None);
+    }
+
+    /// So does one missing responses the client saw: its next ones would reuse their
+    /// `egress_seq`, and be dropped as seen.
+    #[test]
+    fn a_cluster_missing_responses_closes_the_session() {
+        let mut client = reattached_to(&opened(3, 1));
+        assert_eq!(client.poll_event(), Some(Event::Closed { reason: CloseReason::Diverged, unapplied: 1 }));
+    }
+
+    /// An older node's `Opened` (version 3) doesn't say the last response: only what's applied
+    /// is checked.
+    #[test]
+    fn an_older_nodes_opened_is_checked_for_messages_only() {
+        let mut older = opened(3, 1);
+        // Without `lastEgressSeq`, the block's last 8 bytes, and saying version 3, as an older
+        // node writes it.
+        older.truncate(older.len() - 8);
+        let len = u32::try_from(older.len() - 4).unwrap();
+        older[..4].copy_from_slice(&len.to_le_bytes());
+        older[4..6].copy_from_slice(&16_u16.to_le_bytes());
+        older[10..12].copy_from_slice(&3_u16.to_le_bytes());
+        let mut client = reattached_to(&older);
+        assert_eq!(client.poll_event(), Some(Event::Opened(SessionId(9))), "a lost response it can't tell");
+    }
 }

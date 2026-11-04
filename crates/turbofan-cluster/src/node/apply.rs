@@ -156,7 +156,7 @@ impl<S: Service> Node<S> {
         if let Some(conn) = self.local.opening.remove(&session) {
             self.local.conns.insert(conn, Some(session));
             self.local.attached.insert(session, conn);
-            self.send_client(conn, &wire::Opened { session: session.0, applied_seq: 0 });
+            self.send_client(conn, &wire::Opened { session: session.0, applied_seq: 0, last_egress_seq: 0 });
         }
         if self.local.was_leader {
             self.local.activity.insert(session, self.now);

@@ -39,9 +39,9 @@ impl<S: Service> Node<S> {
         }
         self.local.conns.insert(conn, Some(session));
         self.local.activity.insert(session, self.now);
-        let applied_seq = s.last_seq;
+        let (applied_seq, last) = (s.last_seq, s.next_egress - 1);
         let replay: Vec<(u64, Vec<u8>)> = s.ring.iter().filter(|(seq, _)| *seq > last_egress_seq).cloned().collect();
-        self.send_client(conn, &wire::Opened { session: session.0, applied_seq });
+        self.send_client(conn, &wire::Opened { session: session.0, applied_seq, last_egress_seq: last });
         for (egress_seq, payload) in replay {
             self.send_client(conn, &wire::Egress { session: session.0, egress_seq, applied_seq, payload: &payload });
         }
