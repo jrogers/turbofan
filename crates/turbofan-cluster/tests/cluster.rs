@@ -132,6 +132,17 @@ impl Cluster {
         assert!(node.await.unwrap_err().is_cancelled(), "node {} stopped on its own", i + 1);
     }
 
+    /// The nodes that stopped on their own, and why: for a test that timed out to say.
+    async fn stopped(&mut self) -> Vec<String> {
+        let mut stopped = Vec::new();
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            if node.as_ref().is_some_and(JoinHandle::is_finished) {
+                stopped.push(format!("node {}: {:?}", i + 1, node.take().unwrap().await));
+            }
+        }
+        stopped
+    }
+
     fn client_addrs(&self) -> Vec<String> {
         self.configs.iter().map(|c| c.client_listen.to_string()).collect()
     }
@@ -152,13 +163,7 @@ async fn exchange(cluster: &mut Cluster, client: &mut ClusterClient, from: u64, 
     let mut expected = from;
     while expected <= to {
         let Ok(event) = tokio::time::timeout(Duration::from_secs(20), client.recv()).await else {
-            let mut stopped = Vec::new();
-            for (i, node) in cluster.nodes.iter_mut().enumerate() {
-                if node.as_ref().is_some_and(JoinHandle::is_finished) {
-                    stopped.push(format!("node {}: {:?}", i + 1, node.take().unwrap().await));
-                }
-            }
-            panic!("{expected} not answered in time; stopped on their own: {stopped:?}");
+            panic!("{expected} not answered in time; stopped on their own: {:?}", cluster.stopped().await);
         };
         match event.expect("session open") {
             Event::Opened(_) => {}
@@ -246,7 +251,10 @@ async fn a_member_joins_and_another_leaves() {
         .with_token(TOKEN)
         .with_timeout(Duration::from_secs(20));
     let fourth = member(&cluster.addrs, NodeId(4));
-    let added = admin.add_member(&fourth).await.unwrap();
+    let added = match admin.add_member(&fourth).await {
+        Ok(index) => index,
+        Err(e) => panic!("adding node 4: {e:?}; stopped on their own: {:?}", cluster.stopped().await),
+    };
     exchange(&mut cluster, &mut client, 101, 200).await;
     // Asked again, as after a lost answer: answered as made, at the change or a snapshot since.
     // Elsewhere, refused.
@@ -280,6 +288,7 @@ async fn a_capture_replays_what_the_cluster_applied() {
     exchange(&mut cluster, &mut client, 101, 200).await;
 
     // Any member: the one asked answers, of what it knows committed, which may lag the leader's.
+    let mut sent = 200;
     let (captured, echoed, echo) = loop {
         let captured = admin(1).capture().await.unwrap();
         let mut echoed = Vec::new();
@@ -290,8 +299,14 @@ async fn a_capture_replays_what_the_cluster_applied() {
             }
         })
         .unwrap();
-        if replayed.last.values().any(|&k| k == 200) {
-            break (captured, echoed, replayed);
+        if replayed.last.values().any(|&k| k == sent) {
+            if !echoed.is_empty() {
+                break (captured, echoed, replayed);
+            }
+            // Its latest snapshot took the last message, leaving the log nothing to replay: one
+            // more, for it to hold.
+            sent += 1;
+            exchange(&mut cluster, &mut client, sent, sent).await;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
@@ -299,7 +314,7 @@ async fn a_capture_replays_what_the_cluster_applied() {
     // From whichever snapshot is the node's latest (it takes its own every 50 entries): Echo
     // checks each message follows on from the state it restored.
     let first = echoed[0];
-    assert_eq!(echoed, (first..=200).collect::<Vec<_>>(), "echoed once each, in order");
+    assert_eq!(echoed, (first..=sent).collect::<Vec<_>>(), "echoed once each, in order");
     assert_eq!(echo.last.len(), 1, "one session");
 
     // Stopped short, at an entry before the last; past what's committed, refused.
