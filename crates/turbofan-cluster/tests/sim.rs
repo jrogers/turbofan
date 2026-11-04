@@ -31,7 +31,17 @@
 //! faults stop, it shuts the cluster down, and every member stops with the same snapshot; then
 //! they're all started again.
 //!
-//! The service is an echo with timers. Clients send numbered messages through failovers, and
+//! Then the cluster is lost, with the clients sending, and recovered as an operator would: by
+//! promoting a learner, cut off for a while first (as one in another region is) or not at all, or
+//! by restoring a copy of a snapshot taken a while before onto a node of its own. Each client
+//! either carries on, every message and response once and in order as before, or closes its
+//! session as `Diverged`, which it must exactly when the new cluster lacks some of what it saw:
+//! then it opens another, as a gateway would. One client goes idle shortly before, so the new
+//! cluster has all its messages, but perhaps not the notifications others' lost messages caused
+//! it: it diverges by its responses alone.
+//!
+//! The service is an echo with timers, which notifies the first session of some of the others'
+//! messages. Clients send numbered messages through failovers, and
 //! must see every message applied once and in order, every response once and in order, every
 //! timer fire once, and every message the service proposed applied once.
 
@@ -49,19 +59,24 @@ use turbofan_cluster::pipeline::{Batch, Pipeline};
 use turbofan_cluster::raft::{
     Entries, MAX_MEMBERS, MAX_READ_BYTES, Member, NodeId, Persist, Role, Snapshot, SnapshotRead,
 };
-use turbofan_cluster::{Ctx, Service, SessionId, SnapshotWriter, snapshot};
+use turbofan_cluster::{CloseReason, Ctx, Service, SessionId, SnapshotWriter, driver, snapshot};
 
 const MS: u64 = 1_000_000;
 /// Marks an admin request's ID as a `SetRole`'s, to count its answer.
 const ROLE_REQUEST: u64 = 1 << 63;
 const FAULT_PHASE: u64 = 20_000 * MS;
 const QUIET_PHASE: u64 = 10_000 * MS;
+/// After the cluster is recovered from its loss and the clients stop sending, for it to settle.
+const DISASTER_QUIET: u64 = 3000 * MS;
 const CLIENTS: usize = 3;
 /// Every this many messages, the echo service sets a timer.
 const TIMER_EVERY: u64 = 7;
 /// Every this many messages, the echo service proposes one of its own, which sends `p<k>`.
 const PROPOSE_EVERY: u64 = 5;
 const TIMER_SPACE: u64 = 1_000_000;
+/// Every this many messages, the echo service notifies the first session of it, `n<k>`: a
+/// response one session's message causes another, as an order's fill does.
+const NOTIFY_EVERY: u64 = 11;
 /// The admin's connection, which [`Sim::conns`] marks with this client index.
 const ADMIN: usize = usize::MAX;
 
@@ -99,6 +114,11 @@ fn simulate() {
         assert!(covered.torn > 0, "no crash tore an append");
         assert!(covered.rotten_records_found > 0, "no rotten record was found");
         assert!(covered.segments_compacted > 0, "no log segment was compacted");
+        assert!(covered.promotions > 0, "a lost cluster was never recovered by promotion");
+        assert!(covered.restores > 0, "a lost cluster was never restored from a snapshot");
+        assert!(covered.diverged > 0, "no client's session diverged");
+        assert!(covered.carried_on > 0, "no client carried on through a recovery");
+        assert!(covered.lost_responses > 0, "no client's session diverged by its responses alone");
     }
 }
 
@@ -120,6 +140,16 @@ struct Coverage {
     rotten_records_found: u64,
     /// Times a log's first segment was removed.
     segments_compacted: u64,
+    /// Lost clusters recovered by promoting a learner, and by restoring a snapshot.
+    promotions: u64,
+    restores: u64,
+    /// Clients that closed their sessions as `Diverged` on the recovered cluster, and that
+    /// carried on with them.
+    diverged: u64,
+    carried_on: u64,
+    /// Of those that diverged, ones whose cluster had all their messages, but not all the
+    /// responses they saw.
+    lost_responses: u64,
 }
 
 impl Coverage {
@@ -134,15 +164,23 @@ impl Coverage {
         self.torn += other.torn;
         self.rotten_records_found += other.rotten_records_found;
         self.segments_compacted += other.segments_compacted;
+        self.promotions += other.promotions;
+        self.restores += other.restores;
+        self.diverged += other.diverged;
+        self.carried_on += other.carried_on;
+        self.lost_responses += other.lost_responses;
     }
 }
 
-/// Echoes `a<k>` for message `k`, every [`TIMER_EVERY`]th sets a timer that sends `t<k>`, and
-/// every [`PROPOSE_EVERY`]th proposes a message of its own that sends `p<k>`.
+/// Echoes `a<k>` for message `k`, every [`TIMER_EVERY`]th sets a timer that sends `t<k>`,
+/// every [`PROPOSE_EVERY`]th proposes a message of its own that sends `p<k>`, and every
+/// [`NOTIFY_EVERY`]th of another session's notifies the first session, `n<k>`.
 /// Panics if a session's messages arrive other than once each, in order.
 #[derive(Debug, Default)]
 struct Echo {
     last: BTreeMap<SessionId, u64>,
+    /// Responses sent to each session: its last `egress_seq`, while it's open.
+    responses: BTreeMap<SessionId, u64>,
     fired: u64,
     /// Messages applied as version 1, which only new code has.
     as_new: u64,
@@ -153,7 +191,8 @@ struct Echo {
 /// The state, not which version of the code holds it.
 impl PartialEq for Echo {
     fn eq(&self, other: &Self) -> bool {
-        (&self.last, self.fired, self.as_new) == (&other.last, other.fired, other.as_new)
+        (&self.last, &self.responses, self.fired, self.as_new)
+            == (&other.last, &other.responses, other.fired, other.as_new)
     }
 }
 
@@ -178,9 +217,15 @@ impl Service for Echo {
         let last = self.last.entry(session).or_default();
         assert_eq!(k, *last + 1, "session {session}: message {k} applied after {last}");
         *last = k;
-        ctx.send(session, format!("a{k}").as_bytes()).unwrap();
+        self.send(ctx, session, format!("a{k}"));
         if k.is_multiple_of(PROPOSE_EVERY) {
             ctx.propose(format!("{session} {k}").as_bytes()).unwrap();
+        }
+        if k.is_multiple_of(NOTIFY_EVERY)
+            && let Some(&first) = self.last.keys().next()
+            && first != session
+        {
+            self.send(ctx, first, format!("n{k}"));
         }
         if k.is_multiple_of(TIMER_EVERY) {
             ctx.schedule_timer(session.0 * TIMER_SPACE + k, ctx.now() + 30 * MS);
@@ -190,22 +235,27 @@ impl Service for Echo {
     fn on_proposal(&mut self, ctx: &mut Ctx, payload: &[u8]) {
         let text = std::str::from_utf8(payload).unwrap();
         let (session, k) = text.split_once(' ').unwrap();
-        ctx.send(SessionId(session.parse().unwrap()), format!("p{k}").as_bytes()).unwrap();
+        self.send(ctx, SessionId(session.parse().unwrap()), format!("p{k}"));
     }
 
     fn on_timer(&mut self, ctx: &mut Ctx, id: u64) {
         self.fired += 1;
-        ctx.send(SessionId(id / TIMER_SPACE), format!("t{}", id % TIMER_SPACE).as_bytes()).unwrap();
+        self.send(ctx, SessionId(id / TIMER_SPACE), format!("t{}", id % TIMER_SPACE));
     }
 
+    /// Each session's last message and responses, and the two counts, as words.
     fn snapshot(&self) -> SnapshotWriter {
-        let (fired, as_new, last) = (self.fired, self.as_new, self.last.clone());
+        let (fired, as_new) = (self.fired, self.as_new);
+        let sessions: BTreeSet<SessionId> = self.last.keys().chain(self.responses.keys()).copied().collect();
+        let rows: Vec<[u64; 3]> = sessions
+            .into_iter()
+            .map(|s| [s.0, self.last.get(&s).copied().unwrap_or(0), self.responses.get(&s).copied().unwrap_or(0)])
+            .collect();
         Box::new(move |out| {
             out.write_all(&fired.to_le_bytes())?;
             out.write_all(&as_new.to_le_bytes())?;
-            for (session, last) in &last {
-                out.write_all(&session.0.to_le_bytes())?;
-                out.write_all(&last.to_le_bytes())?;
+            for word in rows.iter().flatten() {
+                out.write_all(&word.to_le_bytes())?;
             }
             Ok(())
         })
@@ -216,8 +266,17 @@ impl Service for Echo {
         from.read_to_end(&mut bytes)?;
         let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
         (self.fired, self.as_new) = (words[0], words[1]);
-        self.last = words[2..].as_chunks::<2>().0.iter().map(|&[session, last]| (SessionId(session), last)).collect();
+        let rows = words[2..].as_chunks::<3>().0;
+        self.last = rows.iter().filter(|r| r[1] > 0).map(|&[session, last, _]| (SessionId(session), last)).collect();
+        self.responses = rows.iter().filter(|r| r[2] > 0).map(|&[session, _, n]| (SessionId(session), n)).collect();
         Ok(())
+    }
+}
+
+impl Echo {
+    fn send(&mut self, ctx: &mut Ctx, session: SessionId, text: String) {
+        *self.responses.entry(session).or_default() += 1;
+        ctx.send(session, text.into_bytes()).unwrap();
     }
 }
 
@@ -282,6 +341,14 @@ enum Event {
     Shutdown,
     /// Every node is started again, after a shutdown.
     StartAll,
+    /// The operator copies the newest snapshot off a member, to restore from.
+    Backup,
+    /// The standby, a learner, is cut off from the cluster: it falls behind.
+    CutStandby,
+    /// Every node but the standby is lost, for good.
+    Lose,
+    /// The operator promotes the standby, or restores the backup.
+    Recover,
     /// An operator's request again, redirected or with no leader to send it to.
     AdminRetry {
         frame: Vec<u8>,
@@ -342,6 +409,31 @@ impl Disk {
             snapshot,
             rotten,
             rotten_record,
+            first: 1,
+            log: Vec::new(),
+        }
+    }
+
+    /// What [`driver::restore`] wrote in `dir`, as a node's disk: the snapshot, the meta, and no
+    /// log yet.
+    fn restored(dir: tempfile::TempDir, segment_bytes: u64) -> Self {
+        let snapshots = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(dir.path().join("snapshots")).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::rename(&path, snapshots.path().join(path.file_name().unwrap())).unwrap();
+        }
+        let (snapshot, _) = snapshot::load(snapshots.path()).unwrap().expect("restored");
+        let (_, meta) = MetaFile::open_simulated(&dir.path().join("meta")).unwrap();
+        Self {
+            rot_doubt: false,
+            dir,
+            files: None,
+            segment_bytes,
+            meta,
+            snapshots,
+            snapshot: Some(snapshot),
+            rotten: None,
+            rotten_record: None,
             first: 1,
             log: Vec::new(),
         }
@@ -553,6 +645,8 @@ struct SimNode {
     broken_at: u64,
     /// Wiped and started again: it joins, rather than starting a cluster.
     wiped: bool,
+    /// Lost with its cluster: it never starts again.
+    lost: bool,
 }
 
 impl SimNode {
@@ -573,6 +667,7 @@ impl SimNode {
             broken,
             broken_at: 0,
             wiped,
+            lost: false,
         }
     }
 }
@@ -585,6 +680,8 @@ struct SimClient {
     sent: u64,
     /// The last `a<k>` response.
     answered: u64,
+    /// Every response: its last `egress_seq`.
+    responses: u64,
     timers: BTreeSet<u64>,
     proposals: BTreeSet<u64>,
 }
@@ -654,6 +751,42 @@ struct Sim {
     /// How much of a snapshot a read returns: small, so a snapshot goes in many chunks.
     chunk: usize,
     reads: u64,
+    /// Clients send until then.
+    send_until: u64,
+    /// The cluster's loss and recovery, once begun.
+    disaster: Option<Disaster>,
+}
+
+/// How a lost cluster is recovered, and how far that's got.
+struct Disaster {
+    /// Restored from a snapshot's copy, onto `standby`; else `standby` is a learner, promoted.
+    restore: bool,
+    standby: NodeId,
+    /// The lost cluster's epoch, which the new one mustn't have.
+    old_epoch: u64,
+    /// The copy of a snapshot, to restore from.
+    backup: Option<(tempfile::TempDir, std::path::PathBuf)>,
+    recovered: bool,
+    /// A client that stops sending, and when: shortly before the backup or the standby's cut, so
+    /// the new cluster has its messages, but perhaps not the responses others' messages cause it.
+    idle: (usize, u64),
+}
+
+/// Client `c`, its session `again` if it's the second it opened.
+fn new_client(c: usize, again: bool) -> SimClient {
+    let addrs: Vec<String> = (1..=7).map(|id| format!("n{id}")).collect();
+    let name = if again { format!("client {c} again") } else { format!("client {c}") };
+    SimClient {
+        client: Client::new(&addrs, name, Duration::from_millis(500)).unwrap(),
+        conn: None,
+        dialing: false,
+        tick_at: None,
+        sent: 0,
+        answered: 0,
+        responses: 0,
+        timers: BTreeSet::new(),
+        proposals: BTreeSet::new(),
+    }
 }
 
 impl Sim {
@@ -664,19 +797,7 @@ impl Sim {
         let chunk = if rng.one_in(2) { 4096 } else { MAX_READ_BYTES };
         let segment_bytes = if rng.one_in(4) { MAX_SEGMENT_BYTES } else { 4096 << rng.below(4) };
         let members: Vec<NodeId> = (1..=7).map(NodeId).collect();
-        let addrs: Vec<String> = members.iter().map(|id| format!("n{id}")).collect();
-        let clients = (0..CLIENTS)
-            .map(|c| SimClient {
-                client: Client::new(&addrs, format!("client {c}"), Duration::from_millis(500)).unwrap(),
-                conn: None,
-                dialing: false,
-                tick_at: None,
-                sent: 0,
-                answered: 0,
-                timers: BTreeSet::new(),
-                proposals: BTreeSet::new(),
-            })
-            .collect();
+        let clients = (0..CLIENTS).map(|c| new_client(c, false)).collect();
         let mut sim = Self {
             seed,
             rng,
@@ -717,6 +838,8 @@ impl Sim {
             segment_bytes,
             chunk,
             reads: 0,
+            send_until: FAULT_PHASE + QUIET_PHASE / 2,
+            disaster: None,
         };
         for id in members {
             sim.nodes.insert(id, SimNode::new(Disk::new(segment_bytes)));
@@ -745,10 +868,36 @@ impl Sim {
     }
 
     fn run(mut self) -> Coverage {
+        self.run_until(FAULT_PHASE + QUIET_PHASE);
+        self.check_end();
+        let end = self.begin_disaster();
+        self.run_until(end);
+        self.check_end();
+        self.covered.carried_on = CLIENTS as u64 - self.covered.diverged;
+        let disaster = self.disaster.as_ref().unwrap();
+        let how = if disaster.restore { "restored from a snapshot" } else { "promoted a learner" };
+        let (diverged, by_responses) = (self.covered.diverged, self.covered.lost_responses);
+        eprintln!(
+            "seed {}: lost, {how}: {diverged} of {CLIENTS} clients diverged, {by_responses} by responses",
+            self.seed
+        );
+        Coverage {
+            manual_snapshots: self.admin_answers,
+            member_changes: self.member_changes,
+            transfers: self.transfers,
+            activations: u64::from(self.activated.is_some()),
+            shutdowns: u64::from(self.shut_down.is_some()),
+            ..self.covered
+        }
+    }
+
+    /// Runs the events until `end`, and then until every node has heard the last commit, which
+    /// could be a heartbeat away.
+    fn run_until(&mut self, end: u64) {
         while let Some((Reverse(at), Reverse(seq))) = self.queue.pop() {
-            // Stop once every node has heard the last commit, which could be a heartbeat away.
-            if at > FAULT_PHASE + QUIET_PHASE && (self.converged() || at > FAULT_PHASE + QUIET_PHASE + 1000 * MS) {
-                break;
+            if at > end && (self.converged() || at > end + 1000 * MS) {
+                self.queue.push((Reverse(at), Reverse(seq)));
+                return;
             }
             if self.faults && at > FAULT_PHASE {
                 self.end_faults();
@@ -757,15 +906,6 @@ impl Sim {
             let event = self.events.remove(&seq).expect("each event is queued once");
             self.handle(event);
             self.check();
-        }
-        self.check_end();
-        Coverage {
-            manual_snapshots: self.admin_answers,
-            member_changes: self.member_changes,
-            transfers: self.transfers,
-            activations: u64::from(self.activated.is_some()),
-            shutdowns: u64::from(self.shut_down.is_some()),
-            ..self.covered
         }
     }
 
@@ -813,13 +953,12 @@ impl Sim {
                 let request_id = self.rng.next();
                 self.admin(&turbofan_cluster::wire::Shutdown { request_id });
             }
-            Event::StartAll => {
-                self.started_again = true;
-                for id in self.members.clone() {
-                    self.start(id);
-                }
-            }
+            Event::StartAll => self.start_all(),
             Event::TransferLeadership => self.transfer_leadership(),
+            Event::Backup => self.backup(),
+            Event::CutStandby => self.cut_standby(),
+            Event::Lose => self.lose(),
+            Event::Recover => self.recover(),
             Event::Saved { id, incarnation, save } => self.saved(id, incarnation, save),
             Event::Written { id, incarnation } => {
                 let sim_node = &self.nodes[&id];
@@ -1268,7 +1407,12 @@ impl Sim {
     }
 
     fn client_send(&mut self, c: usize) {
-        if self.now > FAULT_PHASE + QUIET_PHASE / 2 {
+        let idle = self.disaster.as_ref().is_some_and(|d| d.idle.0 == c && self.now > d.idle.1 && !d.recovered);
+        if self.now > self.send_until || idle {
+            if idle {
+                // Again once it's recovered, on whichever session it then has.
+                self.schedule(100 * MS, Event::ClientSend(c));
+            }
             return;
         }
         let k = self.clients[c].sent + 1;
@@ -1316,11 +1460,15 @@ impl Sim {
     }
 
     fn check_client_event(&mut self, c: usize, event: client::Event) {
+        if let client::Event::Closed { reason: CloseReason::Diverged, unapplied } = event {
+            return self.diverged(c, unapplied);
+        }
         let seed = self.seed;
         let sim_client = &mut self.clients[c];
         match event {
-            client::Event::Opened(_) => {}
+            client::Event::Opened(_) => self.carried_on(c),
             client::Event::Message(payload) => {
+                sim_client.responses += 1;
                 let text = String::from_utf8(payload).unwrap();
                 let k: u64 = text[1..].parse().unwrap();
                 if text.starts_with('a') {
@@ -1331,13 +1479,62 @@ impl Sim {
                         sim_client.answered
                     );
                     sim_client.answered = k;
-                } else {
+                } else if !text.starts_with('n') {
                     let seen = if text.starts_with('p') { &mut sim_client.proposals } else { &mut sim_client.timers };
                     assert!(seen.insert(k), "seed {seed}: client {c} got {text} twice");
                 }
             }
             event => panic!("seed {seed}: client {c}: {event:?}"),
         }
+    }
+
+    /// What the cluster client `c` is connected to has of its session: the last message applied,
+    /// and the responses sent.
+    fn session_on_cluster(&self, c: usize) -> (u64, u64) {
+        let conn = self.clients[c].conn.expect("told on its connection");
+        let node = self.nodes[&self.conns[&conn].node].node.as_ref().expect("up: it told the client");
+        let session = self.clients[c].client.session().expect("it has one");
+        let service = node.service();
+        (service.last.get(&session).copied().unwrap_or(0), service.responses.get(&session).copied().unwrap_or(0))
+    }
+
+    /// A client's session opened again on the recovered cluster: it has all the client saw of it,
+    /// messages applied and responses, or the client should have closed it as diverged. (Before,
+    /// the node may since have crashed, or restarted behind what it said.)
+    fn carried_on(&mut self, c: usize) {
+        if !self.disaster.as_ref().is_some_and(|d| d.recovered) {
+            return;
+        }
+        let (applied, responses) = self.session_on_cluster(c);
+        let (seed, client) = (self.seed, &self.clients[c]);
+        assert!(
+            applied >= client.client.applied() && responses >= client.responses,
+            "seed {seed}: client {c} carried on, having seen {} applied and {} responses, the cluster {applied} and {responses}",
+            client.client.applied(),
+            client.responses,
+        );
+    }
+
+    /// A client closed its session on the recovered cluster as `Diverged`: only if that cluster
+    /// lacks some of what it saw, and counting what it never applied. A gateway then opens another.
+    fn diverged(&mut self, c: usize, unapplied: usize) {
+        let seed = self.seed;
+        assert!(self.disaster.as_ref().is_some_and(|d| d.recovered), "seed {seed}: client {c} diverged");
+        let conn = self.clients[c].conn.expect("told on its connection");
+        let (had, responses) = self.session_on_cluster(c);
+        let (sent, seen) = (self.clients[c].sent, self.clients[c].responses);
+        // The client's own idea of what's applied is what it had: it let go of no more since.
+        let applied = self.clients[c].client.applied();
+        assert!(had < applied || responses < seen, "seed {seed}: client {c} diverged from a cluster with all it saw");
+        if had >= applied {
+            self.covered.lost_responses += 1;
+        }
+        assert_eq!(unapplied as u64, sent - had, "seed {seed}: client {c} sent {sent}, the cluster applied {had}");
+        self.covered.diverged += 1;
+        self.clients[c] = new_client(c, true);
+        // What's still to come on the old session's connection isn't the new one's.
+        self.reset(conn);
+        self.dial_later(c);
     }
 
     /// Committed entries are the same on every node, and durable on a majority.
@@ -1591,7 +1788,7 @@ impl Sim {
 
     fn start(&mut self, id: NodeId) {
         let sim_node = self.nodes.get_mut(&id).unwrap();
-        if sim_node.node.is_some() || sim_node.broken {
+        if sim_node.node.is_some() || sim_node.broken || sim_node.lost {
             return;
         }
         let members = if id.0 <= self.initial && !sim_node.wiped {
@@ -1636,6 +1833,167 @@ impl Sim {
         sim_node.stalled_until = 0;
         (sim_node.pipeline, sim_node.writing, sim_node.written_at) = (Pipeline::default(), Vec::new(), None);
         self.flush(id);
+    }
+
+    /// The cluster, settled, is about to be lost, with the clients sending again. Picks how
+    /// it'll be recovered, and readies that: a learner to promote, made one if need be, on the
+    /// new version; or a snapshot, copied off a member a while before the loss. Returns when
+    /// the clients will have stopped and the recovered cluster settled.
+    fn begin_disaster(&mut self) -> u64 {
+        let leader = self.leader().expect("settled");
+        let raft = self.nodes[&leader].node.as_ref().unwrap().raft();
+        let old_epoch = self.nodes[&leader].node.as_ref().unwrap().epoch();
+        let members: Vec<NodeId> = raft.members().iter().map(|m| m.id).collect();
+        let learners: Vec<NodeId> = raft.members().iter().filter(|m| m.learner).map(|m| m.id).collect();
+        let others: Vec<NodeId> = self.members.iter().copied().filter(|id| !members.contains(id)).collect();
+        let restore = self.rng.one_in(2);
+        let lose_after = 2000 * MS + self.rng.below(1000 * MS);
+        // The one others' messages notify: once idle, what it's sent comes of theirs.
+        let first = self.nodes[&leader].node.as_ref().unwrap().service().last.keys().next().copied();
+        let idle_client = (0..CLIENTS).find(|&c| self.clients[c].client.session() == first).expect("a client is first");
+        let mut idle_at = u64::MAX;
+        let standby = if restore {
+            let backup_at = 1000 * MS + self.rng.below(500 * MS);
+            idle_at = self.now + backup_at - 600 * MS;
+            self.schedule(backup_at - 500 * MS, Event::AdminRequest);
+            self.schedule(backup_at, Event::Backup);
+            self.rng.pick(&self.members)
+        } else {
+            let request_id = self.rng.next() & !ROLE_REQUEST;
+            let standby = if let Some(&learner) = learners.first() {
+                learner
+            } else if let Some(&other) = others.first() {
+                let m = member(other);
+                let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
+                let id = m.id.0;
+                self.admin(&turbofan_cluster::wire::AddMember { request_id, id, learner: 1, peer, client, admin });
+                other
+            } else {
+                let voter = *members.iter().find(|&&id| id != leader).expect("more than one member");
+                self.admin(&turbofan_cluster::wire::SetRole { request_id, id: voter.0, learner: 1 });
+                voter
+            };
+            // It takes over as the new version, whatever it ran: restarted on that.
+            let sim_node = self.nodes.get_mut(&standby).unwrap();
+            if !sim_node.upgraded {
+                sim_node.upgraded = true;
+                sim_node.node = None;
+                sim_node.incarnation += 1;
+                self.schedule(10 * MS, Event::Restart(standby));
+            }
+            // Cut off for a while before the loss, as a link to another region is, or not at all.
+            if !self.rng.one_in(3) {
+                let cut_at = 1000 * MS + self.rng.below(lose_after - 1000 * MS);
+                idle_at = self.now + cut_at - 300 * MS - self.rng.below(300 * MS);
+                self.schedule(cut_at, Event::CutStandby);
+            }
+            standby
+        };
+        self.schedule(lose_after, Event::Lose);
+        let recover_after = lose_after + 500 * MS;
+        self.schedule(recover_after, Event::Recover);
+        let idle = (idle_client, idle_at);
+        self.disaster = Some(Disaster { restore, standby, old_epoch, backup: None, recovered: false, idle });
+        self.send_until = self.now + recover_after + 1500 * MS;
+        // Their sends stopped with the run: they start again.
+        for c in 0..CLIENTS {
+            let after = MS + self.rng.below(15 * MS);
+            self.schedule(after, Event::ClientSend(c));
+        }
+        self.send_until + DISASTER_QUIET
+    }
+
+    /// Every node is started again, after a shutdown.
+    fn start_all(&mut self) {
+        self.started_again = true;
+        for id in self.members.clone() {
+            self.start(id);
+        }
+    }
+
+    /// The standby, a learner, is cut off from the cluster: it falls behind.
+    fn cut_standby(&mut self) {
+        let standby = self.disaster.as_ref().unwrap().standby;
+        for from in 0..8 {
+            self.cut[from][usize::from(standby)] = true;
+        }
+    }
+
+    /// The operator copies the newest snapshot off a member, as a backup does.
+    fn backup(&mut self) {
+        let members = self.final_members().expect("settled");
+        let id = self.rng.pick(&members);
+        let dir = self.nodes[&id].disk.snapshots.path();
+        let newest = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "snapshot"))
+            .max()
+            .expect("a member has snapshotted");
+        let to = tempfile::tempdir().unwrap();
+        let backup = to.path().join("backup.snapshot");
+        std::fs::copy(newest, &backup).unwrap();
+        self.disaster.as_mut().unwrap().backup = Some((to, backup));
+    }
+
+    /// Every node is lost but the standby, if it's a learner, and stays down: the operator
+    /// fences the old cluster before recovering.
+    fn lose(&mut self) {
+        let disaster = self.disaster.as_ref().unwrap();
+        let kept = (!disaster.restore).then_some(disaster.standby);
+        for id in self.members.clone().into_iter().filter(|&id| Some(id) != kept) {
+            let sim_node = self.nodes.get_mut(&id).unwrap();
+            (sim_node.node, sim_node.lost) = (None, true);
+            sim_node.incarnation += 1;
+            let conns: Vec<ConnId> = self.conns.iter().filter(|(_, c)| c.up && c.node == id).map(|(&k, _)| k).collect();
+            for conn in conns {
+                self.reset(conn);
+            }
+        }
+        self.cut = [[false; 8]; 8];
+    }
+
+    /// The operator recovers: promotes the standby, or restores the backup onto it, as a node
+    /// of its own. The new cluster's history is its own from there: what the lost one committed
+    /// after is no longer what its entries must match, and its terms and snapshots are new.
+    fn recover(&mut self) {
+        let seed = self.seed;
+        let disaster = self.disaster.as_mut().unwrap();
+        disaster.recovered = true;
+        let id = disaster.standby;
+        self.leaders.clear();
+        self.snapshots.clear();
+        if disaster.restore {
+            let (_, backup) = disaster.backup.as_ref().expect("a backup was taken");
+            let restored = tempfile::tempdir().unwrap();
+            let unused = "127.0.0.1:1".parse().unwrap();
+            let node = node::Config::new(id, vec![member(id)]);
+            let config = driver::Config::new(node, 1, restored.path(), vec![(id, unused)], unused, unused);
+            let (index, _) = driver::restore(backup, &config).unwrap();
+            let sim_node = self.nodes.get_mut(&id).unwrap();
+            sim_node.disk = Disk::restored(restored, self.segment_bytes);
+            (sim_node.lost, sim_node.broken, sim_node.wiped, sim_node.upgraded) = (false, false, false, true);
+            self.committed.truncate(usize::try_from(index).unwrap());
+            self.commit_terms.truncate(usize::try_from(index).unwrap());
+            self.covered.restores += 1;
+            self.start(id);
+        } else {
+            let node = self.nodes[&id].node.as_ref().unwrap_or_else(|| panic!("seed {seed}: the standby is down"));
+            let learner = node.raft().members().iter().any(|m| m.id == id && m.learner);
+            assert!(learner, "seed {seed}: the standby, {id}, isn't a learner");
+            let commit = usize::try_from(node.raft().commit_index()).unwrap();
+            self.committed.truncate(commit);
+            self.commit_terms.truncate(commit);
+            self.covered.promotions += 1;
+            let conn = self.next_conn;
+            self.next_conn += 1;
+            self.conns.insert(conn, Conn { client: ADMIN, node: id, up: true, to_node_at: 0, to_client_at: 0 });
+            let mut frame = Vec::new();
+            codec::encode_frame(&turbofan_cluster::wire::Promote { request_id: self.rng.next() }, &mut frame).unwrap();
+            let node = self.nodes.get_mut(&id).unwrap().node.as_mut().unwrap();
+            node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, self.now);
+            self.flush(id);
+        }
     }
 
     fn end_faults(&mut self) {
@@ -1685,17 +2043,39 @@ impl Sim {
         }
     }
 
+    /// Every client's messages answered and applied, its timers fired and proposals applied,
+    /// once each.
+    fn check_clients_end(&self) {
+        let seed = self.seed;
+        for (c, sim_client) in self.clients.iter().enumerate() {
+            // A second session, opened after a recovery, has had less time.
+            let least = if self.disaster.is_some() { 10 } else { 100 };
+            assert!(sim_client.sent > least, "seed {seed}: client {c} sent only {}", sim_client.sent);
+            assert_eq!(sim_client.answered, sim_client.sent, "seed {seed}: client {c} unanswered");
+            assert_eq!(sim_client.client.unacked(), 0);
+            assert_eq!(sim_client.client.applied(), sim_client.sent, "seed {seed}: client {c} applied");
+            let expected: BTreeSet<u64> = (1..=sim_client.sent).filter(|k| k.is_multiple_of(TIMER_EVERY)).collect();
+            assert_eq!(sim_client.timers, expected, "seed {seed}: client {c} timers");
+            let expected: BTreeSet<u64> = (1..=sim_client.sent).filter(|k| k.is_multiple_of(PROPOSE_EVERY)).collect();
+            assert_eq!(sim_client.proposals, expected, "seed {seed}: client {c} proposals");
+        }
+    }
+
     /// After the faults stop: one leader, the same log and service state on every member, and
     /// every client's messages answered and timers fired, once each.
     fn check_end(&self) {
         let seed = self.seed;
-        let leaders = self.nodes.values().filter(|n| n.node.as_ref().expect("all up").raft().role() == Role::Leader);
+        let up = self.nodes.values().filter(|n| !n.lost).map(|n| n.node.as_ref().expect("all up but the lost"));
+        let leaders = up.filter(|n| n.raft().role() == Role::Leader);
         assert_eq!(leaders.count(), 1, "seed {seed}: not one leader after the faults stopped");
         let members = self.final_members().expect("a leader");
         let nodes: Vec<&Node<Echo>> = members.iter().map(|id| self.nodes[id].node.as_ref().unwrap()).collect();
         let disks: Vec<&Disk> = members.iter().map(|id| &self.nodes[id].disk).collect();
         let commit = nodes[0].raft().commit_index();
         assert_ne!(nodes[0].epoch(), 0, "seed {seed}: no epoch");
+        if let Some(disaster) = &self.disaster {
+            assert_ne!(nodes[0].epoch(), disaster.old_epoch, "seed {seed}: recovered with the lost cluster's epoch");
+        }
         for (node, disk) in nodes.iter().zip(&disks) {
             assert_eq!(node.epoch(), nodes[0].epoch(), "seed {seed}: node {} of another epoch", node.raft().id());
             let (id, role, term, last) =
@@ -1714,16 +2094,7 @@ impl Sim {
                 );
             }
         }
-        for (c, sim_client) in self.clients.iter().enumerate() {
-            assert!(sim_client.sent > 100, "seed {seed}: client {c} sent only {}", sim_client.sent);
-            assert_eq!(sim_client.answered, sim_client.sent, "seed {seed}: client {c} unanswered");
-            assert_eq!(sim_client.client.unacked(), 0);
-            assert_eq!(sim_client.client.applied(), sim_client.sent, "seed {seed}: client {c} applied");
-            let expected: BTreeSet<u64> = (1..=sim_client.sent).filter(|k| k.is_multiple_of(TIMER_EVERY)).collect();
-            assert_eq!(sim_client.timers, expected, "seed {seed}: client {c} timers");
-            let expected: BTreeSet<u64> = (1..=sim_client.sent).filter(|k| k.is_multiple_of(PROPOSE_EVERY)).collect();
-            assert_eq!(sim_client.proposals, expected, "seed {seed}: client {c} proposals");
-        }
+        self.check_clients_end();
         if let Some((index, then)) = self.shut_down.clone() {
             let stopped = then.iter().filter(|id| self.stopped.iter().any(|(s, _)| s == *id)).count();
             assert!(stopped * 2 > then.len(), "seed {seed}: of {then:?}, only {:?} stopped", self.stopped);
