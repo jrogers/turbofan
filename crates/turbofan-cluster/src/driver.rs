@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -750,10 +751,43 @@ async fn read_valid_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<V
     }
 }
 
-/// [`read_valid_frame`], failing if none comes within `idle`.
-async fn read_within(reader: &mut (impl AsyncRead + Unpin), idle: Option<Duration>) -> io::Result<Vec<u8>> {
+/// How long a connection may go without a frame, timed by one timer for its life. A timer a frame
+/// would register and drop an entry in tokio's timer, under its lock, for every message. This one
+/// moves on only when it fires, to the limit after the last frame: once a limit at most.
+struct Idle {
+    limit: Duration,
+    last_frame: tokio::time::Instant,
+    timer: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl Idle {
+    fn new(limit: Duration) -> Self {
+        let now = tokio::time::Instant::now();
+        Self { limit, last_frame: now, timer: Box::pin(tokio::time::sleep_until(now + limit)) }
+    }
+}
+
+/// [`read_valid_frame`], failing if none comes within `idle`'s limit of the last. The read lives
+/// through the timer firing early: a frame half read isn't lost.
+async fn read_within(reader: &mut (impl AsyncRead + Unpin), idle: Option<&mut Idle>) -> io::Result<Vec<u8>> {
     let Some(idle) = idle else { return read_valid_frame(reader).await };
-    tokio::time::timeout(idle, read_valid_frame(reader)).await.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+    let read = read_valid_frame(reader);
+    tokio::pin!(read);
+    loop {
+        tokio::select! {
+            frame = &mut read => {
+                idle.last_frame = tokio::time::Instant::now();
+                return frame;
+            }
+            () = idle.timer.as_mut() => {
+                let due = idle.last_frame + idle.limit;
+                if tokio::time::Instant::now() >= due {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                idle.timer.as_mut().reset(due);
+            }
+        }
+    }
 }
 
 /// Reads from peers: any node of this service whose hello has `token`, if there is one, since a
@@ -883,9 +917,10 @@ async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
             }
         }
     });
+    let mut idle = idle.map(Idle::new);
     loop {
         tokio::select! {
-            frame = read_within(&mut reader, idle) => {
+            frame = read_within(&mut reader, idle.as_mut()) => {
                 let Ok(frame) = frame else { break };
                 let input = if role == wire::Role::Admin { Input::Admin(conn, frame) } else { Input::Client(conn, frame) };
                 if inputs.send(input).await.is_err() {
@@ -1063,9 +1098,46 @@ mod tests {
     async fn a_silent_connection_times_out() {
         let (_theirs, mut ours) = tokio::io::duplex(64);
         let idle = Duration::from_millis(50);
-        let read = read_within(&mut ours, Some(idle)).await;
+        let read = read_within(&mut ours, Some(&mut Idle::new(idle))).await;
         assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(tokio::time::timeout(idle * 2, read_within(&mut ours, None)).await.is_err(), "no idle limit");
+    }
+
+    /// Frames coming within the limit of each other keep a connection open well past it, its timer
+    /// firing early and moving on; a frame written in halves either side of a firing is read
+    /// whole; and once they stop, it times out, not before the limit after the last.
+    #[tokio::test]
+    async fn frames_keep_a_connection_open() {
+        let (mut theirs, mut ours) = tokio::io::duplex(1024);
+        let limit = Duration::from_millis(100);
+        let mut idle = Idle::new(limit);
+        let mut frame = Vec::new();
+        codec::encode_frame(&wire::Unauthorized {}, &mut frame).unwrap();
+        let start = tokio::time::Instant::now();
+        // In tenths of the limit, from the start: whole frames 0.6 apart, the second in halves
+        // either side of the timer's first firing, at 1.0.
+        let (first, second) = frame.split_at(3);
+        let writes =
+            [(6, &frame[..]), (8, first), (12, second), (18, &frame), (24, &frame), (30, &frame), (36, &frame)];
+        let writer = {
+            let writes = writes.map(|(at, bytes)| (start + limit * at / 10, bytes.to_vec()));
+            tokio::spawn(async move {
+                for (at, bytes) in writes {
+                    tokio::time::sleep_until(at).await;
+                    theirs.write_all(&bytes).await.unwrap();
+                }
+                theirs
+            })
+        };
+        for _ in 0..6 {
+            assert_eq!(read_within(&mut ours, Some(&mut idle)).await.unwrap(), frame);
+        }
+        assert!(start.elapsed() > limit * 3, "open past the limit");
+        let _theirs = writer.await.unwrap();
+        let last = tokio::time::Instant::now();
+        let read = read_within(&mut ours, Some(&mut idle)).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(last.elapsed() >= limit * 9 / 10, "not before the limit after the last frame");
     }
 
     const SECOND: u64 = 1_000_000_000;
