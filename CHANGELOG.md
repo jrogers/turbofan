@@ -4,6 +4,19 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Added
+
+- TLS without operators' certificates: `serve` without `--tls-admin-ca` (`NodeTls::admin_ca`
+  `None`) encrypts the admin listener and has operators present no certificate, the admin token
+  saying who they are, as a client's credentials do. The operators' commands take `--tls-ca`
+  alone for it.
+
+### Breaking
+
+- `NodeTls::admin_ca` is an `Option`. `NodeTls::new` and `NodeTls::admin_only` are as they were.
+
 ## 0.5.0 (2026-11-04)
 
 ### Added

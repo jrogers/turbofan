@@ -185,7 +185,9 @@ or `driver::Config::tls`, a `tls::NodeTls::new` of the same four files. Then:
   is its client certificate too when it dials a peer, so if it has an extended key usage, that
   must allow both `serverAuth` and `clientAuth`.
 - **Operators** present a certificate the admin CA signed: the commands take `--tls-ca <pem>
-  --tls-cert <pem> --tls-key <pem>`.
+  --tls-cert <pem> --tls-key <pem>`. Leave out `--tls-admin-ca` (`admin_ca: None`) and they
+  present none, as clients don't: `--tls-ca <pem>` alone, and `TURBOFAN_ADMIN_TOKEN` says who
+  they are.
 - **Clients** check the node's certificate against the CA they're given, and present none: they
   say who they are by their credentials, as without TLS.
 

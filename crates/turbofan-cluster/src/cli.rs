@@ -62,7 +62,9 @@
 //! TLS is optional. `serve --tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca
 //! <pem>` puts it on all three listeners and to peers (see [`crate::tls`]), and without
 //! `--tls-peer-ca`, on the admin listener only; the operators' commands then take `--tls-ca <pem>
-//! --tls-cert <pem> --tls-key <pem>`, a certificate the admin CA signed. Only in a binary built with the `tls` feature; without it, the flags are refused.
+//! --tls-cert <pem> --tls-key <pem>`, a certificate the admin CA signed. Without `--tls-admin-ca`,
+//! operators present none (`--tls-ca <pem>` alone), and the admin token says who they are. Only in
+//! a binary built with the `tls` feature; without it, the flags are refused.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -103,8 +105,9 @@ const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
         [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
         [--election-timeout <ms>] [--heartbeat <ms>]
-        [--tls-cert <pem> --tls-key <pem> --tls-admin-ca <pem> [--tls-peer-ca <pem>]]
-        (without --tls-peer-ca, TLS on the admin listener only)
+        [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem>]]
+        (without --tls-peer-ca, TLS on the admin listener only; without --tls-admin-ca,
+        operators present no certificate, and the admin token says who they are)
   restore --from <snapshot file>, then serve's flags: a new cluster of one, this node
   snapshot --admin <addr>
   add-member --admin <addr> --member <n>=<peer addr>,<client addr>,<admin addr> [--learner]
@@ -118,7 +121,7 @@ const USAGE: &str = "usage:
   activate --admin <addr> [--protocol <n>] [--service <n>]
   capture --admin <addr>: that node's snapshot and log, in a directory of its data directory
   replay --capture <dir> [--to <n>]: a capture into this service, printing what it does
-an operator's command, over TLS: [--tls-ca <pem> --tls-cert <pem> --tls-key <pem>]";
+an operator's command, over TLS: [--tls-ca <pem> [--tls-cert <pem> --tls-key <pem>]]";
 
 /// Runs the command line for a node of `service`, which serves cluster `service_id`, with
 /// [`NodeConfig::new`](crate::NodeConfig::new)'s defaults: [`run_with`] to change them.
@@ -146,7 +149,7 @@ pub fn run_with<S: Service + 'static>(
             configure(&mut config);
             tune(&args[1..], &mut config)?;
             (config.admin_token, config.peer_token) = (token(ADMIN_TOKEN)?, token(PEER_TOKEN)?);
-            if config.admin_token.is_none() && config.tls.is_none() {
+            if config.admin_token.is_none() && config.tls.as_ref().is_none_or(|t| t.admin_ca.is_none()) {
                 eprintln!("warning: {ADMIN_TOKEN} isn't set, so anyone who can reach the admin listener can run it");
             }
             if config.peer_token.is_none() && config.tls.as_ref().is_none_or(|t| t.peer_ca.is_none()) {
@@ -222,9 +225,15 @@ fn restore(args: &[String], service_id: u32) -> Result<(), String> {
 /// An operator's `command`, one of [`COMMANDS`], through the admin listener `--admin` names.
 fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String> {
     let mut admin = Admin::new(flag(args, "--admin")?, service_id).with_token(token(ADMIN_TOKEN)?.unwrap_or_default());
-    if let Some([ca, cert, key]) = tls_flags(args, ["--tls-ca", "--tls-cert", "--tls-key"])? {
-        let tls = ClientTls::load(ca.as_ref(), Some((cert.as_ref(), key.as_ref())));
-        admin = admin.with_tls(tls.map_err(|e| format!("TLS: {e}"))?);
+    let identity = tls_flags(args, ["--tls-cert", "--tls-key"])?;
+    match optional_flag(args, "--tls-ca")? {
+        Some(ca) => {
+            let identity = identity.as_ref().map(|[cert, key]| (cert.as_ref(), key.as_ref()));
+            let tls = ClientTls::load(ca.as_ref(), identity).map_err(|e| format!("TLS: {e}"))?;
+            admin = admin.with_tls(tls);
+        }
+        None if identity.is_some() => return Err("--tls-cert and --tls-key take --tls-ca".into()),
+        None => {}
     }
     let failed = |e: AdminError| format!("{command}: {e}");
     match command {
@@ -385,18 +394,20 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
     })
 }
 
-/// `serve`'s TLS: none, or a certificate, key and admin CA, and a peer CA for TLS beyond the admin
-/// listener.
+/// `serve`'s TLS: none, or a certificate and key, with an admin CA for operators' certificates and
+/// a peer CA for TLS beyond the admin listener.
 fn node_tls(args: &[String]) -> Result<Option<NodeTls>, String> {
-    let peer_ca = optional_flag(args, "--tls-peer-ca")?;
-    match tls_flags(args, ["--tls-cert", "--tls-key", "--tls-admin-ca"])? {
-        Some([cert, key, admin_ca]) => Ok(Some(NodeTls {
+    let (peer_ca, admin_ca) = (optional_flag(args, "--tls-peer-ca")?, optional_flag(args, "--tls-admin-ca")?);
+    match tls_flags(args, ["--tls-cert", "--tls-key"])? {
+        Some([cert, key]) => Ok(Some(NodeTls {
             cert: cert.into(),
             key: key.into(),
             peer_ca: peer_ca.map(Into::into),
-            admin_ca: admin_ca.into(),
+            admin_ca: admin_ca.map(Into::into),
         })),
-        None if peer_ca.is_some() => Err("--tls-peer-ca takes --tls-cert, --tls-key and --tls-admin-ca".into()),
+        None if peer_ca.is_some() || admin_ca.is_some() => {
+            Err("--tls-peer-ca and --tls-admin-ca take --tls-cert and --tls-key".into())
+        }
         None => Ok(None),
     }
 }
@@ -568,7 +579,10 @@ mod tests {
         let args = |a: &[&str]| a.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
         let tls = ["--tls-cert", "c", "--tls-key", "k", "--tls-admin-ca", "a"];
         let admin_only = node_tls(&args(&tls)).unwrap().unwrap();
-        assert_eq!((admin_only.peer_ca, admin_only.admin_ca), (None, "a".into()));
+        assert_eq!((admin_only.peer_ca, admin_only.admin_ca), (None, Some("a".into())));
+        let no_admin_ca = node_tls(&args(&tls[..4])).unwrap().unwrap();
+        assert_eq!((no_admin_ca.peer_ca, no_admin_ca.admin_ca), (None, None));
+        assert!(node_tls(&args(&["--tls-admin-ca", "a"])).is_err());
         let all = node_tls(&args(&[&tls[..], &["--tls-peer-ca", "p"]].concat())).unwrap().unwrap();
         assert_eq!(all.peer_ca, Some("p".into()));
         assert!(node_tls(&args(&["--tls-peer-ca", "p"])).is_err());

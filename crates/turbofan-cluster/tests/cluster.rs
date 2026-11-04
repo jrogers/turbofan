@@ -517,3 +517,29 @@ async fn tls_on_the_admin_listener_alone() {
     assert!(admin.clone().with_tls(operator).request_snapshot().await.unwrap() > 100);
     assert!(admin.request_snapshot().await.is_err(), "an operator without TLS");
 }
+
+/// Without an admin CA, an operator over TLS presents no certificate, and its token says who it
+/// is: one with the token gets through, one without it doesn't.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_without_an_admin_ca_takes_operators_by_their_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let certs = dir.path().join("certs");
+    std::fs::create_dir(&certs).unwrap();
+    certify(&certs, "node");
+    let file = |name: &str| certs.join(name);
+    let mut tls = NodeTls::admin_only(file("node.pem"), file("node.key"), file("node-ca.pem"));
+    tls.admin_ca = None;
+    let mut cluster = Cluster::new(dir.path(), Some(tls));
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 100).await;
+
+    let no_cert = ClientTls::load(&file("node-ca.pem"), None).unwrap();
+    let admin = Admin::new(cluster.configs[0].admin_listen.to_string(), SERVICE_ID)
+        .with_tls(no_cert)
+        .with_timeout(Duration::from_secs(5));
+    assert!(admin.clone().with_token(TOKEN).request_snapshot().await.unwrap() > 100);
+    let error = admin.with_token(b"wrong").request_snapshot().await.unwrap_err();
+    assert!(matches!(error, AdminError::Denied(_)), "{error:?}");
+}

@@ -3,9 +3,15 @@
 //!
 //! A node presents its certificate on each listener, and to the peers it dials. Peers check each
 //! other's against the peer CA, both ways; operators present one the admin CA signed; clients
-//! only check the node's, and say who they are by their credentials, as without TLS. A
+//! only check the node's, and say who they are by their credentials, as without TLS. Without an
+//! admin CA, operators are as clients: they present no certificate, and the admin token says who
+//! they are. A
 //! certificate is checked against the address dialled, so a node's must name (as a subject
 //! alternative name) every host it's reached at: its peer, client and admin addresses'.
+//!
+//! A CA file is a bundle: every certificate in it, root or intermediate, is trusted, and a
+//! certificate that chains to any of them is taken. A certificate file holds the chain, its own
+//! certificate first, then any intermediates, which are sent with it.
 //!
 //! A peer certificate stands for the cluster, not for one node: any node with one may say it's
 //! any member, as with the peer token.
@@ -46,8 +52,10 @@ pub struct NodeTls {
     /// The CA that signed every node's certificate. With none, TLS is on the admin listener only:
     /// peers and clients are plain TCP.
     pub peer_ca: Option<PathBuf>,
-    /// The CA that signed operators' certificates.
-    pub admin_ca: PathBuf,
+    /// The CA that signed operators' certificates. With none, operators present none: the
+    /// connection is encrypted and the node's certificate checked, but only the admin token says
+    /// who an operator is.
+    pub admin_ca: Option<PathBuf>,
 }
 
 impl NodeTls {
@@ -60,14 +68,14 @@ impl NodeTls {
         peer_ca: impl Into<PathBuf>,
         admin_ca: impl Into<PathBuf>,
     ) -> Self {
-        Self { cert: cert.into(), key: key.into(), peer_ca: Some(peer_ca.into()), admin_ca: admin_ca.into() }
+        Self { cert: cert.into(), key: key.into(), peer_ca: Some(peer_ca.into()), admin_ca: Some(admin_ca.into()) }
     }
 
     /// TLS on the admin listener only: the node's certificate `cert` and its `key`, and the
     /// `admin_ca` that signed operators'. Peers and clients are plain TCP.
     #[must_use]
     pub fn admin_only(cert: impl Into<PathBuf>, key: impl Into<PathBuf>, admin_ca: impl Into<PathBuf>) -> Self {
-        Self { cert: cert.into(), key: key.into(), peer_ca: None, admin_ca: admin_ca.into() }
+        Self { cert: cert.into(), key: key.into(), peer_ca: None, admin_ca: Some(admin_ca.into()) }
     }
 }
 
@@ -200,7 +208,7 @@ mod rustls_impl {
             Some(peer_ca) => Some((server(Some(peer_ca))?, server(None)?)),
             None => None,
         };
-        Ok((cluster, server(Some(&tls.admin_ca))?))
+        Ok((cluster, server(tls.admin_ca.as_deref())?))
     }
 
     pub(super) async fn connect(tls: &Connector, addr: &str, stream: TcpStream) -> io::Result<Conn> {
@@ -298,7 +306,7 @@ mod without {
             let error = ClientTls::load(Path::new("ca.pem"), None).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
             let file = PathBuf::from;
-            let node = NodeTls { cert: file("c"), key: file("k"), peer_ca: Some(file("p")), admin_ca: file("a") };
+            let node = NodeTls { cert: file("c"), key: file("k"), peer_ca: Some(file("p")), admin_ca: Some(file("a")) };
             assert_eq!(Loaded::load(&node).err().map(|e| e.kind()), Some(std::io::ErrorKind::Unsupported));
         }
     }
