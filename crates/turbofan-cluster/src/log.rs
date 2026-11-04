@@ -871,6 +871,9 @@ mod tests {
         assert!(log.capture(into.path(), 4, 8).is_err(), "not yet held");
         log.compact_to(4).unwrap();
         assert!(log.capture(into.path(), 2, 5).is_err(), "no longer held");
+        let one = tempfile::tempdir().unwrap();
+        log.capture(one.path(), 6, 6).unwrap();
+        assert_eq!(fs::read_dir(one.path()).unwrap().count(), 1, "one entry, its segment");
         let none = tempfile::tempdir().unwrap();
         log.capture(none.path(), 8, 7).unwrap();
         assert_eq!(fs::read_dir(none.path()).unwrap().count(), 0, "an empty range takes nothing");

@@ -956,6 +956,30 @@ mod tests {
         assert_eq!(storage.log.next_index(), 5);
     }
 
+    /// A capture in a batch sees the batch's appends, and starts after the snapshot: here a log
+    /// that holds nothing before it.
+    #[test]
+    fn a_capture_sees_its_batchs_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut storage, ..) = Storage::open(dir.path(), Fsync::Never, usize::MAX).unwrap();
+        snapshot::save(&dir.path().join("snapshots"), 3, 1, Vec::new(), Box::new(|_| Ok(())), false).unwrap();
+        storage.log.reset(4).unwrap();
+        let mut records = Vec::new();
+        for index in [4, 5] {
+            crate::codec::Record { term: 1, index, payload: b"x" }.encode_into(&mut records);
+        }
+        let capture = node::Capture { conn: 9, request_id: 1, to: 5 };
+        let (reads, snapshot_reads) = (Vec::new(), Vec::new());
+        let batch =
+            pipeline::Batch { persist: vec![Persist::Append(records)], reads, snapshot_reads, captures: vec![capture] };
+        let (.., captured) = storage.write(&[batch]).unwrap();
+        let (conn, frame) = &captured[0];
+        let Some((wire::Decoded::Captured(m), _)) = codec::decode_frame(frame).unwrap() else { panic!() };
+        let detail = String::from_utf8_lossy(m.detail()).into_owned();
+        assert_eq!((*conn, m.refused(), m.snapshot_index(), m.to()), (9, 0, 3, 5), "{detail}");
+        assert!(Path::new(&detail).join("log").join(format!("{:020}.log", 4)).exists());
+    }
+
     /// An unreachable peer is dialled less and less often, but at least once a [`MAX_REDIAL`].
     #[test]
     fn redials_back_off_to_a_ceiling() {
