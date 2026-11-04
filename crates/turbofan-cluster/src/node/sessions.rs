@@ -4,7 +4,18 @@
 use super::*;
 
 impl<S: Service> Node<S> {
+    /// Forgets `conn`, and the session it's attached to, if any, forgets it.
+    pub(super) fn detach(&mut self, conn: ConnId) {
+        if let Some(Some(session)) = self.local.conns.remove(&conn)
+            && self.local.attached.get(&session) == Some(&conn)
+        {
+            self.local.attached.remove(&session);
+        }
+    }
+
     pub(super) fn open(&mut self, conn: ConnId, credentials: &[u8]) {
+        // A connection takes one session: one it had is left for its client to reattach to.
+        self.detach(conn);
         if self.state.sessions.len() + self.local.opening.len() >= MAX_SESSIONS {
             self.send_client(conn, &wire::Closed { session: 0, reason: CloseReason::NoSession });
             return;
@@ -33,6 +44,7 @@ impl<S: Service> Node<S> {
             self.send_client(conn, &wire::Closed { session: session.0, reason: CloseReason::Refused });
             return;
         }
+        self.detach(conn);
         let s = &self.state.sessions[&session];
         if let Some(old) = self.local.attached.insert(session, conn) {
             self.local.conns.insert(old, None);

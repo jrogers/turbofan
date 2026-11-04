@@ -6,7 +6,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::WriteHalf;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -168,24 +167,17 @@ async fn run(
     let start = Instant::now();
     let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let hello = Hello { service_id, node_id: None, epoch: Arc::default() };
+    let mut redirected_at: Option<Instant> = None;
     loop {
         let Ok(stream) = handshake(client.target(), &hello, wire::Role::Client, &[], tls.as_ref()).await else {
             client.on_disconnected();
             tokio::time::sleep(RETRY).await;
             continue;
         };
-        let (mut reader, mut writer) = tokio::io::split(stream);
-        let (frames_tx, mut frames) = mpsc::channel(256);
-        let read = tokio::spawn(async move {
-            while let Ok(frame) = read_frame(&mut reader).await {
-                if frames_tx.send(frame).await.is_err() {
-                    return;
-                }
-            }
-        });
+        let mut conn = Connection::new(stream);
         client.on_connected(now());
-        let mut up = write(&mut client, &mut writer).await;
-        while up {
+        conn.write(&mut client);
+        loop {
             let wake = start + Duration::from_nanos(client.next_deadline());
             tokio::select! {
                 command = commands.recv() => match command {
@@ -193,7 +185,7 @@ async fn run(
                     Some(Command::Send(payload, reply)) => { let _ = reply.send(client.send(payload)); }
                     Some(Command::Close) => client.close(),
                 },
-                frame = frames.recv() => {
+                frame = conn.frames.recv() => {
                     let decoded = frame.as_deref().map(codec::decode_frame);
                     match decoded {
                         Some(Ok(Some((message, _)))) => client.on_frame(&message),
@@ -206,23 +198,33 @@ async fn run(
                     }
                 }
                 () = tokio::time::sleep_until(wake.into()) => client.on_tick(now()),
+                _ = &mut conn.written => {
+                    client.on_disconnected();
+                    break;
+                }
             }
             applied.send_if_modified(|seq| std::mem::replace(seq, client.applied()) != client.applied());
             while let Some(event) = client.poll_event() {
                 if events.send(event).await.is_err() {
-                    read.abort();
                     return;
                 }
             }
             // Over: `recv` returns `None` once the events are read, and nothing reattaches.
             if client.is_closed() {
-                read.abort();
                 return;
             }
-            up = write(&mut client, &mut writer).await;
+            conn.write(&mut client);
             // Redirected: the target already points where to go.
             match client.take_reconnect() {
-                Some(Reconnect::ToLeader) => break,
+                Some(Reconnect::ToLeader) => {
+                    // Nodes that disagree on the leader, mid-election, send it back and forth:
+                    // once at once, then paced.
+                    if redirected_at.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+                        tokio::time::sleep(RETRY).await;
+                    }
+                    redirected_at = Some(Instant::now());
+                    break;
+                }
                 Some(Reconnect::Later) => {
                     tokio::time::sleep(RETRY).await;
                     break;
@@ -230,18 +232,58 @@ async fn run(
                 None => {}
             }
         }
-        read.abort();
     }
 }
 
-/// Writes what the client has to send. `false`, and the client told, if the connection failed.
-async fn write(client: &mut Client, writer: &mut WriteHalf<Conn>) -> bool {
-    let frames = client.take_frames();
-    if !frames.is_empty() && write_frames(writer, frames.iter().map(Vec::as_slice)).await.is_err() {
-        client.on_disconnected();
-        return false;
+/// A client's connection, read and written on tasks of their own, which stop when it's dropped.
+/// Written apart, a node slow to read doesn't stop the client reading what the node sends: it
+/// would then drop the client, whose frames back up. What waits to be written is bounded by what
+/// the client holds anyway, its unacknowledged messages.
+struct Connection {
+    frames: mpsc::Receiver<Vec<u8>>,
+    out: mpsc::UnboundedSender<Vec<Vec<u8>>>,
+    read: JoinHandle<()>,
+    /// Done once writing failed.
+    written: JoinHandle<()>,
+}
+
+impl Connection {
+    fn new(stream: Conn) -> Self {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (frames_tx, frames) = mpsc::channel(256);
+        let read = tokio::spawn(async move {
+            while let Ok(frame) = read_frame(&mut reader).await {
+                if frames_tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let (out, mut to_write) = mpsc::unbounded_channel::<Vec<Vec<u8>>>();
+        let written = tokio::spawn(async move {
+            while let Some(frames) = to_write.recv().await {
+                if write_frames(&mut writer, frames.iter().map(Vec::as_slice)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Self { frames, out, read, written }
     }
-    true
+
+    /// Hands what the client has to send to the writer. Should it have stopped, the connection
+    /// failed, which [`Connection::written`] says.
+    fn write(&self, client: &mut Client) {
+        let frames = client.take_frames();
+        if !frames.is_empty() {
+            let _ = self.out.send(frames);
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.read.abort();
+        self.written.abort();
+    }
 }
 
 /// A connection to `addr` that has said hello for `role`, with an operator's `token` (empty for
@@ -496,10 +538,17 @@ impl Admin {
         let (token, tls) = (&self.token[..], self.tls.as_ref());
         let mut target = self.addr.clone();
         let attempt = async {
+            let mut redirected = false;
             loop {
                 match ask(&target, &hello, token, tls, &request(request_id), |reply| answer(reply, request_id)).await {
                     Some(Ok(answer)) => return answer,
-                    Some(Err(leader)) if !leader.is_empty() => target = leader,
+                    Some(Err(leader)) if !leader.is_empty() => {
+                        // Redirected again: nodes that disagree on the leader, mid-election.
+                        if std::mem::replace(&mut redirected, true) {
+                            tokio::time::sleep(RETRY).await;
+                        }
+                        target = leader;
+                    }
                     // The leader it was sent to may be gone: the address finds the next.
                     _ => {
                         target.clone_from(&self.addr);

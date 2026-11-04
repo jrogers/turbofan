@@ -392,9 +392,9 @@ impl<S: Service> Node<S> {
 
     /// A client connection closed. Its session stays open for the client to reattach to.
     pub fn on_disconnect(&mut self, conn: ConnId) {
-        if let Some(Some(session)) = self.local.conns.remove(&conn) {
-            self.local.attached.remove(&session);
-        }
+        self.detach(conn);
+        // A session it asked for opens all the same, but not on it.
+        self.local.opening.retain(|_, &mut c| c != conn);
     }
 
     /// A client's message on connection `conn`.

@@ -47,6 +47,20 @@ a patch version (0.1.1) doesn't.
   refused, not taken as absent.
 - `ClusterClient` stops once its session is closed: `recv` returns `None`, as it says.
 - A leader that removed itself counted its own snapshot towards an operator's snapshot quorum.
+- An append whose records' terms fell, or passed the leader's, panicked a follower: it's now
+  ignored as malformed.
+- Heartbeats to a peer that had stopped acknowledging carried up to a megabyte of records each,
+  queued for it while it was gone, up to gigabytes. Past what it may have in flight, they carry
+  none.
+- A client stops reading while it's blocked writing no longer: a leader slow to read disconnected
+  it once its responses backed up. `ClusterClient` writes on a task of its own.
+- Redirects back and forth, between nodes that disagree on the leader mid-election, are paced
+  rather than followed in a tight loop, by `ClusterClient` and `Admin`.
+- Accepting a connection that fails (out of file descriptors, say) is retried after a pause, not
+  in a loop that holds a core.
+- The directories a node creates are synced into their parents, and a connection that closes
+  before its session opens is forgotten; one that opens a second session leaves the first. A
+  snapshot file's length is checked without overflowing.
 
 ## 0.2.0 (2026-11-04)
 

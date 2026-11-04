@@ -51,6 +51,8 @@ const MAX_QUEUED_FRAMES: usize = 4096;
 const REDIAL: Duration = Duration::from_millis(100);
 /// The longest wait before dialling an unreachable peer again.
 const MAX_REDIAL: Duration = Duration::from_secs(1);
+/// How long to wait to accept again after accepting failed.
+const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 /// How long a node that has stopped waits, for what it sent last to go out.
 const STOP_GRACE: Duration = Duration::from_millis(200);
 /// How often the node's gauges are published.
@@ -152,7 +154,7 @@ pub fn restore(from: &Path, config: &Config) -> io::Result<(u64, u64)> {
     let epoch = node::mint_epoch(wall_ns(), id);
     let state = node::with_epoch(&mut bytes, epoch)?;
     let snapshots = dir.join("snapshots");
-    std::fs::create_dir_all(&snapshots)?;
+    crate::log::create_dir_durably(&snapshots)?;
     let writer: node::SnapshotWriter = Box::new(move |out| {
         out.write_all(&state)?;
         io::copy(&mut bytes, out).map(drop)
@@ -464,7 +466,7 @@ impl Storage {
         window_bytes: usize,
     ) -> io::Result<(Self, crate::meta::Meta, Option<(crate::raft::Snapshot, impl io::Read + use<>)>, Entries)> {
         let snapshots = dir.join("snapshots");
-        std::fs::create_dir_all(&snapshots)?;
+        crate::log::create_dir_durably(&snapshots)?;
         let snapshot = snapshot::load(&snapshots)?;
         let mut entries = Entries::default();
         let mut log = Log::open(&dir.join("log"), fsync, |record| entries.recover(record, window_bytes))?;
@@ -709,7 +711,11 @@ async fn accept_peers(
 ) {
     let mut conns = JoinSet::new();
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            // Out of file descriptors, say: not again at once, in a loop that holds a core.
+            tokio::time::sleep(ACCEPT_RETRY).await;
+            continue;
+        };
         let (inputs, token, tls, hello) = (inputs.clone(), token.clone(), tls.clone(), hello.clone());
         conns.spawn(async move {
             let handshake = async {
@@ -752,7 +758,11 @@ async fn accept(
 ) {
     let mut conns = JoinSet::new();
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            // Out of file descriptors, say: not again at once, in a loop that holds a core.
+            tokio::time::sleep(ACCEPT_RETRY).await;
+            continue;
+        };
         let conn = next_conn.fetch_add(1, Ordering::Relaxed);
         conns.spawn(serve_connection(stream, conn, role, hello.clone(), token.clone(), tls.clone(), inputs.clone()));
         while conns.try_join_next().is_some() {}

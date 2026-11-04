@@ -86,13 +86,14 @@ impl Raft {
     /// malformed (and so ignored).
     pub(super) fn accept_records(&mut self, m: &wire::AppendEntriesRef<'_>) -> Option<u64> {
         let prev = m.prev_index();
-        let mut expected = prev + 1;
+        let (mut expected, mut term) = (prev + 1, m.prev_term());
         for record in codec::records(m.entries()) {
             let Ok(record) = record else { return None };
-            if record.index != expected {
+            // Indices in order, and terms that never fall nor pass the leader's.
+            if record.index != expected || record.term < term || record.term > m.term() {
                 return None;
             }
-            expected += 1;
+            (expected, term) = (expected + 1, record.term);
         }
         if expected - prev - 1 != u64::from(m.count()) {
             return None;
@@ -185,7 +186,10 @@ impl Raft {
         let mut bytes = Vec::new();
         let mut count = 0_u32;
         let mut index = next;
-        while index <= self.replicate_to() && u64::from(count) < crate::widen(MAX_ENTRIES_PER_APPEND) {
+        // A heartbeat to a peer too far behind on its acks (gone, say) carries no records: each
+        // would otherwise queue another for it, up to a megabyte.
+        let to = if next > self.peers[peer].matched + MAX_IN_FLIGHT { 0 } else { self.replicate_to() };
+        while index <= to && u64::from(count) < crate::widen(MAX_ENTRIES_PER_APPEND) {
             let Some(record) = self.record(index) else { break };
             if !bytes.is_empty() && bytes.len() + record.len() > MAX_APPEND_BYTES {
                 break;
@@ -194,7 +198,7 @@ impl Raft {
             count += 1;
             index += 1;
         }
-        if count == 0 && next <= self.replicate_to() {
+        if count == 0 && next <= to {
             self.fetch(next);
             if !probe {
                 return false;

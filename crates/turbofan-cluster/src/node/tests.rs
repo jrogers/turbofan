@@ -583,3 +583,21 @@ fn a_request_sent_again_is_answered_on_the_new_connection() {
         assert!(sent[0].starts_with("100: ") && sent[0].contains(answer), "{sent:?}");
     }
 }
+
+/// A connection that opens a second session leaves the first for its client to reattach to; one
+/// that closes before its session opens is forgotten, not attached to it.
+#[test]
+fn a_connection_holds_one_session_and_a_closed_one_none() {
+    let mut node = leader();
+    let first = open(&mut node, 7, 0);
+    let second = open(&mut node, 7, 0);
+    assert_ne!(first, second);
+    assert_eq!((node.local.attached.get(&first), node.local.attached.get(&second)), (None, Some(&7)));
+
+    let mut frame = Vec::new();
+    codec::encode_frame(&wire::Connect { credentials: b"" }, &mut frame).unwrap();
+    node.on_client(8, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
+    node.on_disconnect(8);
+    assert!(drive(&mut node).is_empty(), "nothing sent to it");
+    assert!(!node.local.conns.contains_key(&8) && !node.local.attached.values().any(|&c| c == 8));
+}

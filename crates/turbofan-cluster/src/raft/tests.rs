@@ -409,6 +409,65 @@ fn an_earlier_batch_durable_does_not_count_entries_that_replaced_its_own() {
     assert_eq!(raft.durable, 2);
 }
 
+/// An append whose records' terms fall, or pass the leader's, is malformed: ignored, not taken
+/// into the log (where it would break it) nor a panic.
+#[test]
+fn an_append_with_terms_out_of_order_is_ignored() {
+    let mut raft = Raft::new(config(3, &[1, 2, 3]), Meta { term: 1, vote: None }, None, entries(&[1]), 0);
+    let mut append = |records: &[(u64, u64)]| {
+        let mut bytes = Vec::new();
+        for &(index, term) in records {
+            Record { term, index, payload: b"x" }.encode_into(&mut bytes);
+        }
+        let count = u32::try_from(records.len()).unwrap();
+        let append = wire::AppendEntries {
+            term: 2,
+            leader: 1,
+            prev_index: 1,
+            prev_term: 1,
+            commit: 1,
+            count,
+            entries: &bytes,
+            last_index: 0,
+        };
+        let mut frame = Vec::new();
+        codec::encode_frame(&append, &mut frame).unwrap();
+        raft.on_message(NodeId(1), &decode(&frame), 0);
+        raft.take_outputs();
+        raft.last_index()
+    };
+    assert_eq!(append(&[(2, 2), (3, 1)]), 1, "falling");
+    assert_eq!(append(&[(2, 3)]), 1, "past the leader's");
+    assert_eq!(append(&[(2, 1), (3, 2)]), 3);
+}
+
+/// A peer that stops acking (gone) is sent no further than `MAX_IN_FLIGHT` past what it acked,
+/// heartbeats included: they carry no records then, but still find where its log matches.
+#[test]
+fn heartbeats_to_a_peer_gone_carry_no_records() {
+    let mut rafts = cluster(3);
+    elect(&mut rafts, &[1, 2, 3], 1, 1000 * MS);
+    let leader = &mut rafts[0];
+    let to_3 = |sends: &[(NodeId, Vec<u8>)]| -> Vec<u32> {
+        let appends = sends.iter().filter(|(to, _)| *to == NodeId(3));
+        appends
+            .filter_map(|(_, f)| if let wire::Decoded::AppendEntries(m) = decode(f) { Some(m.count()) } else { None })
+            .collect()
+    };
+    let mut sent = 0;
+    for _ in 0..MAX_IN_FLIGHT + 100 {
+        leader.propose(b"x");
+        sent += to_3(&flush(leader)).iter().map(|&n| u64::from(n)).sum::<u64>();
+    }
+    assert!(sent <= MAX_IN_FLIGHT + crate::widen(MAX_ENTRIES_PER_APPEND), "{sent}");
+    for _ in 0..3 {
+        let now = leader.next_deadline();
+        leader.on_tick(now);
+        let counts = to_3(&flush(leader));
+        assert!(!counts.is_empty() && counts.iter().all(|&n| n == 0), "{counts:?}");
+    }
+}
+
 #[test]
 fn a_reordered_older_append_does_not_take_the_commit_back() {
     let mut raft = Raft::new(config(3, &[1, 2, 3]), Meta { term: 1, vote: None }, None, Entries::default(), 0);

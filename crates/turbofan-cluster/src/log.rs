@@ -97,7 +97,11 @@ impl Log {
     }
 
     fn open_with(dir: &Path, segment_bytes: u64, sync: bool, mut each: impl FnMut(Record<'_>)) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        if sync {
+            create_dir_durably(dir)?
+        } else {
+            fs::create_dir_all(dir)?
+        }
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("lock"))?;
         lock.try_lock().map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "log directory is in use"))?;
         let mut segments = list_segments(dir)?;
@@ -490,6 +494,22 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Creates `dir`, and its parents that are missing, each synced into its parent: else a crash
+/// could lose the directory a synced file is in.
+///
+/// # Errors
+///
+/// If creating or syncing one fails.
+pub(crate) fn create_dir_durably(dir: &Path) -> io::Result<()> {
+    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !d.as_os_str().is_empty() && !d.exists()).collect();
+    fs::create_dir_all(dir)?;
+    for created in missing.iter().rev() {
+        let parent = created.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -593,6 +613,16 @@ mod tests {
         assert_eq!(resume(dir.path(), (4, 1)), (false, 7), "the same term: kept");
         assert_eq!(resume(dir.path(), (4, 2)), (true, 5));
         assert_eq!(open(dir.path()).1, Vec::<u64>::new());
+    }
+
+    /// Missing directories are made, parents and all.
+    #[test]
+    fn directories_are_created_parents_and_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a/b/c");
+        create_dir_durably(&deep).unwrap();
+        create_dir_durably(&deep).unwrap();
+        assert!(deep.is_dir());
     }
 
     /// A crash partway through a reset, which removes the newest segments first: what's left

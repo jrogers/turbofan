@@ -143,7 +143,9 @@ fn open_file(at: &Path, index: Option<u64>) -> io::Result<(Snapshot, File)> {
         return Err(invalid("not a snapshot"));
     }
     let index = stored;
-    if file.metadata()?.len() < crate::widen(HEADER) + len {
+    // From a header not yet checked: a garbled length mustn't overflow.
+    let end = crate::widen(HEADER).checked_add(len).ok_or_else(|| invalid("wrong length"))?;
+    if file.metadata()?.len() < end {
         return Err(invalid("wrong length"));
     }
     let body_sum = sum_body(&mut file, len)?;
@@ -419,5 +421,11 @@ mod tests {
         bytes[16 + 6] ^= 1 << 4;
         fs::write(&file, bytes).unwrap();
         assert_eq!(load(dir.path()).err().unwrap().kind(), io::ErrorKind::InvalidData, "a damaged term");
+
+        // Its length, past any file's, is an error, not an overflow.
+        let mut bytes = fs::read(&file).unwrap();
+        bytes[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        fs::write(&file, bytes).unwrap();
+        assert_eq!(load(dir.path()).err().unwrap().kind(), io::ErrorKind::InvalidData, "a damaged length");
     }
 }

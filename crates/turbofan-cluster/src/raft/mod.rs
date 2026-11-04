@@ -128,7 +128,8 @@ impl std::str::FromStr for NodeId {
 pub const MAX_MEMBERS: usize = 7;
 /// The most record bytes one `AppendEntries` carries, leaving room for its header in a frame.
 const MAX_APPEND_BYTES: usize = 1_000_000;
-/// How far a leader replicates to a peer ahead of its acks before it waits for a heartbeat.
+/// How far a leader replicates to a peer ahead of its acks: then it waits for them, sending
+/// heartbeats without records.
 const MAX_IN_FLIGHT: u64 = 4096;
 /// A new member that hasn't caught up in this many election timeouts isn't added.
 const CATCH_UP_TIMEOUTS: u64 = 100;
