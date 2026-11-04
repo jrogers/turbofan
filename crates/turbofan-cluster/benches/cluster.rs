@@ -248,7 +248,7 @@ fn start(dir: &Path, tls: bool, fsync: driver::Fsync) -> (Vec<String>, Option<Cl
         config.tls = node_tls.clone();
         tokio::spawn(async move { serve(config, Ack).await.unwrap() });
     }
-    let client_tls = node_tls.map(|t| ClientTls::load(&t.peer_ca, None).unwrap());
+    let client_tls = node_tls.map(|t| ClientTls::load(t.peer_ca.as_deref().expect("a peer CA"), None).unwrap());
     (ids.iter().map(|&id| addr(3, id).to_string()).collect(), client_tls)
 }
 

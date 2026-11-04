@@ -491,3 +491,29 @@ async fn a_cluster_over_tls_takes_only_who_it_should() {
         assert!(matches!(error, AdminError::Denied(_)), "{error:?}");
     }
 }
+
+/// With TLS on the admin listener only, peers replicate and a client gets through over plain
+/// TCP; an operator gets through with its certificate, and not without TLS.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_on_the_admin_listener_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let certs = dir.path().join("certs");
+    std::fs::create_dir(&certs).unwrap();
+    certify(&certs, "node");
+    certify(&certs, "operator");
+    let file = |name: &str| certs.join(name);
+    let tls = NodeTls::admin_only(file("node.pem"), file("node.key"), file("operator-ca.pem"));
+    let mut cluster = Cluster::new(dir.path(), Some(tls));
+
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 100).await;
+
+    let admin = Admin::new(cluster.configs[0].admin_listen.to_string(), SERVICE_ID)
+        .with_token(TOKEN)
+        .with_timeout(Duration::from_secs(5));
+    let operator = ClientTls::load(&file("node-ca.pem"), Some((&file("operator.pem"), &file("operator.key")))).unwrap();
+    assert!(admin.clone().with_tls(operator).request_snapshot().await.unwrap() > 100);
+    assert!(admin.request_snapshot().await.is_err(), "an operator without TLS");
+}

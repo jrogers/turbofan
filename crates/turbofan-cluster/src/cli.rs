@@ -60,9 +60,9 @@
 //! `serve --fsync` syncs it once a batch, before acknowledging it.
 //!
 //! TLS is optional. `serve --tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca
-//! <pem>` puts it on all three listeners and to peers (see [`crate::tls`]); the operators'
-//! commands then take `--tls-ca <pem> --tls-cert <pem> --tls-key <pem>`, a certificate the admin
-//! CA signed. Only in a binary built with the `tls` feature; without it, the flags are refused.
+//! <pem>` puts it on all three listeners and to peers (see [`crate::tls`]), and without
+//! `--tls-peer-ca`, on the admin listener only; the operators' commands then take `--tls-ca <pem>
+//! --tls-cert <pem> --tls-key <pem>`, a certificate the admin CA signed. Only in a binary built with the `tls` feature; without it, the flags are refused.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -103,7 +103,8 @@ const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
         [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
         [--election-timeout <ms>] [--heartbeat <ms>]
-        [--tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca <pem>]
+        [--tls-cert <pem> --tls-key <pem> --tls-admin-ca <pem> [--tls-peer-ca <pem>]]
+        (without --tls-peer-ca, TLS on the admin listener only)
   restore --from <snapshot file>, then serve's flags: a new cluster of one, this node
   snapshot --admin <addr>
   add-member --admin <addr> --member <n>=<peer addr>,<client addr>,<admin addr> [--learner]
@@ -148,7 +149,7 @@ pub fn run_with<S: Service + 'static>(
             if config.admin_token.is_none() && config.tls.is_none() {
                 eprintln!("warning: {ADMIN_TOKEN} isn't set, so anyone who can reach the admin listener can run it");
             }
-            if config.peer_token.is_none() && config.tls.is_none() {
+            if config.peer_token.is_none() && config.tls.as_ref().is_none_or(|t| t.peer_ca.is_none()) {
                 eprintln!(
                     "warning: {PEER_TOKEN} isn't set, so anyone who can reach the peer listener can act as a node"
                 );
@@ -380,15 +381,24 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
         peer_addrs: peers,
         admin_token: None,
         peer_token: None,
-        tls: tls_flags(args, ["--tls-cert", "--tls-key", "--tls-peer-ca", "--tls-admin-ca"])?.map(
-            |[cert, key, peer_ca, admin_ca]| NodeTls {
-                cert: cert.into(),
-                key: key.into(),
-                peer_ca: peer_ca.into(),
-                admin_ca: admin_ca.into(),
-            },
-        ),
+        tls: node_tls(args)?,
     })
+}
+
+/// `serve`'s TLS: none, or a certificate, key and admin CA, and a peer CA for TLS beyond the admin
+/// listener.
+fn node_tls(args: &[String]) -> Result<Option<NodeTls>, String> {
+    let peer_ca = optional_flag(args, "--tls-peer-ca")?;
+    match tls_flags(args, ["--tls-cert", "--tls-key", "--tls-admin-ca"])? {
+        Some([cert, key, admin_ca]) => Ok(Some(NodeTls {
+            cert: cert.into(),
+            key: key.into(),
+            peer_ca: peer_ca.map(Into::into),
+            admin_ca: admin_ca.into(),
+        })),
+        None if peer_ca.is_some() => Err("--tls-peer-ca takes --tls-cert, --tls-key and --tls-admin-ca".into()),
+        None => Ok(None),
+    }
 }
 
 /// `serve`'s flags for what an operator tunes, over `config`, which [`run_with`]'s closure may
@@ -509,7 +519,7 @@ fn members(list: &str) -> Result<Vec<(NodeId, SocketAddr)>, String> {
 mod tests {
     use std::time::Duration;
 
-    use super::{learners, optional_flag, serve_config, tls_flags, tune};
+    use super::{learners, node_tls, optional_flag, serve_config, tls_flags, tune};
     use crate::driver::Fsync;
     use crate::raft::NodeId;
 
@@ -550,6 +560,19 @@ mod tests {
         assert_eq!(tls_flags(&args(&["--a", "1", "--b", "2"]), names), Ok(Some(["1".into(), "2".into()])));
         assert!(tls_flags(&args(&["--a", "1"]), names).is_err());
         assert!(tls_flags(&args(&["--a"]), names).is_err());
+    }
+
+    /// Without `--tls-peer-ca`, TLS on the admin listener only; with it alone, refused.
+    #[test]
+    fn tls_without_a_peer_ca_is_the_admin_listeners_alone() {
+        let args = |a: &[&str]| a.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+        let tls = ["--tls-cert", "c", "--tls-key", "k", "--tls-admin-ca", "a"];
+        let admin_only = node_tls(&args(&tls)).unwrap().unwrap();
+        assert_eq!((admin_only.peer_ca, admin_only.admin_ca), (None, "a".into()));
+        let all = node_tls(&args(&[&tls[..], &["--tls-peer-ca", "p"]].concat())).unwrap().unwrap();
+        assert_eq!(all.peer_ca, Some("p".into()));
+        assert!(node_tls(&args(&["--tls-peer-ca", "p"])).is_err());
+        assert!(node_tls(&args(&[])).unwrap().is_none());
     }
 
     /// A flag given without its value is an error, not taken for absent.

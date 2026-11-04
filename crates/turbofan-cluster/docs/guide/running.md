@@ -197,5 +197,9 @@ member, as with the peer token. Certificates are read when the node starts, so r
 rolling restart. A node with TLS and one without can't talk, so a cluster turns TLS on or off all
 at once.
 
+Leave out `--tls-peer-ca` (`tls::NodeTls::admin_only`, with no peer CA) and only the admin listener
+has TLS: peers and clients stay on plain TCP, keep the peer token. That's each node's own, so a
+running cluster can take it one node at a time.
+
 Without the `tls` feature the API is the same, but loading any TLS configuration is an error, and
 the flags are refused: there's never TLS to run, nor a TLS dependency to license.

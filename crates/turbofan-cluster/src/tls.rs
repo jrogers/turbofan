@@ -1,4 +1,5 @@
-//! TLS, optional, on all three listeners, from PEM files: rustls, TLS 1.3 only.
+//! TLS, optional, on all three listeners or the admin listener alone, from PEM files: rustls,
+//! TLS 1.3 only.
 //!
 //! A node presents its certificate on each listener, and to the peers it dials. Peers check each
 //! other's against the peer CA, both ways; operators present one the admin CA signed; clients
@@ -8,6 +9,9 @@
 //!
 //! A peer certificate stands for the cluster, not for one node: any node with one may say it's
 //! any member, as with the peer token.
+//!
+//! Without a peer CA ([`NodeTls::admin_only`]), only operators connect over TLS: peers and clients
+//! stay on plain TCP, so a cluster can put TLS on its admin listeners alone, one node at a time.
 //!
 //! Only with the `tls` feature. Without it the API is the same, but loading any TLS
 //! configuration ([`ClientTls::load`], or `serve` with a [`NodeTls`]) is an
@@ -39,8 +43,9 @@ pub struct NodeTls {
     pub cert: PathBuf,
     /// The certificate's private key.
     pub key: PathBuf,
-    /// The CA that signed every node's certificate.
-    pub peer_ca: PathBuf,
+    /// The CA that signed every node's certificate. With none, TLS is on the admin listener only:
+    /// peers and clients are plain TCP.
+    pub peer_ca: Option<PathBuf>,
     /// The CA that signed operators' certificates.
     pub admin_ca: PathBuf,
 }
@@ -55,7 +60,14 @@ impl NodeTls {
         peer_ca: impl Into<PathBuf>,
         admin_ca: impl Into<PathBuf>,
     ) -> Self {
-        Self { cert: cert.into(), key: key.into(), peer_ca: peer_ca.into(), admin_ca: admin_ca.into() }
+        Self { cert: cert.into(), key: key.into(), peer_ca: Some(peer_ca.into()), admin_ca: admin_ca.into() }
+    }
+
+    /// TLS on the admin listener only: the node's certificate `cert` and its `key`, and the
+    /// `admin_ca` that signed operators'. Peers and clients are plain TCP.
+    #[must_use]
+    pub fn admin_only(cert: impl Into<PathBuf>, key: impl Into<PathBuf>, admin_ca: impl Into<PathBuf>) -> Self {
+        Self { cert: cert.into(), key: key.into(), peer_ca: None, admin_ca: admin_ca.into() }
     }
 }
 
@@ -91,19 +103,22 @@ pub(crate) trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream for T {}
 pub(crate) type Conn = Box<dyn Stream>;
 
-/// A node's TLS, loaded: what each listener accepts with, and what it dials peers with.
+/// A node's TLS, loaded: what each listener accepts with, and what it dials peers with. Without
+/// a peer CA, only the admin listener's.
 #[derive(Clone)]
 pub(crate) struct Loaded {
-    pub(crate) peer: Acceptor,
-    pub(crate) client: Acceptor,
+    pub(crate) peer: Option<Acceptor>,
+    pub(crate) client: Option<Acceptor>,
     pub(crate) admin: Acceptor,
-    pub(crate) dial: ClientTls,
+    pub(crate) dial: Option<ClientTls>,
 }
 
 impl Loaded {
     pub(crate) fn load(tls: &NodeTls) -> io::Result<Self> {
-        let (peer, client, admin) = imp::acceptors(tls)?;
-        Ok(Self { peer, client, admin, dial: ClientTls::load(&tls.peer_ca, Some((&tls.cert, &tls.key)))? })
+        let (cluster, admin) = imp::acceptors(tls)?;
+        let dial = tls.peer_ca.as_deref().map(|ca| ClientTls::load(ca, Some((&tls.cert, &tls.key)))).transpose()?;
+        let (peer, client) = cluster.unzip();
+        Ok(Self { peer, client, admin, dial })
     }
 }
 
@@ -163,8 +178,8 @@ mod rustls_impl {
         Ok(Connector::from(Arc::new(config)))
     }
 
-    /// The peer, client and admin listeners' acceptors.
-    pub(super) fn acceptors(tls: &NodeTls) -> io::Result<(Acceptor, Acceptor, Acceptor)> {
+    /// The peer and client listeners' acceptors, if there's a peer CA, and the admin listener's.
+    pub(super) fn acceptors(tls: &NodeTls) -> io::Result<(Option<(Acceptor, Acceptor)>, Acceptor)> {
         let (chain, key) = (certs(&tls.cert)?, private_key(&tls.key)?);
         let server = |ca: Option<&Path>| -> io::Result<Acceptor> {
             let builder = ServerConfig::builder_with_provider(provider())
@@ -181,7 +196,11 @@ mod rustls_impl {
             let config = builder.with_single_cert(chain.clone(), key.clone_key()).map_err(invalid)?;
             Ok(Acceptor::from(Arc::new(config)))
         };
-        Ok((server(Some(&tls.peer_ca))?, server(None)?, server(Some(&tls.admin_ca))?))
+        let cluster = match &tls.peer_ca {
+            Some(peer_ca) => Some((server(Some(peer_ca))?, server(None)?)),
+            None => None,
+        };
+        Ok((cluster, server(Some(&tls.admin_ca))?))
     }
 
     pub(super) async fn connect(tls: &Connector, addr: &str, stream: TcpStream) -> io::Result<Conn> {
@@ -253,7 +272,7 @@ mod without {
         Err(unsupported())
     }
 
-    pub(super) fn acceptors(_tls: &NodeTls) -> io::Result<(Acceptor, Acceptor, Acceptor)> {
+    pub(super) fn acceptors(_tls: &NodeTls) -> io::Result<(Option<(Acceptor, Acceptor)>, Acceptor)> {
         Err(unsupported())
     }
 
@@ -279,7 +298,7 @@ mod without {
             let error = ClientTls::load(Path::new("ca.pem"), None).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
             let file = PathBuf::from;
-            let node = NodeTls { cert: file("c"), key: file("k"), peer_ca: file("p"), admin_ca: file("a") };
+            let node = NodeTls { cert: file("c"), key: file("k"), peer_ca: Some(file("p")), admin_ca: file("a") };
             assert_eq!(Loaded::load(&node).err().map(|e| e.kind()), Some(std::io::ErrorKind::Unsupported));
         }
     }

@@ -13,10 +13,15 @@ a patch version (0.1.1) doesn't.
   `replay --capture <dir> [--to <n>]` (`capture::replay`) restores the snapshot into the service
   and applies the entries, printing every effect, to reproduce a bug from production or compare
   two versions on real traffic. An older node doesn't answer `Capture`.
+- TLS on the admin listener only: `serve` without `--tls-peer-ca` (`NodeTls::admin_only`) puts it
+  there, and leaves peers and clients on plain TCP. Each node's own, so it can go on one node at a
+  time.
 
 ### Breaking
 
 - `AdminError` has `CaptureFailed`.
+- `NodeTls::peer_ca` is an `Option`: none for TLS on the admin listener only. `NodeTls::new` is as
+  it was.
 
 ## 0.4.0 (2026-11-04)
 

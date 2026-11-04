@@ -89,7 +89,7 @@ pub struct Config {
     pub peer_addrs: Vec<(NodeId, SocketAddr)>,
     /// Where it listens for clients.
     pub client_listen: SocketAddr,
-    /// Where it listens for operators. Without TLS, keep it on a private interface.
+    /// Where it listens for operators. Without TLS on it, keep it on a private interface.
     pub admin_listen: SocketAddr,
     /// The token an operator's hello must carry, at most [`MAX_TOKEN_BYTES`]: a connection without
     /// it is refused. With none, any is taken.
@@ -97,8 +97,9 @@ pub struct Config {
     /// The token every node's hello to a peer carries, and must, at most [`MAX_TOKEN_BYTES`]: the
     /// same on every node. With none, a node sends none and takes any peer.
     pub peer_token: Option<Vec<u8>>,
-    /// TLS on all three listeners and to peers. With none, everything is plain TCP, and every
-    /// node of the cluster must agree.
+    /// TLS on all three listeners and to peers, or with no peer CA, on the admin listener only.
+    /// With none, everything is plain TCP. Every node of the cluster must agree on TLS to peers
+    /// and clients; the admin listener's is each node's own.
     pub tls: Option<NodeTls>,
 }
 
@@ -232,15 +233,20 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     let epoch = Arc::new(AtomicU64::new(node.epoch()));
     let hello = Hello { service_id: config.service_id, node_id: Some(id), epoch };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
-    let acceptor = |pick: fn(&tls::Loaded) -> &TlsAcceptor| tls.as_ref().map(|t| pick(t).clone());
-    let dial = tls.as_ref().map(|t| t.dial.clone());
-    tasks.spawn(accept_peers(peer_listener, hello.clone(), peer_token.clone(), acceptor(|t| &t.peer), inputs.clone()));
+    let (dial, tls_peers) = (tls.as_ref().and_then(|t| t.dial.clone()), tls.as_ref().and_then(|t| t.peer.clone()));
+    tasks.spawn(accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls_peers, inputs.clone()));
     let next_conn = Arc::new(AtomicU64::new(1));
-    let (tls, idle) = (acceptor(|t| &t.client), Some(config.node.session_timeout));
-    let clients =
-        Gate { role: wire::Role::Client, hello: hello.clone(), token: None, tls, inputs: client_inputs, idle };
+    let (tls_clients, idle) = (tls.as_ref().and_then(|t| t.client.clone()), Some(config.node.session_timeout));
+    let clients = Gate {
+        role: wire::Role::Client,
+        hello: hello.clone(),
+        token: None,
+        tls: tls_clients,
+        inputs: client_inputs,
+        idle,
+    };
     let token = config.admin_token.as_deref().map(Arc::from);
-    let (tls_admin, admin_inputs) = (acceptor(|t| &t.admin), inputs.clone());
+    let (tls_admin, admin_inputs) = (tls.as_ref().map(|t| t.admin.clone()), inputs.clone());
     let operators =
         Gate { role: wire::Role::Admin, token, tls: tls_admin, inputs: admin_inputs, idle: None, ..clients.clone() };
     tasks.spawn(accept(client_listener, clients, next_conn.clone()));
