@@ -392,6 +392,103 @@ mod tests {
         client
     }
 
+    /// A client with session 9 open on its first connection, and what it wrote taken.
+    fn open() -> Client {
+        let mut client = Client::new(["a", "b"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
+        client.on_connected(0);
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0 }));
+        while client.poll_event().is_some() {}
+        client.take_frames();
+        client
+    }
+
+    fn decoded(frames: &[Vec<u8>]) -> Vec<String> {
+        frames.iter().map(|f| format!("{:?}", codec::decode_frame(f).unwrap().unwrap().0)).collect()
+    }
+
+    /// A keepalive's ack says what's applied, as a response does: a service that doesn't answer
+    /// still lets the client let go of what it sent, and `applied` advance.
+    #[test]
+    fn a_keepalive_ack_lets_go_of_what_is_applied() {
+        let mut client = open();
+        for _ in 0..3 {
+            client.send(b"quiet".to_vec()).unwrap();
+        }
+        deliver(&mut client, &frame(&wire::KeepAliveAck { applied_seq: 2 }));
+        assert_eq!((client.applied(), client.unacked()), (2, 1));
+        deliver(&mut client, &frame(&wire::KeepAliveAck { applied_seq: 1 }));
+        assert_eq!((client.applied(), client.unacked()), (2, 1), "never back");
+    }
+
+    /// `close` says so to the cluster, once a session is open on the connection.
+    #[test]
+    fn close_closes_an_open_session() {
+        let mut client = open();
+        client.close();
+        assert_eq!(decoded(&client.take_frames()), ["Close(CloseRef { session: 9 })"]);
+        client.on_disconnected();
+        client.close();
+        assert!(client.take_frames().is_empty(), "no connection with the session open");
+    }
+
+    /// An idle session sends a keepalive once a `keepalive` (1 s) has passed, and is next due a
+    /// `keepalive` after.
+    #[test]
+    fn an_idle_session_keeps_alive() {
+        let mut client = open();
+        assert_eq!(client.session(), Some(SessionId(9)));
+        let second = 1_000_000_000;
+        assert_eq!(client.next_deadline(), second);
+        client.on_tick(second - 1);
+        assert!(client.take_frames().is_empty(), "not yet");
+        client.on_tick(second);
+        assert_eq!(decoded(&client.take_frames()), ["KeepAlive(KeepAliveRef { session: 9 })"]);
+        assert_eq!(client.next_deadline(), 2 * second);
+    }
+
+    /// A dropped connection is tried again at the same member if the session was open there,
+    /// since a reset needn't mean it's gone; one that never opened tries the next, round.
+    #[test]
+    fn a_dropped_connection_tries_the_same_member_or_the_next() {
+        let mut client = open();
+        client.on_disconnected();
+        assert_eq!(client.target(), "a", "the session was open there");
+        client.on_disconnected();
+        assert_eq!(client.target(), "b");
+        client.on_disconnected();
+        assert_eq!(client.target(), "a", "round again");
+    }
+
+    /// A gap in the responses is reported as the ones missed, then the next delivered.
+    #[test]
+    fn a_gap_in_the_responses_is_reported() {
+        let mut client = open();
+        let egress = |egress_seq| frame(&wire::Egress { session: 9, egress_seq, applied_seq: 0, payload: b"r" });
+        deliver(&mut client, &egress(1));
+        deliver(&mut client, &egress(4));
+        let events: Vec<Event> = std::iter::from_fn(|| client.poll_event()).collect();
+        let message = Event::Message(b"r".to_vec());
+        assert_eq!(events, [message.clone(), Event::Lost { from: 2, to: 4 }, message]);
+    }
+
+    /// What's for another session is ignored: its responses, and its closing.
+    #[test]
+    fn another_sessions_frames_are_ignored() {
+        let mut client = open();
+        deliver(&mut client, &frame(&wire::Egress { session: 8, egress_seq: 1, applied_seq: 0, payload: b"r" }));
+        deliver(&mut client, &frame(&wire::Closed { session: 8, reason: CloseReason::Client }));
+        assert_eq!(client.poll_event(), None);
+        assert!(client.send(b"order".to_vec()).is_ok(), "still open");
+    }
+
+    /// A payload of the most a payload can be is sent; one byte more is refused.
+    #[test]
+    fn a_payload_of_the_limit_is_sent() {
+        let mut client = open();
+        assert!(client.send(vec![0; MAX_PAYLOAD_BYTES]).is_ok());
+        assert_eq!(client.send(vec![0; MAX_PAYLOAD_BYTES + 1]), Err(SendError::TooLong));
+    }
+
     fn opened(applied_seq: u64, last_egress_seq: u64) -> Vec<u8> {
         frame(&wire::Opened { session: 9, applied_seq, last_egress_seq })
     }

@@ -82,6 +82,8 @@ with one wouldn't start. What's in the bytes changes by this file's rules instea
 ## Checking a change
 
 - Mark new fields, groups and data with `sinceVersion`, and bump `version` in `cluster.xml`.
+- `tests/golden.rs` reads what each released version wrote (`tests/golden/<version>/`): a
+  snapshot, and the client protocol's frames. They must still read, as they say.
 - A test that an older version's message still decodes, and a newer one's is read past
   (`codec::tests::a_newer_versions_frames_are_tolerated` is the pattern).
 - For a change of the third kind, the simulator's rolling upgrade: the nodes start on the old

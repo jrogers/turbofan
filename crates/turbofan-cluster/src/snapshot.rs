@@ -342,6 +342,31 @@ mod tests {
         assert_eq!(list(dir.path()).unwrap(), [40], "none is one: the newest");
     }
 
+    /// A file that isn't the snapshot its name says is refused, each way it can fail on its own:
+    /// another magic, another index, or cut short.
+    #[test]
+    fn a_snapshot_that_isnt_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), 10, 2, members(), writer(b"state"), true).unwrap();
+        let good = fs::read(path(dir.path(), 10)).unwrap();
+        let refused = |bytes: &[u8], what: &str| {
+            fs::write(path(dir.path(), 10), bytes).unwrap();
+            let error = load(dir.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains(what), "{error}");
+        };
+        let mut magic = good.clone();
+        magic[0] ^= 1;
+        refused(&magic, "not a snapshot");
+        let mut index = good.clone();
+        index[8] ^= 1;
+        refused(&index, "not a snapshot");
+        refused(&good[..good.len() - 1], "checksum mismatch");
+        refused(&good[..HEADER + 4], "wrong length");
+        fs::write(path(dir.path(), 10), &good).unwrap();
+        assert!(load(dir.path()).unwrap().is_some(), "and whole, it's read");
+    }
+
     /// A copy of a snapshot, wherever it's put, opens checked, and damaged it doesn't.
     #[test]
     fn a_copied_snapshot_opens_checked() {

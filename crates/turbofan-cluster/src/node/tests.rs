@@ -4,7 +4,8 @@ const MS: u64 = 1_000_000;
 const TIMEOUT: u64 = 1000 * MS;
 
 /// Logs every callback. A message `at <id> <ms>` schedules a timer and `cancel <id>`
-/// cancels one; any message is echoed.
+/// cancels one, `propose <what>` proposes it, and `close` closes the session; any but `quiet`
+/// and `close` is echoed.
 #[derive(Debug, Default)]
 struct Recorder(Vec<String>);
 
@@ -30,6 +31,7 @@ impl Service for Recorder {
             ["cancel", id] => ctx.cancel_timer(id.parse().unwrap()),
             ["propose", what] => ctx.propose(what.as_bytes()).expect("a client payload fits"),
             ["quiet"] => return,
+            ["close"] => return ctx.close_session(session),
             _ => {}
         }
         ctx.send(session, payload).expect("a client payload fits");
@@ -160,7 +162,9 @@ fn messages_apply_once_in_order_and_a_reattach_replays_responses() {
     node.on_disconnect(7);
     let sent = client(&mut node, 8, &wire::Reattach { session: session.0, last_egress_seq: 1, credentials: b"" }, 0);
     assert_eq!(sent.len(), 2, "{sent:?}");
-    assert!(sent[0].contains("Opened") && sent[0].contains("applied_seq: 2"));
+    assert!(sent[0].contains("Opened") && sent[0].contains("applied_seq: 2"), "{sent:?}");
+    // The last response it sent, which a client that saw more knows the cluster lost.
+    assert!(sent[0].contains("last_egress_seq: Some(2)"), "{sent:?}");
     assert!(sent[1].contains("egress_seq: 2"));
     // The old connection is no longer the session's.
     assert!(client(&mut node, 7, &message(3, b"three"), 0)[0].contains("NoSession"));
@@ -204,6 +208,76 @@ fn a_session_proposes_each_message_once_within_its_window() {
     assert_eq!(node.service.0.iter().filter(|e| e.starts_with("message")).count(), MAX_UNACKED);
     // Once they apply, the window moves on.
     assert_eq!(submit(&mut node, crate::widen(MAX_UNACKED) + 1), 1);
+}
+
+/// A service closes a session: the client is told why, and the service called back.
+#[test]
+fn the_service_closes_a_session() {
+    let mut node = leader();
+    let session = open(&mut node, 7, 0);
+    let sent = client(&mut node, 7, &wire::Message { session: session.0, client_seq: 1, payload: b"close" }, 0);
+    assert!(sent.iter().any(|s| s.contains("Closed") && s.contains("Service")), "{sent:?}");
+    assert!(node.service.0.contains(&format!("close {session} Service")));
+    let reattach = wire::Reattach { session: session.0, last_egress_seq: 0, credentials: b"" };
+    assert!(client(&mut node, 8, &reattach, 0)[0].contains("NoSession"), "gone");
+}
+
+/// Sessions open up to `MAX_SESSIONS`; past it, the next is refused, until one closes.
+#[test]
+fn sessions_open_up_to_the_limit() {
+    let mut node = leader();
+    let first = open(&mut node, 0, 0);
+    for conn in 1..crate::widen(MAX_SESSIONS) {
+        open(&mut node, conn, 0);
+    }
+    let past = crate::widen(MAX_SESSIONS);
+    assert!(client(&mut node, past, &wire::Connect { credentials: b"" }, 0)[0].contains("NoSession"));
+    client(&mut node, 0, &wire::Close { session: first.0 }, 0);
+    assert!(client(&mut node, past, &wire::Connect { credentials: b"" }, 0)[0].contains("Opened"));
+}
+
+/// A snapshot's counts are refused past their limits, and read up to them: what's read at the
+/// limit runs out of messages instead, which is a different error.
+#[test]
+fn a_snapshots_counts_are_checked_at_their_limits() {
+    let node_state = |sessions: usize| {
+        let sessions = u32::try_from(sessions).unwrap();
+        let node = wire::NodeState {
+            applied: 1,
+            time: 0,
+            next_proposal: 0,
+            sessions,
+            timers: 0,
+            proposals: 0,
+            protocol: 0,
+            service_version: 0,
+            epoch: 1,
+        };
+        let mut bytes = Vec::new();
+        codec::encode_frame(&node, &mut bytes).unwrap();
+        bytes
+    };
+    let error = |bytes: Vec<u8>| decode_state(&mut &bytes[..]).unwrap_err().to_string();
+    assert!(error(node_state(MAX_SESSIONS + 1)).contains("too many sessions"));
+    assert!(!error(node_state(MAX_SESSIONS)).contains("too many sessions"));
+
+    let ring = |ring: usize| {
+        let mut bytes = node_state(1);
+        let ring = u32::try_from(ring).unwrap();
+        let session = wire::SessionState { session: 1, last_seq: 0, next_egress: 1, ring, principal: b"" };
+        codec::encode_frame(&session, &mut bytes).unwrap();
+        bytes
+    };
+    assert!(error(ring(MAX_EGRESS_RING + 1)).contains("too long a ring"));
+    assert!(!error(ring(MAX_EGRESS_RING)).contains("too long a ring"));
+
+    let frame_of = |len: usize| {
+        let mut bytes = u32::try_from(len).unwrap().to_le_bytes().to_vec();
+        bytes.resize(4 + 16, 0);
+        bytes
+    };
+    assert!(error(frame_of(codec::MAX_FRAME_BYTES + 1)).contains("over MAX_FRAME_BYTES"));
+    assert!(!error(frame_of(codec::MAX_FRAME_BYTES)).contains("over MAX_FRAME_BYTES"));
 }
 
 /// A client the service refuses gets no session; one it accepts opens one as its principal,
