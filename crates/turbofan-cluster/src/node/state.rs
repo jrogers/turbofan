@@ -33,6 +33,19 @@ pub(super) struct State {
     pub(super) time: u64,
     /// The cluster's epoch: 0 until its first leader's `Epoch` entry is applied.
     pub(super) epoch: u64,
+    /// The index `epoch` began at: a session opened from it on is this epoch's, and one before
+    /// it was carried over from an earlier one (promoted or restored from). `u64::MAX` if
+    /// unknown, from an older node's snapshot: every session is taken for any epoch's.
+    pub(super) epoch_since: u64,
+}
+
+impl State {
+    /// `session` may be reattached to by a client that last had it in `epoch` (0 for unknown):
+    /// one of another epoch, opened since this one began, isn't the one the client had. Its ID,
+    /// the index it opened at, was reused by a cluster that logged on from behind the old one.
+    pub(super) fn of_epoch(&self, session: SessionId, epoch: u64) -> bool {
+        epoch == 0 || epoch == self.epoch || session.0 < self.epoch_since
+    }
 }
 
 /// Encodes the replicated state, which a snapshot starts with: SBE messages, each framed as on
@@ -52,6 +65,7 @@ pub(super) fn encode_state(state: &State) -> Vec<u8> {
         protocol: state.protocol,
         service_version: state.service_version,
         epoch: state.epoch,
+        epoch_since: state.epoch_since,
     };
     put(&mut out, &node);
     for (&session, s) in &state.sessions {
@@ -87,6 +101,7 @@ pub(super) fn decode_state(from: &mut dyn Read) -> io::Result<State> {
         protocol: n.protocol(),
         service_version: n.service_version(),
         epoch: n.epoch(),
+        epoch_since: n.epoch_since().unwrap_or(u64::MAX),
         ..State::default()
     };
     let (sessions, timers, proposals) = (n.sessions(), n.timers(), n.proposals());
@@ -127,8 +142,8 @@ pub(super) fn decode_state(from: &mut dyn Read) -> io::Result<State> {
 }
 
 /// The `NodeState` that starts a snapshot's bytes, read from `from`, written again with
-/// `epoch`: for a cluster restored from the snapshot, which mustn't be taken for the one it was
-/// taken from. `from` is left after it, at the rest of the state, which is the same.
+/// `epoch`, begun after the snapshot: for a cluster restored from the snapshot, which mustn't be
+/// taken for the one it was taken from. `from` is left after it, at the rest of the state, which is the same.
 ///
 /// # Errors
 ///
@@ -146,6 +161,7 @@ pub(crate) fn with_epoch(from: &mut dyn Read, epoch: u64) -> io::Result<Vec<u8>>
         protocol: n.protocol(),
         service_version: n.service_version(),
         epoch,
+        epoch_since: n.applied() + 1,
     };
     let mut out = Vec::new();
     codec::encode_frame(&node, &mut out).expect("a NodeState is within its limits");

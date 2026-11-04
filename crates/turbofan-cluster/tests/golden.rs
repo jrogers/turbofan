@@ -67,12 +67,12 @@ fn frames() -> Vec<u8> {
     let role = wire::Role::Client;
     put(&mut out, &wire::Hello { magic: codec::MAGIC, service_id: SERVICE_ID, role, node_id: 0, epoch: 0, token: b"" });
     put(&mut out, &wire::Connect { credentials: b"desk" });
-    put(&mut out, &wire::Reattach { session: 9, last_egress_seq: 4, credentials: b"desk" });
+    put(&mut out, &wire::Reattach { session: 9, last_egress_seq: 4, epoch: 3, credentials: b"desk" });
     put(&mut out, &wire::Message { session: 9, client_seq: 5, payload: b"order" });
     put(&mut out, &wire::KeepAlive { session: 9 });
     put(&mut out, &wire::Close { session: 9 });
     put(&mut out, &wire::Redirect { leader: 2, addr: b"10.0.0.2:7101" });
-    put(&mut out, &wire::Opened { session: 9, applied_seq: 5, last_egress_seq: 4 });
+    put(&mut out, &wire::Opened { session: 9, applied_seq: 5, last_egress_seq: 4, epoch: 3 });
     put(&mut out, &wire::Egress { session: 9, egress_seq: 5, applied_seq: 5, payload: b"fill" });
     put(&mut out, &wire::KeepAliveAck { applied_seq: 5 });
     put(&mut out, &wire::Closed { session: 9, reason: CloseReason::Timeout });
@@ -80,19 +80,21 @@ fn frames() -> Vec<u8> {
 }
 
 /// What [`frames`] wrote, as this version reads it. A version before 0.2.0 (schema version 4)
-/// didn't say the session's last response in `Opened`.
+/// didn't say the session's last response in `Opened`, nor one before 0.4.0 (schema version 5)
+/// the epoch in `Opened` and `Reattach`.
 fn expected(version: &str) -> Vec<String> {
     let last_egress = if version.starts_with("0.1.") { "None" } else { "Some(4)" };
+    let epoch = if ["0.1.", "0.2.", "0.3."].iter().any(|v| version.starts_with(v)) { "None" } else { "Some(3)" };
     [
         // Secrets are kept out of debug output: they're checked apart.
         "Hello(HelloRef { magic: 1414745155, service_id: 7, role: Client, node_id: 0, epoch: 0, token: *** })".into(),
         "Connect(ConnectRef { credentials: *** })".into(),
-        "Reattach(ReattachRef { session: 9, last_egress_seq: 4, credentials: *** })".into(),
+        format!("Reattach(ReattachRef {{ session: 9, last_egress_seq: 4, epoch: {epoch}, credentials: *** }})"),
         "Message(MessageRef { session: 9, client_seq: 5, payload: [111, 114, 100, 101, 114] })".into(),
         "KeepAlive(KeepAliveRef { session: 9 })".into(),
         "Close(CloseRef { session: 9 })".into(),
         "Redirect(RedirectRef { leader: 2, addr: [49, 48, 46, 48, 46, 48, 46, 50, 58, 55, 49, 48, 49] })".into(),
-        format!("Opened(OpenedRef {{ session: 9, applied_seq: 5, last_egress_seq: {last_egress} }})"),
+        format!("Opened(OpenedRef {{ session: 9, applied_seq: 5, last_egress_seq: {last_egress}, epoch: {epoch} }})"),
         "Egress(EgressRef { session: 9, egress_seq: 5, applied_seq: 5, payload: [102, 105, 108, 108] })".into(),
         "KeepAliveAck(KeepAliveAckRef { applied_seq: 5 })".into(),
         "Closed(ClosedRef { session: 9, reason: Timeout })".into(),
@@ -157,7 +159,7 @@ fn every_versions_snapshot_restores() {
             node.on_tick(now);
             drive(&mut node, now);
         }
-        let reattach = wire::Reattach { session, last_egress_seq: 0, credentials: b"" };
+        let reattach = wire::Reattach { session, last_egress_seq: 0, epoch: node.epoch(), credentials: b"" };
         let mut frame = Vec::new();
         codec::encode_frame(&reattach, &mut frame).unwrap();
         node.on_client(1, &codec::decode_frame(&frame).unwrap().unwrap().0, now);

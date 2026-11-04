@@ -22,7 +22,7 @@ const MS: u64 = 1_000_000;
 #[derive(Debug, Arbitrary)]
 enum Step {
     Connect { conn: u8 },
-    Reattach { conn: u8, session: u8, last_egress_seq: u64 },
+    Reattach { conn: u8, session: u8, last_egress_seq: u64, epoch: u64 },
     // `op` is what the service does with it: see `Checker::on_message`.
     Message { conn: u8, session: u8, client_seq: u64, op: u8, arg: u8 },
     KeepAlive { conn: u8, session: u8 },
@@ -142,9 +142,10 @@ fuzz_target!(|steps: Vec<Step>| {
         };
         match step {
             Step::Connect { conn } => client(&mut node, conn, frame(&wire::Connect { credentials: b"" }), now),
-            Step::Reattach { conn, session, last_egress_seq } => {
+            Step::Reattach { conn, session, last_egress_seq, epoch } => {
                 let session = u64::from(session);
-                client(&mut node, conn, frame(&wire::Reattach { session, last_egress_seq, credentials: b"" }), now);
+                let reattach = wire::Reattach { session, last_egress_seq, epoch, credentials: b"" };
+                client(&mut node, conn, frame(&reattach), now);
             }
             Step::Message { conn, session, client_seq, op, arg } => {
                 let mut payload = client_seq.to_le_bytes().to_vec();

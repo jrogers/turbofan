@@ -160,7 +160,8 @@ fn messages_apply_once_in_order_and_a_reattach_replays_responses() {
 
     // After a failover the client reattaches on a new connection, having seen response 1.
     node.on_disconnect(7);
-    let sent = client(&mut node, 8, &wire::Reattach { session: session.0, last_egress_seq: 1, credentials: b"" }, 0);
+    let sent =
+        client(&mut node, 8, &wire::Reattach { session: session.0, last_egress_seq: 1, epoch: 0, credentials: b"" }, 0);
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(sent[0].contains("Opened") && sent[0].contains("applied_seq: 2"), "{sent:?}");
     // The last response it sent, which a client that saw more knows the cluster lost.
@@ -232,7 +233,7 @@ fn the_service_closes_a_session() {
     let sent = client(&mut node, 7, &wire::Message { session: session.0, client_seq: 1, payload: b"close" }, 0);
     assert!(sent.iter().any(|s| s.contains("Closed") && s.contains("Service")), "{sent:?}");
     assert!(node.service.0.contains(&format!("close {session} Service")));
-    let reattach = wire::Reattach { session: session.0, last_egress_seq: 0, credentials: b"" };
+    let reattach = wire::Reattach { session: session.0, last_egress_seq: 0, epoch: 0, credentials: b"" };
     assert!(client(&mut node, 8, &reattach, 0)[0].contains("NoSession"), "gone");
 }
 
@@ -266,6 +267,7 @@ fn a_snapshots_counts_are_checked_at_their_limits() {
             protocol: 0,
             service_version: 0,
             epoch: 1,
+            epoch_since: 0,
         };
         let mut bytes = Vec::new();
         codec::encode_frame(&node, &mut bytes).unwrap();
@@ -305,7 +307,7 @@ fn credentials_open_a_session_and_reattach_to_it() {
     let session = node.local.attached.iter().find(|&(_, &c)| c == 2).map(|(&s, _)| s).unwrap();
     assert!(node.service.0.contains(&format!("open {session} alice")));
 
-    let reattach = |credentials| wire::Reattach { session: session.0, last_egress_seq: 0, credentials };
+    let reattach = |credentials| wire::Reattach { session: session.0, last_egress_seq: 0, epoch: 0, credentials };
     assert!(client(&mut node, 3, &reattach(b"mallory"), 0)[0].contains("Refused"), "a guessed session");
     assert!(client(&mut node, 4, &reattach(b"alice"), 0)[0].contains("Opened"));
 }
@@ -420,6 +422,39 @@ fn the_first_leader_names_the_epoch() {
     assert_eq!(decode_state(&mut &bytes[..]).unwrap().epoch, epoch, "kept in snapshots");
     assert_ne!(mint_epoch(5, NodeId(1)), mint_epoch(5, NodeId(2)), "two nodes at once");
     assert_ne!(mint_epoch(0, NodeId(0)), 0);
+}
+
+/// A cluster promoted or restored logs on from its own last index, so it may give a session the
+/// ID of one the old cluster opened after: a client of that one, naming the old epoch, isn't let
+/// into it. A session from before the new epoch began was carried over, and is; and a client
+/// naming no epoch (an older one) is taken as before.
+#[test]
+fn a_session_of_another_epoch_is_not_reattached_to() {
+    let mut node = leader();
+    let old = node.epoch();
+    let carried = open(&mut node, 1, 0);
+    node.propose(&wire::Epoch { timestamp: 1, epoch: old + 1, promoted: 1 });
+    drive(&mut node);
+    assert_eq!(node.epoch(), old + 1);
+    assert!(carried.0 < node.state.epoch_since, "it began after");
+    let reused = open(&mut node, 2, 0);
+    let reattach =
+        |session: SessionId, epoch| wire::Reattach { session: session.0, last_egress_seq: 0, epoch, credentials: b"" };
+    let sent = client(&mut node, 3, &reattach(reused, old), 0);
+    assert!(sent[0].contains("NoSession"), "another epoch's: {sent:?}");
+    for epoch in [old + 1, 0] {
+        assert!(client(&mut node, 4, &reattach(reused, epoch), 0)[0].contains("Opened"), "epoch {epoch}");
+    }
+    let sent = client(&mut node, 5, &reattach(carried, old), 0);
+    assert!(sent[0].contains(&format!("epoch: Some({})", old + 1)), "carried over, and told the new: {sent:?}");
+
+    let bytes = encode_state(&node.state);
+    assert_eq!(decode_state(&mut &bytes[..]).unwrap().epoch_since, node.state.epoch_since, "kept in snapshots");
+    let mut rest = &bytes[..];
+    let mut restored = with_epoch(&mut rest, 9).unwrap();
+    restored.extend_from_slice(rest);
+    let restored = decode_state(&mut &restored[..]).unwrap();
+    assert_eq!((restored.epoch, restored.epoch_since), (9, node.applied() + 1), "restored, from after the snapshot");
 }
 
 /// A learner promoted leads alone, of a new epoch that replaces its cluster's, and says so

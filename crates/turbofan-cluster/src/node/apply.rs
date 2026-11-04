@@ -124,6 +124,8 @@ impl<S: Service> Node<S> {
     pub(super) fn apply_epoch(&mut self, index: u64, epoch: u64, promoted: bool) {
         if self.state.epoch == 0 || promoted {
             self.state.epoch = epoch;
+            // The first epoch has every session; a promoted standby's, those from here on.
+            self.state.epoch_since = if promoted { index } else { 0 };
         }
         if let Some((conn, request_id, at)) = self.promoting
             && at == epoch
@@ -156,7 +158,8 @@ impl<S: Service> Node<S> {
         if let Some(conn) = self.local.opening.remove(&session) {
             self.local.conns.insert(conn, Some(session));
             self.local.attached.insert(session, conn);
-            self.send_client(conn, &wire::Opened { session: session.0, applied_seq: 0, last_egress_seq: 0 });
+            let epoch = self.state.epoch;
+            self.send_client(conn, &wire::Opened { session: session.0, applied_seq: 0, last_egress_seq: 0, epoch });
         }
         if self.local.was_leader {
             self.local.activity.insert(session, self.now);

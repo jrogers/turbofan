@@ -109,6 +109,9 @@ pub struct Client {
     credentials: Vec<u8>,
     target: usize,
     session: Option<SessionId>,
+    /// The cluster's epoch, as the session's last `Opened` said (0 for none), for a reattach to
+    /// name: a cluster of another, which may have given its ID to another session, refuses it.
+    epoch: u64,
     /// The current connection is attached to the session.
     open: bool,
     closed: bool,
@@ -153,6 +156,7 @@ impl Client {
             credentials,
             target: 0,
             session: None,
+            epoch: 0,
             open: false,
             closed: false,
             next_seq: 1,
@@ -204,6 +208,7 @@ impl Client {
                 let reattach = wire::Reattach {
                     session: session.0,
                     last_egress_seq: self.last_egress,
+                    epoch: self.epoch,
                     credentials: &self.credentials,
                 };
                 push_frame(&mut self.frames, &reattach);
@@ -251,6 +256,7 @@ impl Client {
             }
             wire::Decoded::Opened(m) => {
                 self.session = Some(SessionId(m.session()));
+                self.epoch = m.epoch().unwrap_or(0);
                 self.open = true;
                 self.trim(m.applied_seq());
                 self.events.push_back(Event::Opened(SessionId(m.session())));
@@ -402,7 +408,7 @@ mod tests {
     fn reattached_to(opened: &[u8]) -> Client {
         let mut client = Client::new(["a", "b"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
         client.on_connected(0);
-        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0 }));
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0 }));
         for _ in 0..4 {
             client.send(b"order".to_vec()).unwrap();
         }
@@ -421,7 +427,7 @@ mod tests {
     fn open() -> Client {
         let mut client = Client::new(["a", "b"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
         client.on_connected(0);
-        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0 }));
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0 }));
         while client.poll_event().is_some() {}
         client.take_frames();
         client
@@ -537,7 +543,21 @@ mod tests {
     }
 
     fn opened(applied_seq: u64, last_egress_seq: u64) -> Vec<u8> {
-        frame(&wire::Opened { session: 9, applied_seq, last_egress_seq })
+        frame(&wire::Opened { session: 9, applied_seq, last_egress_seq, epoch: 0 })
+    }
+
+    /// A reattach names the epoch the last `Opened` said: none, from an older node.
+    #[test]
+    fn a_reattach_names_the_epoch_it_was_opened_in() {
+        let mut client = open();
+        let reattach = |client: &mut Client| {
+            client.on_disconnected();
+            client.on_connected(1);
+            decoded(&client.take_frames())
+        };
+        assert!(reattach(&mut client)[0].contains("epoch: Some(0)"), "none said");
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 5 }));
+        assert!(reattach(&mut client)[0].contains("epoch: Some(5)"));
     }
 
     /// A cluster with everything the client saw carries the session on, and is sent what it
@@ -579,9 +599,9 @@ mod tests {
     #[test]
     fn an_older_nodes_opened_is_checked_for_messages_only() {
         let mut older = opened(3, 1);
-        // Without `lastEgressSeq`, the block's last 8 bytes, and saying version 3, as an older
-        // node writes it.
-        older.truncate(older.len() - 8);
+        // Without `lastEgressSeq` and `epoch`, the block's last 16 bytes, and saying version 3, as
+        // an older node writes it.
+        older.truncate(older.len() - 16);
         let len = u32::try_from(older.len() - 4).unwrap();
         older[..4].copy_from_slice(&len.to_le_bytes());
         older[4..6].copy_from_slice(&16_u16.to_le_bytes());

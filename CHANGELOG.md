@@ -8,6 +8,13 @@ a patch version (0.1.1) doesn't.
 
 ### Fixed
 
+- A client reattaching after a recovery could be given another client's session. A session's
+  ID is the index it opened at, and a cluster promoted from a standby or restored from a backup
+  logs on from its own last index, so it may open a session under an ID the old cluster had
+  given one after they split. `Opened` says the cluster's epoch, a `Reattach` names it back, and
+  the snapshot keeps the index the epoch began at (schema version 5): a reattach naming another
+  epoch, to a session opened since, is refused (`CloseReason::NoSession`). A client naming none
+  (an older one), or a cluster whose snapshot an older node wrote, is taken as before.
 - A pre-vote granted in an earlier round counted in a later one, so one delayed past an election
   timeout could let a node cut off from the leader win a pre-vote, then depose it. `RequestVote`
   names its round and `Vote` echoes it (schema version 5); a vote from an older node, without

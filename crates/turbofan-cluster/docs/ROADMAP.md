@@ -19,14 +19,6 @@ down when they show.
 
 From a review of the crate, still open:
 
-- **Session IDs reused after a recovery.** A session's ID is the index it opened at, and a cluster
-  promoted from a standby or restored from a backup logs on from its own last index, which may be
-  behind the old cluster's. A client reattaching to a session from the old cluster can then be
-  given a new one of the same ID, opened by another client with the same principal (any client,
-  with the default `authenticate`). `Reattach` names no epoch (`src/node/sessions.rs`). A fix:
-  `Opened` says the cluster's epoch and `Reattach` sends it back; `NodeState` keeps the index the
-  epoch began at, and a reattach naming another epoch, to a session opened after that index, is
-  refused. A schema version, and a change to what a snapshot holds.
 - **A power cut mid-batch can leave a log that won't open.** A batch is one write then a sync,
   and the disk may keep a later page of it and lose an earlier one. `open` takes whole records
   after damage for synced data rotted, not a torn write, and refuses to start (`whole_record_in`,

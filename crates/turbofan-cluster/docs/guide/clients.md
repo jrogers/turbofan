@@ -87,7 +87,9 @@ A session is the unit of the guarantee. It ends when:
 - **The service closes it**: `CloseReason::Service`.
 - **The service refuses its credentials**: `CloseReason::Refused`, with no session opened. A
   cluster at `MAX_SESSIONS` refuses with `CloseReason::NoSession`, which is also the answer to
-  reattaching to a session that has since closed.
+  reattaching to a session that has since closed, or to one a promoted or restored cluster
+  opened under the same ID after it split from the client's (the client names the epoch it was
+  opened in).
 - **The client reattaches to a cluster that has less of the session than it saw**: messages it
   knew applied, or responses, that a standby promoted without all of it lost (see
   [Members][membership]). It can't resend messages it had let go of, nor the cluster the

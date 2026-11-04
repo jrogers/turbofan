@@ -34,8 +34,17 @@ impl<S: Service> Node<S> {
         self.service.authenticate(credentials).filter(|p| p.len() <= MAX_PRINCIPAL_BYTES)
     }
 
-    pub(super) fn reattach(&mut self, conn: ConnId, session: SessionId, last_egress_seq: u64, credentials: &[u8]) {
-        let Some(s) = self.state.sessions.get(&session) else {
+    /// Attaches `conn` to `session`, which its client last had in `epoch` (0 for unknown).
+    pub(super) fn reattach(
+        &mut self,
+        conn: ConnId,
+        session: SessionId,
+        epoch: u64,
+        last_egress_seq: u64,
+        credentials: &[u8],
+    ) {
+        let s = self.state.sessions.get(&session).filter(|_| self.state.of_epoch(session, epoch));
+        let Some(s) = s else {
             self.send_client(conn, &wire::Closed { session: session.0, reason: CloseReason::NoSession });
             return;
         };
@@ -53,7 +62,8 @@ impl<S: Service> Node<S> {
         self.local.activity.insert(session, self.now);
         let (applied_seq, last) = (s.last_seq, s.next_egress - 1);
         let replay: Vec<(u64, Vec<u8>)> = s.ring.iter().filter(|(seq, _)| *seq > last_egress_seq).cloned().collect();
-        self.send_client(conn, &wire::Opened { session: session.0, applied_seq, last_egress_seq: last });
+        let epoch = self.state.epoch;
+        self.send_client(conn, &wire::Opened { session: session.0, applied_seq, last_egress_seq: last, epoch });
         for (egress_seq, payload) in replay {
             self.send_client(conn, &wire::Egress { session: session.0, egress_seq, applied_seq, payload: &payload });
         }

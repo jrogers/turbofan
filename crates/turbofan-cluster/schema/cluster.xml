@@ -161,10 +161,12 @@
     <sbe:message name="Connect" id="20">
         <data name="credentials" id="1" type="payloadData"/>
     </sbe:message>
-    <!-- The same credentials: they must be the session's principal's. -->
+    <!-- The same credentials: they must be the session's principal's. `epoch`: the cluster's, as
+         the session's last `Opened` said, or 0 for none. Absent from an older client. -->
     <sbe:message name="Reattach" id="21">
         <field name="session" id="1" type="uint64"/>
         <field name="lastEgressSeq" id="2" type="uint64"/>
+        <field name="epoch" id="4" type="uint64" sinceVersion="5"/>
         <data name="credentials" id="3" type="payloadData"/>
     </sbe:message>
     <sbe:message name="Message" id="22">
@@ -185,11 +187,13 @@
         <data name="addr" id="2" type="addrData"/>
     </sbe:message>
     <!-- `lastEgressSeq`: the session's last response. A client that knows of more applied than
-         `appliedSeq`, or has seen more responses, has seen what this cluster lost. -->
+         `appliedSeq`, or has seen more responses, has seen what this cluster lost. `epoch`: the
+         cluster's, for a `Reattach` to name. Absent from an older node. -->
     <sbe:message name="Opened" id="31">
         <field name="session" id="1" type="uint64"/>
         <field name="appliedSeq" id="2" type="uint64"/>
         <field name="lastEgressSeq" id="3" type="uint64" sinceVersion="4"/>
+        <field name="epoch" id="4" type="uint64" sinceVersion="5"/>
     </sbe:message>
     <sbe:message name="Egress" id="32">
         <field name="session" id="1" type="uint64"/>
@@ -386,6 +390,9 @@
         <field name="protocol" id="7" type="uint32"/>
         <field name="serviceVersion" id="8" type="uint32"/>
         <field name="epoch" id="9" type="uint64"/>
+        <!-- The index `epoch` began at: a session opened from it on is this epoch's. Absent from
+             an older node, which didn't keep it: then every session is taken for any epoch's. -->
+        <field name="epochSince" id="10" type="uint64" sinceVersion="5"/>
     </sbe:message>
     <!-- `ring` EgressStates follow it. -->
     <sbe:message name="SessionState" id="61">

@@ -407,9 +407,13 @@ impl<S: Service> Node<S> {
         }
         match message {
             wire::Decoded::Connect(m) => self.open(conn, m.credentials()),
-            wire::Decoded::Reattach(m) => {
-                self.reattach(conn, SessionId(m.session()), m.last_egress_seq(), m.credentials())
-            }
+            wire::Decoded::Reattach(m) => self.reattach(
+                conn,
+                SessionId(m.session()),
+                m.epoch().unwrap_or(0),
+                m.last_egress_seq(),
+                m.credentials(),
+            ),
             wire::Decoded::Message(m) => {
                 if let Some(session) = self.check_attached(conn, SessionId(m.session())) {
                     self.submit(conn, session, m.client_seq(), m.payload());
