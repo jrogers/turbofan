@@ -1,3 +1,5 @@
 target/
 crates/turbofan-cluster/fuzz/corpus/
 crates/turbofan-cluster/fuzz/artifacts/
+mutants.out/
+mutants.out.old/

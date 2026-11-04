@@ -1,5 +1,5 @@
-# scripts/check.sh, with the simulation's fixed seeds and the fuzz targets' build in jobs of their
-# own. Random seeds and fuzzing run nightly (simulate.yml, fuzz.yml).
+# scripts/check.sh, with the simulation's fixed seeds, the fuzz targets' build and mutation testing of
+# what changed in jobs of their own. Random seeds and fuzzing run nightly (simulate.yml, fuzz.yml).
 name: CI
 on:
   push:
@@ -51,6 +51,46 @@ jobs:
           workspaces: crates/turbofan-cluster/fuzz
       - run: cargo fmt --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --check
       - run: cargo clippy --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --bins --locked -- -D warnings
+
+  # Mutation testing of what the push or pull request changed (scripts/mutants.sh). A mutant the
+  # tests miss is a warning on its line, not a failure: some can't be caught, being the same as
+  # the code. Fails only if the tests or the build fail unmutated.
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # A new branch's first push has nothing before it: its last commit, then.
+          if [[ -z $BASE || $BASE =~ ^0+$ ]] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            BASE=HEAD~1
+          fi
+          status=0
+          scripts/mutants.sh "$BASE" || status=$?
+          # 2: some missed; 3: some timed out, which counts as caught.
+          if [[ $status != 0 && $status != 2 && $status != 3 ]]; then
+            exit "$status"
+          fi
+          missed=0
+          if [[ -f mutants.out/missed.txt ]]; then
+            while IFS= read -r line; do
+              location=${line%%: *}
+              file=${location%%:*} rest=${location#*:}
+              echo "::warning file=$file,line=${rest%%:*}::The tests miss this mutant: ${line#*: }"
+              missed=$((missed + 1))
+            done <mutants.out/missed.txt
+          fi
+          caught=$(grep -c '' mutants.out/caught.txt 2>/dev/null || echo 0)
+          echo "Mutants of what changed since \`${BASE:0:12}\`: $caught caught, $missed missed." >>"$GITHUB_STEP_SUMMARY"
 
   # The cluster's throughput and latency, into the run's summary, compared with main's last run's,
   # which the cache keeps: a run well below it is flagged with a warning. See benches/cluster.rs.

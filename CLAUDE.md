@@ -27,6 +27,9 @@ before writing code.
 - `scripts/site.sh [--serve]` builds the website into `target/site` (mdbook, mdbook-mermaid): the
   landing page `site/index.html`, and the cluster's guide and ARCHITECTURE.md as a book, assembled
   by `site/build.py`, which fails the build if what it reads from the docs moves.
+- `scripts/mutants.sh [base]` (cargo-mutants) mutation-tests the Rust changed since `base` (the commit
+  before `HEAD` by default): a mutant the tests miss is code they don't check. CI runs it on each push
+  and pull request, a missed mutant a warning on its line.
 - `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan-cluster/fuzz`,
   outside the workspace; nightly and cargo-fuzz). `check.sh` only checks it builds.
 - Releasing: both crates share the workspace version. Bump it (and `cargo update -w` both lock files, the
