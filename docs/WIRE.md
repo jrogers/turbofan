@@ -1,6 +1,6 @@
 # Changing the wire protocol
 
-`schema/cluster.xml` defines everything a node writes for another to read: the peer, client and
+`crates/turbofan-cluster/schema/cluster.xml` (paths here are in that crate) defines everything a node writes for another to read: the peer, client and
 admin messages, the log entries, and what a snapshot holds of the node's state and the members,
 as messages framed as on the wire. During a rolling upgrade old and new nodes, and old and new
 clients, run side by side, so every change must leave them able to work together. This is how.

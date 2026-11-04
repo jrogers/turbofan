@@ -17,7 +17,7 @@ to read.
   until the design is simple. It costs less than fixing it once it's in use.
 - Don't ship a known showstopper: work that grows without limit, a latency spike on a common
   path, or an error that's silently ignored. If a problem is accepted for now, write it down: in
-  [ROADMAP.md](../crates/turbofan-cluster/docs/ROADMAP.md), or as a `ponytail:` comment at the
+  [ROADMAP.md](ROADMAP.md), or as a `ponytail:` comment at the
   code that has the ceiling, saying what the ceiling is and what would lift it.
 
 ## The core is sans-IO
@@ -108,7 +108,7 @@ Declare variables in the smallest scope they need, and close to where they are u
 
 Old and new nodes run side by side during an upgrade, and a log written today is read by the
 next version. Change `schema/cluster.xml`, never the generated code, and only in the ways
-[WIRE.md](../crates/turbofan-cluster/docs/WIRE.md) allows.
+[WIRE.md](WIRE.md) allows.
 
 ## Performance
 

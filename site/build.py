@@ -4,7 +4,7 @@ Called by scripts/site.sh, which runs mdBook after it:
 
 - the book's sources, in BOOK/src: the guide's chapters (crates/turbofan-cluster/docs/guide/*.md),
   with a contents page made from the guide's own index, and the architecture overview
-  (crates/turbofan-cluster/docs/ARCHITECTURE.md). A link to a file outside the book (WIRE.md, say)
+  (docs/ARCHITECTURE.md). A link to a file outside the book (WIRE.md, say)
   goes to it on GitHub, at REF.
 - the landing page, OUT/index.html: site/index.html with the version, and the counter example
   (crates/turbofan-cluster/examples/counter.rs) and the command line that runs it, filled in.
@@ -49,12 +49,12 @@ def main(book: Path, out: Path, ref: str) -> None:
     # there but leave links to it pointing at README.html.
     names = {p.name: ("index.md" if p.name == "README.md" else p.name) for p in guide.glob("*.md")}
     for path in sorted(guide.glob("*.md")):
-        text = relink(path.read_text().replace(f"]({REPO}/blob/main/{CLUSTER_DOCS}/ARCHITECTURE.md)", "](architecture.md)"), f"{CLUSTER_DOCS}/guide", set(names) | {"architecture.md"}, ref).replace("](README.md)", "](index.md)")
+        text = relink(path.read_text().replace(f"]({REPO}/blob/main/docs/ARCHITECTURE.md)", "](architecture.md)"), f"{CLUSTER_DOCS}/guide", set(names) | {"architecture.md"}, ref).replace("](README.md)", "](index.md)")
         (src / names[path.name]).write_text(text)
         chapters.append(names[path.name])
-    architecture = (ROOT / CLUSTER_DOCS / "ARCHITECTURE.md").read_text()
-    architecture = architecture.replace("](guide/README.md)", "](index.md)")
-    (src / "architecture.md").write_text(relink(architecture, CLUSTER_DOCS, {"index.md"}, ref))
+    architecture = (ROOT / "docs" / "ARCHITECTURE.md").read_text()
+    architecture = architecture.replace("](../crates/turbofan-cluster/docs/guide/README.md)", "](index.md)")
+    (src / "architecture.md").write_text(relink(architecture, "docs", {"index.md"}, ref))
     (src / "SUMMARY.md").write_text(summary((guide / "README.md").read_text(), chapters))
 
     out.mkdir(parents=True, exist_ok=True)
@@ -133,8 +133,8 @@ def llms(chapters: list[tuple[str, str, str]], ref: str) -> str:
         "", "## Reference", "",
         f"- [Architecture]({SITE}/guide/architecture.md): how its crates and layers fit together",
         "- [API reference](https://docs.rs/turbofan-cluster): every public type, on docs.rs",
-        f"- [Roadmap]({REPO}/blob/{ref}/{CLUSTER_DOCS}/ROADMAP.md): what's left before production",
-        f"- [Wire protocol]({REPO}/blob/{ref}/{CLUSTER_DOCS}/WIRE.md): how the protocol may change, with old and new nodes side by side",
+        f"- [Roadmap]({REPO}/blob/{ref}/docs/ROADMAP.md): what's left before production",
+        f"- [Wire protocol]({REPO}/blob/{ref}/docs/WIRE.md): how the protocol may change, with old and new nodes side by side",
         f"- [Changelog]({REPO}/blob/{ref}/CHANGELOG.md)",
         "", "## Optional", "",
         f"- [The whole guide in one file]({SITE}/llms-full.txt)",

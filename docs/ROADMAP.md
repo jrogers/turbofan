@@ -1,7 +1,7 @@
 # turbofan-cluster roadmap
 
 What's left before the framework is fit for production, roughly in order. Each item names where it
-lives today. Items marked `ponytail:` in the code are known ceilings, taken on purpose: pay them
+lives today, in `crates/turbofan-cluster`. Items marked `ponytail:` in the code are known ceilings, taken on purpose: pay them
 down when they show.
 
 ## 1. Operating a cluster

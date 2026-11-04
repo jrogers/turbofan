@@ -79,7 +79,7 @@ active, so an old node can still read the snapshots it's sent until then.
 ## The cluster's own protocol
 
 Turbofan's own messages (between nodes, to clients, in the log and in its part of a snapshot)
-change by the same rules, in `crates/turbofan-cluster/docs/WIRE.md`. Most changes need nothing:
+change by the same rules, in `docs/WIRE.md`. Most changes need nothing:
 a reader skips fields and messages newer than it. A change every node must act on alike is
 switched on the same way, with `activate --protocol <n>`. A release's notes say when that's
 needed.

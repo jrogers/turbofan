@@ -3,7 +3,8 @@
 An overview of how Turbofan fits together, for working on it. Each crate's README says how to use
 it, [WIRE.md](WIRE.md) how the wire protocol may change,
 [ROADMAP.md](ROADMAP.md) what's left, and
-[STYLE.md](../../../docs/STYLE.md) the house style.
+[STYLE.md](STYLE.md) the house style. Paths are in
+`crates/turbofan-cluster` unless they name another crate.
 
 ## The crates
 

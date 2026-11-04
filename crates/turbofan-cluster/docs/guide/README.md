@@ -3,7 +3,7 @@
 This guide goes from a first service to what running a cluster in production asks for: clients,
 members, operations, upgrades and performance. Each chapter's examples are compiled and run as
 tests, so they work as shown. The API reference has the details of each type, and
-[ARCHITECTURE.md](https://github.com/jrogers/turbofan/blob/main/crates/turbofan-cluster/docs/ARCHITECTURE.md) how it's built.
+[ARCHITECTURE.md](https://github.com/jrogers/turbofan/blob/main/docs/ARCHITECTURE.md) how it's built.
 
 1. [A first service][first-service]: a `Service`, the rules that keep it deterministic,
    snapshots, and a one-node cluster with a client, in one program.

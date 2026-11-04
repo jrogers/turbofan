@@ -225,4 +225,4 @@ network, and replay any failure exactly.
 - `node/` adds client sessions, timers and snapshots on top, and runs the service.
 - `driver` runs a node on tokio, with TCP and files; `ClusterClient` runs a client.
 
-[ARCHITECTURE.md](https://github.com/jrogers/turbofan/blob/main/crates/turbofan-cluster/docs/ARCHITECTURE.md) goes through it in full.
+[ARCHITECTURE.md](https://github.com/jrogers/turbofan/blob/main/docs/ARCHITECTURE.md) goes through it in full.
