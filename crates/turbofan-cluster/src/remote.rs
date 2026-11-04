@@ -368,12 +368,13 @@ impl Admin {
 
     /// Adds `member` to the cluster, as a learner if it's [`Member::learner`]: it catches up from
     /// the leader, then joins. Start it first, with `--join`. Returns the index of the change,
-    /// once it's committed.
+    /// once it's committed; or, if `member` is one already, as it is, of the latest change, so
+    /// that a request retried after it was made isn't refused.
     ///
     /// # Errors
     ///
-    /// [`AdminError::MembersRefused`] if another change is under way, `member` is one already,
-    /// there are [`MAX_MEMBERS`](crate::MAX_MEMBERS), or it didn't catch up; or
+    /// [`AdminError::MembersRefused`] if another change is under way, a member has its ID with
+    /// other addresses or role, there are [`MAX_MEMBERS`](crate::MAX_MEMBERS), or it didn't catch up; or
     /// [`AdminError::TokenTooLong`], [`AdminError::Denied`] or [`AdminError::TimedOut`].
     pub async fn add_member(&self, member: &Member) -> Result<u64, AdminError> {
         let request = |request_id| {
@@ -385,12 +386,11 @@ impl Admin {
     }
 
     /// Removes member `id` from the cluster. Returns the index of the change, once it's
-    /// committed: stop the node then.
+    /// committed: stop the node then. If `id` isn't a member, that of the latest change.
     ///
     /// # Errors
     ///
-    /// [`AdminError::MembersRefused`] if another change is under way, `id` isn't a member, or
-    /// it's the last; or [`AdminError::TokenTooLong`], [`AdminError::Denied`] or
+    /// [`AdminError::MembersRefused`] if another change is under way, or it's the last; or [`AdminError::TokenTooLong`], [`AdminError::Denied`] or
     /// [`AdminError::TimedOut`].
     pub async fn remove_member(&self, id: NodeId) -> Result<u64, AdminError> {
         let request = |request_id| frame(&wire::RemoveMember { request_id, id: id.0 });
@@ -399,12 +399,13 @@ impl Admin {
 
     /// Makes member `id` a learner, or a voter, in place, rather than removing it and adding it
     /// again, which ships it the whole log. A learner made a voter catches up first: check
-    /// [`Admin::status`] that it's close. Returns the index of the change, once it's committed.
+    /// [`Admin::status`] that it's close. Returns the index of the change, once it's committed;
+    /// if it has that role already, that of the latest change.
     ///
     /// # Errors
     ///
-    /// [`AdminError::MembersRefused`] if another change is under way, `id` isn't a member of the
-    /// other role, it's the last voter, or it didn't catch up; or [`AdminError::TokenTooLong`],
+    /// [`AdminError::MembersRefused`] if another change is under way, `id` isn't a member, it's
+    /// the last voter, or it didn't catch up; or [`AdminError::TokenTooLong`],
     /// [`AdminError::Denied`] or [`AdminError::TimedOut`], which a leader too old to answer
     /// gives too.
     pub async fn set_role(&self, id: NodeId, learner: bool) -> Result<u64, AdminError> {
@@ -478,7 +479,8 @@ impl Admin {
 
     /// Hands the leadership to member `to`, or with `None` to the one most caught up: before
     /// stopping the leader, so a restart costs a quick election rather than an election timeout.
-    /// Returns the new leader.
+    /// Returns the new leader; `to`, if it leads already. (A request with `None` retried after
+    /// it was made hands it on again.)
     ///
     /// # Errors
     ///

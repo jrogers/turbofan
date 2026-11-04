@@ -210,7 +210,8 @@ impl Raft {
     }
 
     /// The index of the latest `Members` entry, or of the snapshot if the log has none.
-    pub(super) fn config_index(&self) -> u64 {
+    #[must_use]
+    pub fn config_index(&self) -> u64 {
         self.log.configs.last().map_or(self.snapshot_index(), |&(index, _)| index)
     }
 

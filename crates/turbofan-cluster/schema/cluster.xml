@@ -232,13 +232,15 @@
         <field name="requestId" id="1" type="uint64"/>
         <field name="id" id="2" type="uint8"/>
     </sbe:message>
-    <!-- The change is committed, at `index`. -->
+    <!-- The change is committed, at `index`; or the members were as asked already (a request sent
+         again after it was made), as of the latest change, at `index`. -->
     <sbe:message name="MembersChanged" id="44">
         <field name="requestId" id="1" type="uint64"/>
         <field name="index" id="2" type="uint64"/>
     </sbe:message>
-    <!-- Refused: another change is under way, the member is already in (or isn't), there would
-         be too many or none, or a new member didn't catch up. -->
+    <!-- Refused: another change is under way, a member has the ID with other addresses or role
+         (or none has it, to set its role), there would be too many or none, or a new member
+         didn't catch up. -->
     <sbe:message name="MembersRefused" id="45">
         <field name="requestId" id="1" type="uint64"/>
     </sbe:message>
@@ -343,11 +345,15 @@
         <field name="timestamp" id="1" type="uint64"/>
         <field name="requestId" id="2" type="uint64"/>
     </sbe:message>
-    <!-- From this entry on, the cluster's protocol and the service's behaviour are these versions. -->
+    <!-- From this entry on, the cluster's protocol and the service's behaviour are these versions.
+         `egressRing`: from protocol 1, the responses each session keeps, the leader's
+         `egress_ring_entries`, for every node; 0, or absent from an older node, for each node's
+         own. -->
     <sbe:message name="Activated" id="58">
         <field name="timestamp" id="1" type="uint64"/>
         <field name="protocol" id="2" type="uint32"/>
         <field name="serviceVersion" id="3" type="uint32"/>
+        <field name="egressRing" id="4" type="uint32" sinceVersion="5"/>
     </sbe:message>
     <!-- The cluster's epoch from here on: from a new cluster's first leader, which counts only if
          there's none yet (so only the first one applied does); or, with `promoted` 1, from a
@@ -393,6 +399,9 @@
         <!-- The index `epoch` began at: a session opened from it on is this epoch's. Absent from
              an older node, which didn't keep it: then every session is taken for any epoch's. -->
         <field name="epochSince" id="10" type="uint64" sinceVersion="5"/>
+        <!-- The responses each session keeps, as last activated: 0, or absent from an older node,
+             for each node's own `egress_ring_entries`. -->
+        <field name="egressRing" id="11" type="uint32" sinceVersion="5"/>
     </sbe:message>
     <!-- `ring` EgressStates follow it. -->
     <sbe:message name="SessionState" id="61">

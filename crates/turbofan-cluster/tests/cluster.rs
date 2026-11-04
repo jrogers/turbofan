@@ -244,10 +244,13 @@ async fn a_member_joins_and_another_leaves() {
         .with_token(TOKEN)
         .with_timeout(Duration::from_secs(20));
     let fourth = member(&cluster.addrs, NodeId(4));
-    admin.add_member(&fourth).await.unwrap();
+    let added = admin.add_member(&fourth).await.unwrap();
     exchange(&mut cluster, &mut client, 101, 200).await;
-    let again = admin.add_member(&fourth).await.unwrap_err();
-    assert!(matches!(again, AdminError::MembersRefused), "already a member: {again:?}");
+    // Asked again, as after a lost answer: answered as made. Elsewhere, refused.
+    assert_eq!(admin.add_member(&fourth).await.unwrap(), added, "already a member");
+    let elsewhere = raft::Member { peer: "127.0.0.1:1".into(), ..fourth.clone() };
+    let again = admin.add_member(&elsewhere).await.unwrap_err();
+    assert!(matches!(again, AdminError::MembersRefused), "a member 4 elsewhere: {again:?}");
 
     admin.remove_member(NodeId(1)).await.unwrap();
     cluster.kill(0).await;

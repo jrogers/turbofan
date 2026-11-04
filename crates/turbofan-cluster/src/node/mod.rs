@@ -52,7 +52,8 @@ pub const MAX_EGRESS_RING: usize = 65_536;
 /// The most sessions open at once.
 pub const MAX_SESSIONS: usize = 10_000;
 /// The highest protocol version this code supports: see `WIRE.md`, and [`Config::protocol`].
-pub const PROTOCOL: u32 = 0;
+/// 1: an activation logs the leader's [`Config::egress_ring_entries`] for every node.
+pub const PROTOCOL: u32 = 1;
 /// The longest principal [`Service::authenticate`] can give.
 pub const MAX_PRINCIPAL_BYTES: usize = 255;
 
@@ -97,8 +98,10 @@ pub struct Config {
     /// How many responses each session keeps for a client that reattaches after a failover. A
     /// client away while more than this are sent misses some ([`crate::client::Event::Lost`]),
     /// so it must cover a gateway's requests in flight times the responses each can cause.
-    /// Every node holds this many per session, and snapshots them: give every member the same,
-    /// or a client's replay after a failover depends on which leader it reattaches to.
+    /// Every node holds this many per session, and snapshots them. From protocol 1, the leader's,
+    /// as of the latest `activate`, is every node's: to change it, restart the nodes with the new
+    /// value, then activate again. Before, give every member the same, or a client's replay after
+    /// a failover depends on which leader it reattaches to.
     pub egress_ring_entries: usize,
     /// The highest protocol version this node runs: [`PROTOCOL`], or lower to run as an older
     /// node would.
@@ -232,6 +235,8 @@ pub struct Node<S> {
     /// A promotion asked for, on this admin connection with this request ID, to this epoch:
     /// answered once it applies.
     promoting: Option<(ConnId, u64, u64)>,
+    /// The promotion answered: its request ID, index and epoch, for the request sent again.
+    promoted: Option<(u64, u64, u64)>,
     /// When the latest snapshot was taken or installed, or the node started.
     snapshot_at: u64,
 }
@@ -263,6 +268,7 @@ impl<S: Service> Node<S> {
             restoring,
             transferring: None,
             promoting: None,
+            promoted: None,
             snapshot_at: now,
         }
     }

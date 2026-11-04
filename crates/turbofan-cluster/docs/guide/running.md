@@ -99,7 +99,7 @@ For full control, call `driver::serve` with a `driver::Config` from a `main` of 
 | `node.session_timeout` | 10 s | A session the leader hears nothing from for this long is closed, and so is a client connection any node hears nothing on. |
 | `node.snapshot_every_entries` | 100,000 | Each node snapshots once this many entries follow its last snapshot. |
 | `node.snapshots_kept` | 1 | The newest snapshots each node keeps on disk (`--keep-snapshots`): see [Operations][operations]. |
-| `node.egress_ring_entries` | 8192 | Responses kept per session for a client that reattaches (up to `MAX_EGRESS_RING`). |
+| `node.egress_ring_entries` | 8192 | Responses kept per session for a client that reattaches (up to `MAX_EGRESS_RING`). From protocol 1, the leader's at the latest `activate`, for every node: see [Upgrades][upgrades]. |
 | `log_fsync` | `Fsync::Never` | `Fsync::EachBatch` is `--fsync`. |
 | `admin_token`, `peer_token` | none | See below. |
 | `tls` | none | See below. |

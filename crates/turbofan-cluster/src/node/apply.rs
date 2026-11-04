@@ -58,7 +58,7 @@ impl<S: Service> Node<S> {
             }
             wire::Decoded::Activated(e) => {
                 self.advance_time(e.timestamp());
-                self.apply_activated(index, e.protocol(), e.service_version());
+                self.apply_activated(index, e.protocol(), e.service_version(), e.egress_ring().unwrap_or(0));
             }
             wire::Decoded::ServiceProposal(e) => {
                 self.advance_time(e.timestamp());
@@ -131,13 +131,18 @@ impl<S: Service> Node<S> {
             && at == epoch
         {
             self.promoting = None;
+            self.promoted = Some((request_id, index, epoch));
             self.send_client(conn, &wire::Promoted { request_id, index, epoch });
         }
     }
 
-    /// From `index` on, the cluster runs these versions.
-    pub(super) fn apply_activated(&mut self, index: u64, protocol: u32, service_version: u32) {
+    /// From `index` on, the cluster runs these versions, and from protocol 1 each session keeps
+    /// `egress_ring` responses (0 for each node's own number).
+    pub(super) fn apply_activated(&mut self, index: u64, protocol: u32, service_version: u32, egress_ring: u32) {
         self.state.protocol = protocol;
+        if protocol >= 1 {
+            self.state.egress_ring = egress_ring;
+        }
         self.raft.require(protocol, service_version);
         if let Some((conn, request_id, at)) = self.local.activating
             && at == index

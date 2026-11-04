@@ -268,6 +268,7 @@ fn a_snapshots_counts_are_checked_at_their_limits() {
             service_version: 0,
             epoch: 1,
             epoch_since: 0,
+            egress_ring: 0,
         };
         let mut bytes = Vec::new();
         codec::encode_frame(&node, &mut bytes).unwrap();
@@ -395,7 +396,10 @@ fn versions_activate_once_every_member_has_them() {
         drive(node).join(" ")
     };
     let refused = activate(&mut node, PROTOCOL + 1, 0);
-    assert!(refused.contains("index: 0, lowest_protocol: 0, lowest_service_version: 1"), "{refused}");
+    assert!(
+        refused.contains(&format!("index: 0, lowest_protocol: {PROTOCOL}, lowest_service_version: 1")),
+        "{refused}"
+    );
     assert!(!activate(&mut node, 0, 1).contains("index: 0"), "this node has version 1");
     assert!(node.service.0.contains(&"activate 1".to_owned()));
     client(&mut node, 7, &wire::Message { session: session.0, client_seq: 1, payload: b"later" }, 0);
@@ -405,6 +409,42 @@ fn versions_activate_once_every_member_has_them() {
     let bytes = encode_state(&node.state);
     let state = decode_state(&mut &bytes[..]).unwrap();
     assert_eq!((state.protocol, state.service_version), (0, 1), "kept in snapshots");
+}
+
+/// Each node keeps its own number of responses a session, until an activation of protocol 1 or
+/// later logs the leader's for all; one of 0 leaves it. Snapshots keep it.
+#[test]
+fn an_activation_logs_the_egress_ring_for_every_node() {
+    let mut node = leader();
+    let session = open(&mut node, 7, 0);
+    let activate = |node: &mut Node<Recorder>, protocol| {
+        let mut frame = Vec::new();
+        codec::encode_frame(&wire::Activate { request_id: 1, protocol, service_version: 0 }, &mut frame).unwrap();
+        node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 1_000_000_000);
+        drive(node);
+    };
+    let ring = |node: &mut Node<Recorder>| {
+        for k in 1..=3 {
+            let payload = format!("{k}");
+            let message = wire::Message {
+                session: session.0,
+                client_seq: node.state.sessions[&session].last_seq + 1,
+                payload: payload.as_bytes(),
+            };
+            client(node, 7, &message, 0);
+        }
+        node.state.sessions[&session].ring.len()
+    };
+    node.config.egress_ring_entries = 2;
+    activate(&mut node, 0);
+    assert_eq!((node.state.egress_ring, ring(&mut node)), (0, 2), "its own");
+    activate(&mut node, 1);
+    assert_eq!(node.state.egress_ring, 2, "the leader's");
+    node.config.egress_ring_entries = 5;
+    assert_eq!(ring(&mut node), 2, "the cluster's, not its own");
+
+    let bytes = encode_state(&node.state);
+    assert_eq!(decode_state(&mut &bytes[..]).unwrap().egress_ring, 2, "kept in snapshots");
 }
 
 /// A new cluster's first leader names its epoch; one named later, by a leader that hadn't
@@ -638,6 +678,41 @@ fn a_request_sent_again_is_answered_on_the_new_connection() {
     let sent = drive(&mut node);
     assert!(!sent.iter().any(|s| s.contains("MembersRefused")), "{sent:?}");
     assert_eq!(node.local.changing.map(|(conn, id, _)| (conn, id)), Some((100, 45)), "under way, for 100");
+}
+
+/// A request sent again after it was made (its answer lost, or its leader gone, and nothing kept
+/// of it) is answered as made: a change of members the members already show, a transfer to the
+/// leader, a promotion this node made. One the members don't show yet is still refused.
+#[test]
+fn a_request_sent_again_after_it_was_made_is_answered_as_made() {
+    fn ask(node: &mut Node<Recorder>, message: &impl turbofan_sbe::Encode) -> String {
+        let mut frame = Vec::new();
+        codec::encode_frame(message, &mut frame).unwrap();
+        node.on_admin(7, &codec::decode_frame(&frame).unwrap().unwrap().0, node.now);
+        drive(node).join(" ")
+    }
+    let mut node = leader();
+    let index = node.raft().config_index();
+    let changed = format!("MembersChanged(MembersChangedRef {{ request_id: 50, index: {index} }})");
+    let m = member(1);
+    let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
+    let add = wire::AddMember { request_id: 50, id: 1, learner: 0, peer, client, admin };
+    assert!(ask(&mut node, &add).contains(&changed), "added");
+    assert!(ask(&mut node, &wire::RemoveMember { request_id: 50, id: 2 }).contains(&changed), "removed");
+    let set_role = |learner| wire::SetRole { request_id: 50, id: 1, learner };
+    assert!(ask(&mut node, &set_role(0)).contains(&changed), "a voter");
+    assert!(ask(&mut node, &set_role(1)).contains("MembersRefused"), "not a learner yet, and the only voter");
+    let elsewhere = wire::AddMember { peer: b"p9", ..add };
+    assert!(ask(&mut node, &elsewhere).contains("MembersRefused"), "a member 1 at another address");
+
+    let transfer = ask(&mut node, &wire::TransferLeadership { request_id: 50, to: 1 });
+    assert!(transfer.contains("request_id: 50, leader: 1"), "{transfer}");
+
+    node.promoted = Some((50, 9, 8));
+    let promoted = ask(&mut node, &wire::Promote { request_id: 50 });
+    assert!(promoted.contains("request_id: 50, index: 9, epoch: 8"), "{promoted}");
+    node.promoted = Some((49, 9, 8));
+    assert!(ask(&mut node, &wire::Promote { request_id: 50 }).contains("index: 0"), "another's");
 }
 
 /// A connection that opens a second session leaves the first for its client to reattach to; one

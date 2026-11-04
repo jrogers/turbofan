@@ -11,8 +11,30 @@ a patch version (0.1.1) doesn't.
 - `wire::Opened` and `wire::Reattach` have an `epoch`, `wire::RequestVote` and `wire::Vote` a
   `round`, and `wire::NodeState` an `epoch_since`: code building them sets them.
 
+### Changed
+
+- A log is truncated on open at its first damaged record, wherever it is, and at a gap between
+  segments, the records and segments after it dropped, and doubted: the node catches up from the
+  others. Before, only damage with nothing whole after it was truncated, and any other refused to
+  start, for the node to be wiped and replaced. Bit rot of synced records is now taken the same
+  way, which doubt keeps safe however much is dropped.
+
 ### Fixed
 
+- `egress_ring_entries`, the responses each session keeps, was each node's own setting, though
+  the ring is replicated state: members with different values replayed different responses to a
+  client after a failover. Protocol 1 (`node::PROTOCOL`) logs the leader's in each `Activated`
+  entry, and every node keeps that many; until `activate --protocol 1`, each its own, as before.
+  Once it's active, name it in every `activate`: the default, 0, is refused as a step back.
+- An operator's request retried after it was made, its answer lost or its leader gone, was
+  refused: a member change, say, though the members showed it. A change the members already show,
+  committed, is answered `MembersChanged` at the latest change's index, by any leader; a transfer
+  to the node that leads, with it; a promotion, as it was. So `add-member` of a member already
+  in, with the same addresses and role, or `remove-member` of one that isn't, succeeds now.
+- A power cut mid-batch could leave a log that wouldn't open: the disk may keep a later page of a
+  write and lose an earlier one, leaving whole records after a torn one, which was taken for bit
+  rot; and unsynced, a segment's tail lost and the next one kept, a gap. Both are truncated now,
+  as above.
 - A client reattaching after a recovery could be given another client's session. A session's
   ID is the index it opened at, and a cluster promoted from a standby or restored from a backup
   logs on from its own last index, so it may open a session under an ID the old cluster had

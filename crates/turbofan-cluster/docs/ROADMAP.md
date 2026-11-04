@@ -14,31 +14,21 @@ down when they show.
   majority losing power together may lose committed entries. Spread the nodes over power
   domains, and cover a whole site with a standby (a learner in another region, to `promote`) or
   `serve --fsync`.
+- **Capture and replay.** Copy a cluster's log, from a snapshot on, and replay it into a service
+  offline: to reproduce a bug from production, check a new service version against real traffic
+  (its responses compared with what the cluster sent), or audit what happened. Applying is
+  already deterministic, with time in the entries (`src/node/apply.rs`), and a snapshot copied
+  off a node restores (`driver::restore`). Missing: capturing the committed entries from a node's
+  segments (`src/log.rs`) or a learner, as a file that names its snapshot and epoch; and a replay
+  that restores the snapshot and applies the entries through `Node` without Raft, with the
+  service's outputs to compare.
 
-## 2. Known issues
-
-From a review of the crate, still open:
-
-- **A power cut mid-batch can leave a log that won't open.** A batch is one write then a sync,
-  and the disk may keep a later page of it and lose an earlier one. `open` takes whole records
-  after damage for synced data rotted, not a torn write, and refuses to start (`whole_record_in`,
-  `src/log.rs`). Unsynced (`Fsync::Never`), a segment isn't synced when the next starts, so a power
-  cut can leave a gap between them, refused too. Nothing wrong is served, but the node needs
-  wiping. A fix: know how far the log is synced, and take damage past it for a torn write; or,
-  unsynced, truncate at damage and doubt the log, which that mode already allows.
-- **Admin requests answered once.** A request sent again while it's under way is answered on the
-  new connection; one that finished first isn't remembered, so a member change retried after it
-  committed is refused, though it was made (`src/node/admin.rs`).
-- **The egress ring is each node's setting.** `egress_ring_entries` is replicated state sized by
-  local config: members with different values replay different responses to a client after a
-  failover. It could be logged, as a version is activated.
-
-## 3. Toward 1.0
+## 2. Toward 1.0
 
 - **A stable API.** Freeze `Service`, `Ctx`, `ClusterClient` and `driver::Config`. The crates are
   on crates.io from 0.1.0, but until 1.0 a minor version may break the API (CHANGELOG.md says how).
 
-## 4. Docs and outreach
+## 3. Docs and outreach
 
 - **Benchmark numbers** in the guide's performance chapter and on the website's landing page,
   measured somewhere steadier than a laptop.

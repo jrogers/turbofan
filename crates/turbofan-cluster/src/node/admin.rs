@@ -38,24 +38,8 @@ impl<S: Service> Node<S> {
                 self.local.requested.insert(id, conn);
                 self.propose(&wire::Snapshot { timestamp: now, request_id: id });
             }
-            wire::Decoded::AddMember(m) => {
-                let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-                let member = Member {
-                    id: NodeId(m.id()),
-                    peer: text(m.peer()),
-                    client: text(m.client()),
-                    admin: text(m.admin()),
-                    learner: m.learner() == 1,
-                };
-                self.change_members(conn, m.request_id(), |raft| raft.add_member(member));
-            }
-            wire::Decoded::RemoveMember(m) => {
-                let started = self.local.changing.is_none() && self.raft.remove_member(NodeId(m.id()));
-                self.start_change(conn, m.request_id(), started);
-            }
-            wire::Decoded::SetRole(m) => {
-                let (id, learner) = (NodeId(m.id()), m.learner() == 1);
-                self.change_members(conn, m.request_id(), |raft| raft.set_role(id, learner));
+            wire::Decoded::AddMember(_) | wire::Decoded::RemoveMember(_) | wire::Decoded::SetRole(_) => {
+                self.members_request(conn, message);
             }
             wire::Decoded::Activate(m) => self.activate(conn, m.request_id(), m.protocol(), m.service_version()),
             wire::Decoded::Shutdown(m) => {
@@ -63,6 +47,11 @@ impl<S: Service> Node<S> {
                     self.local.shutting = Some((conn, m.request_id(), None));
                     self.propose(&wire::Snapshot { timestamp: now, request_id: m.request_id() });
                 }
+            }
+            // To this node: sent again after the transfer, to the new leader.
+            wire::Decoded::TransferLeadership(m) if NodeId::from_wire(m.to()) == Some(self.raft.id()) => {
+                let leader = self.raft.id().0;
+                self.send_client(conn, &wire::LeadershipTransferred { request_id: m.request_id(), leader });
             }
             wire::Decoded::TransferLeadership(m) => {
                 let request_id = m.request_id();
@@ -107,7 +96,11 @@ impl<S: Service> Node<S> {
         // Not while a member is being added: it could join, too old, after this is logged.
         let free = self.local.activating.is_none() && !self.raft.changing_members();
         let index = (supported && forward && free)
-            .then(|| self.propose(&wire::Activated { timestamp: self.now, protocol, service_version }))
+            .then(|| {
+                let egress_ring = if protocol >= 1 { self.config.egress_ring_entries } else { 0 };
+                let egress_ring = u32::try_from(egress_ring).expect("at most MAX_EGRESS_RING");
+                self.propose(&wire::Activated { timestamp: self.now, protocol, service_version, egress_ring })
+            })
             .flatten();
         match index {
             Some(index) => self.local.activating = Some((conn, request_id, index)),
@@ -121,6 +114,11 @@ impl<S: Service> Node<S> {
     /// Makes this learner a cluster of its own, of a new epoch ([`Raft::promote`]): answered
     /// `Promoted` once the epoch applies, after the rest of its log.
     pub(super) fn promote(&mut self, conn: ConnId, request_id: u64) {
+        // Sent again after it was answered.
+        if let Some((_, index, epoch)) = self.promoted.filter(|&(r, ..)| r == request_id) {
+            self.send_client(conn, &wire::Promoted { request_id, index, epoch });
+            return;
+        }
         if self.promoting.is_some() || !self.raft.promote(self.now) {
             self.send_client(conn, &wire::Promoted { request_id, index: 0, epoch: 0 });
             return;
@@ -139,6 +137,51 @@ impl<S: Service> Node<S> {
             .collect();
         let (leader, last_index, commit_index) = (self.raft.id().0, self.raft.last_index(), self.raft.commit_index());
         self.send_client(conn, &wire::Status { request_id, leader, last_index, commit_index, member: &member });
+    }
+
+    /// `AddMember`, `RemoveMember` or `SetRole`.
+    fn members_request(&mut self, conn: ConnId, message: &wire::Decoded<'_>) {
+        match message {
+            wire::Decoded::AddMember(m) => {
+                let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+                let member = Member {
+                    id: NodeId(m.id()),
+                    peer: text(m.peer()),
+                    client: text(m.client()),
+                    admin: text(m.admin()),
+                    learner: m.learner() == 1,
+                };
+                if !self.already_changed(conn, m.request_id(), |members| members.contains(&member)) {
+                    self.change_members(conn, m.request_id(), |raft| raft.add_member(member));
+                }
+            }
+            wire::Decoded::RemoveMember(m) => {
+                let id = NodeId(m.id());
+                if !self.already_changed(conn, m.request_id(), |members| members.iter().all(|m| m.id != id)) {
+                    let started = self.local.changing.is_none() && self.raft.remove_member(id);
+                    self.start_change(conn, m.request_id(), started);
+                }
+            }
+            wire::Decoded::SetRole(m) => {
+                let (id, learner) = (NodeId(m.id()), m.learner() == 1);
+                let done = |members: &[Member]| members.iter().any(|m| m.id == id && m.learner == learner);
+                if !self.already_changed(conn, m.request_id(), done) {
+                    self.change_members(conn, m.request_id(), |raft| raft.set_role(id, learner));
+                }
+            }
+            _ => unreachable!("a change of members"),
+        }
+    }
+
+    /// The members are already as a change asks (`done`), and committed: a request sent again after
+    /// it was made, its answer lost or its leader gone, is answered as made. Nothing is kept of
+    /// answered requests, so any leader answers it so.
+    fn already_changed(&mut self, conn: ConnId, request_id: u64, done: impl Fn(&[Member]) -> bool) -> bool {
+        if self.raft.changing_members() || !done(self.raft.members()) {
+            return false;
+        }
+        self.send_client(conn, &wire::MembersChanged { request_id, index: self.raft.config_index() });
+        true
     }
 
     /// Starts a change of members by `change`, unless one is under way, or an activation, which

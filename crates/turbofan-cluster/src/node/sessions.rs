@@ -129,7 +129,12 @@ impl<S: Service> Node<S> {
             self.local.sends.push((conn, frame));
         }
         // Over, not only at, the limit: from a node that kept more, or before it was lowered.
-        while s.ring.len() >= self.config.egress_ring_entries {
+        // The cluster's, as activated: a node's own only before.
+        let ring = match usize::try_from(self.state.egress_ring) {
+            Ok(0) | Err(_) => self.config.egress_ring_entries,
+            Ok(ring) => ring.min(MAX_EGRESS_RING),
+        };
+        while s.ring.len() >= ring {
             s.ring.pop_front();
         }
         s.ring.push_back((egress_seq, payload));

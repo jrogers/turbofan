@@ -84,4 +84,9 @@ a reader skips fields and messages newer than it. A change every node must act o
 switched on the same way, with `activate --protocol <n>`. A release's notes say when that's
 needed.
 
-`activate --protocol <n> --service <m>` does both at once.
+`activate --protocol <n> --service <m>` does both at once. Once a protocol is active, name it in
+every `activate`: the default, 0, would be a step back, which is refused.
+
+Protocol 1 makes the responses each session keeps (`egress_ring_entries`) the cluster's: every
+`activate` logs the leader's, for every node. To change it, restart the nodes with the new value,
+then `activate` again.

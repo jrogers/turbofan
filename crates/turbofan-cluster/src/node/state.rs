@@ -37,6 +37,9 @@ pub(super) struct State {
     /// it was carried over from an earlier one (promoted or restored from). `u64::MAX` if
     /// unknown, from an older node's snapshot: every session is taken for any epoch's.
     pub(super) epoch_since: u64,
+    /// The responses each session keeps, as activated: 0 for each node's own
+    /// [`Config::egress_ring_entries`].
+    pub(super) egress_ring: u32,
 }
 
 impl State {
@@ -66,6 +69,7 @@ pub(super) fn encode_state(state: &State) -> Vec<u8> {
         service_version: state.service_version,
         epoch: state.epoch,
         epoch_since: state.epoch_since,
+        egress_ring: state.egress_ring,
     };
     put(&mut out, &node);
     for (&session, s) in &state.sessions {
@@ -102,6 +106,7 @@ pub(super) fn decode_state(from: &mut dyn Read) -> io::Result<State> {
         service_version: n.service_version(),
         epoch: n.epoch(),
         epoch_since: n.epoch_since().unwrap_or(u64::MAX),
+        egress_ring: n.egress_ring().unwrap_or(0),
         ..State::default()
     };
     let (sessions, timers, proposals) = (n.sessions(), n.timers(), n.proposals());
@@ -162,6 +167,7 @@ pub(crate) fn with_epoch(from: &mut dyn Read, epoch: u64) -> io::Result<Vec<u8>>
         service_version: n.service_version(),
         epoch,
         epoch_since: n.applied() + 1,
+        egress_ring: n.egress_ring().unwrap_or(0),
     };
     let mut out = Vec::new();
     codec::encode_frame(&node, &mut out).expect("a NodeState is within its limits");
