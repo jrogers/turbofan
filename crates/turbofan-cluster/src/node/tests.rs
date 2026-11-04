@@ -170,6 +170,20 @@ fn messages_apply_once_in_order_and_a_reattach_replays_responses() {
     assert!(client(&mut node, 7, &message(3, b"three"), 0)[0].contains("NoSession"));
 }
 
+/// A ring longer than this node keeps (a snapshot from a node that kept more, or the setting
+/// lowered) is cut to it at the next response, not left to grow.
+#[test]
+fn a_ring_over_the_limit_is_cut_to_it() {
+    let mut node = leader();
+    let session = open(&mut node, 7, 0);
+    let s = node.state.sessions.get_mut(&session).unwrap();
+    s.ring = (1..=2000).map(|seq| (seq, b"old".to_vec())).collect();
+    s.next_egress = 2001;
+    node.egress(session, b"new".to_vec());
+    let ring = &node.state.sessions[&session].ring;
+    assert_eq!((ring.len(), ring.back().map(|(seq, _)| *seq)), (1024, Some(2001)));
+}
+
 /// A message the service doesn't answer is acknowledged as soon as it's applied, not at the
 /// client's next keepalive; one it answers needs nothing but the `Egress`.
 #[test]
@@ -374,7 +388,8 @@ fn versions_activate_once_every_member_has_them() {
     let activate = |node: &mut Node<Recorder>, protocol, service_version| {
         let mut frame = Vec::new();
         codec::encode_frame(&wire::Activate { request_id: 1, protocol, service_version }, &mut frame).unwrap();
-        node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
+        // Its leader silent an election timeout since it started.
+        node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 1_000_000_000);
         drive(node).join(" ")
     };
     let refused = activate(&mut node, PROTOCOL + 1, 0);
@@ -414,7 +429,8 @@ fn a_promoted_learner_names_a_new_epoch() {
     let promote = |node: &mut Node<Recorder>| {
         let mut frame = Vec::new();
         codec::encode_frame(&wire::Promote { request_id: 9 }, &mut frame).unwrap();
-        node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
+        // Its leader silent an election timeout since it started.
+        node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 1_000_000_000);
         drive(node).join(" ")
     };
     assert!(promote(&mut leader()).contains("Promoted(PromotedRef { request_id: 9, index: 0, epoch: 0 })"));
@@ -548,4 +564,22 @@ fn an_operator_snapshot_is_answered_once_durable() {
         sent,
         [format!("99: SnapshotTaken(SnapshotTakenRef {{ request_id: 42, index: {index}, quorum_acked: 1 }})")]
     );
+}
+
+/// An operator's request sent again, its connection dropped while it was under way, is answered
+/// once, on the new connection: not ignored as one already under way.
+#[test]
+fn a_request_sent_again_is_answered_on_the_new_connection() {
+    let (mut snapshot, mut shutdown) = (Vec::new(), Vec::new());
+    codec::encode_frame(&wire::SnapshotRequest { request_id: 42 }, &mut snapshot).unwrap();
+    codec::encode_frame(&wire::Shutdown { request_id: 43 }, &mut shutdown).unwrap();
+    for (frame, answer) in [(snapshot, "SnapshotTaken"), (shutdown, "ShutDown")] {
+        let mut node = leader();
+        for conn in [99, 100] {
+            node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
+        }
+        let sent = drive(&mut node);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with("100: ") && sent[0].contains(answer), "{sent:?}");
+    }
 }

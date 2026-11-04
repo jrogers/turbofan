@@ -181,6 +181,8 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"no".to_vec(), Duration::from_millis(500)).unwrap();
     let event = tokio::time::timeout(Duration::from_secs(10), stranger.recv()).await.unwrap();
     assert!(matches!(event, Some(Event::Closed { reason: CloseReason::Refused, .. })), "{event:?}");
+    let after = tokio::time::timeout(Duration::from_secs(10), stranger.recv()).await.unwrap();
+    assert!(after.is_none(), "the session is over: {after:?}");
 
     let anyone =
         Admin::new(cluster.configs[0].admin_listen.to_string(), SERVICE_ID).with_timeout(Duration::from_secs(10));

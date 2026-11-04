@@ -11,23 +11,18 @@ impl<S: Service> Node<S> {
     /// leader: see [`Raft::promote`]. `StatusRequest` is answered `Status`, each member's progress.
     pub fn on_admin(&mut self, conn: ConnId, message: &wire::Decoded<'_>, now: u64) {
         self.after(now);
+        // A request under way, sent again after its connection dropped: answered here instead.
+        if let Some(id) = request_id(message)
+            && self.answer_on(conn, id)
+        {
+            return;
+        }
         // To a learner, which never leads: not for the leader, if there's one.
         if let wire::Decoded::Promote(m) = message {
             self.promote(conn, m.request_id());
             return;
         }
-        let admin = matches!(
-            message,
-            wire::Decoded::SnapshotRequest(_)
-                | wire::Decoded::AddMember(_)
-                | wire::Decoded::RemoveMember(_)
-                | wire::Decoded::SetRole(_)
-                | wire::Decoded::TransferLeadership(_)
-                | wire::Decoded::Shutdown(_)
-                | wire::Decoded::Activate(_)
-                | wire::Decoded::StatusRequest(_)
-        );
-        if !admin {
+        if request_id(message).is_none() && !matches!(message, wire::Decoded::StatusRequest(_)) {
             return;
         }
         if !self.is_ready() {
@@ -81,6 +76,26 @@ impl<S: Service> Node<S> {
             wire::Decoded::StatusRequest(m) => self.status(conn, m.request_id()),
             _ => unreachable!("matched above"),
         }
+    }
+
+    /// Moves the answer to request `id`, if it's under way, to `conn`.
+    fn answer_on(&mut self, conn: ConnId, id: u64) -> bool {
+        let local = &mut self.local;
+        let slots = [
+            local.requested.get_mut(&id),
+            local.awaiting.get_mut(&id).map(|(c, _)| c),
+            local.changing.as_mut().filter(|(_, r, _)| *r == id).map(|(c, _, _)| c),
+            local.shutting.as_mut().filter(|(_, r, _)| *r == id).map(|(c, _, _)| c),
+            local.activating.as_mut().filter(|(_, r, _)| *r == id).map(|(c, _, _)| c),
+            self.transferring.as_mut().filter(|(_, r)| *r == id).map(|(c, _)| c),
+            self.promoting.as_mut().filter(|(_, r, _)| *r == id).map(|(c, _, _)| c),
+        ];
+        let mut found = false;
+        for slot in slots.into_iter().flatten() {
+            *slot = conn;
+            found = true;
+        }
+        found
     }
 
     /// Logs a switch to these versions, unless a member doesn't support them, or it's a step
@@ -163,4 +178,19 @@ impl<S: Service> Node<S> {
             self.send_client(conn, &wire::SnapshotTaken { request_id, index, quorum_acked: 1 });
         }
     }
+}
+
+/// The request ID of an operator's request.
+fn request_id(message: &wire::Decoded<'_>) -> Option<u64> {
+    Some(match message {
+        wire::Decoded::SnapshotRequest(m) => m.request_id(),
+        wire::Decoded::AddMember(m) => m.request_id(),
+        wire::Decoded::RemoveMember(m) => m.request_id(),
+        wire::Decoded::SetRole(m) => m.request_id(),
+        wire::Decoded::TransferLeadership(m) => m.request_id(),
+        wire::Decoded::Shutdown(m) => m.request_id(),
+        wire::Decoded::Activate(m) => m.request_id(),
+        wire::Decoded::Promote(m) => m.request_id(),
+        _ => return None,
+    })
 }

@@ -18,6 +18,10 @@ use crate::wire::{self, CloseReason};
 /// The most messages sent but not yet known applied. [`Client::send`] refuses more.
 pub const MAX_UNACKED: usize = 4096;
 
+/// Keepalives in a row that the cluster may leave unanswered before the connection is taken for
+/// dead: a leader answers each at once, and one that lost power leaves a socket that never errs.
+const SILENT_KEEPALIVES: u32 = 3;
+
 /// What the cluster told the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -49,7 +53,8 @@ pub enum Event {
 pub enum Reconnect {
     /// To the leader, now.
     ToLeader,
-    /// There's no leader yet: to the next member, after a pause.
+    /// There's no leader yet, or the one connected to went silent: to the next member, after a
+    /// pause.
     Later,
 }
 
@@ -114,6 +119,8 @@ pub struct Client {
     last_egress: u64,
     keepalive_ns: u64,
     keepalive_at: u64,
+    /// Keepalives due since the cluster last sent anything.
+    silent: u32,
     reconnect: Option<Reconnect>,
     frames: Vec<Vec<u8>>,
     events: VecDeque<Event>,
@@ -154,6 +161,7 @@ impl Client {
             last_egress: 0,
             keepalive_ns: crate::raft::nanos(keepalive.min(MAX_TIMEOUT)),
             keepalive_at: 0,
+            silent: 0,
             reconnect: None,
             frames: Vec::new(),
             events: VecDeque::new(),
@@ -172,6 +180,12 @@ impl Client {
         self.session
     }
 
+    /// The session is over: the cluster closed it ([`Event::Closed`]), and nothing more will come.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     /// Messages sent but not yet known applied.
     #[must_use]
     pub fn unacked(&self) -> usize {
@@ -183,6 +197,7 @@ impl Client {
         self.open = false;
         self.reconnect = None;
         self.keepalive_at = now + self.keepalive_ns;
+        self.silent = 0;
         match self.session {
             None => push_frame(&mut self.frames, &wire::Connect { credentials: &self.credentials }),
             Some(session) => {
@@ -208,6 +223,7 @@ impl Client {
 
     /// A frame from the cluster.
     pub fn on_frame(&mut self, message: &wire::Decoded<'_>) {
+        self.silent = 0;
         match message {
             wire::Decoded::Redirect(m) => {
                 self.open = false;
@@ -307,10 +323,19 @@ impl Client {
         }
     }
 
-    /// Time passed: a keepalive, if one is due.
+    /// Time passed: a keepalive, if one is due; or, the cluster silent for
+    /// three of them, [`Client::take_reconnect`] says to try the next member.
     pub fn on_tick(&mut self, now: u64) {
         if now >= self.keepalive_at {
             self.keepalive_at = now + self.keepalive_ns;
+            self.silent += 1;
+            if self.silent > SILENT_KEEPALIVES {
+                (self.open, self.silent) = (false, 0);
+                self.frames.clear();
+                self.target = (self.target + 1) % self.addrs.len();
+                self.reconnect = Some(Reconnect::Later);
+                return;
+            }
             if let (true, Some(session)) = (self.open, self.session) {
                 self.frame(&wire::KeepAlive { session: session.0 });
             }
@@ -444,6 +469,28 @@ mod tests {
         client.on_tick(second);
         assert_eq!(decoded(&client.take_frames()), ["KeepAlive(KeepAliveRef { session: 9 })"]);
         assert_eq!(client.next_deadline(), 2 * second);
+    }
+
+    /// A cluster that answers nothing for three keepalives is left for the next member; one that
+    /// answers anything is kept.
+    #[test]
+    fn a_silent_cluster_is_left() {
+        let second = 1_000_000_000;
+        let mut client = open();
+        for tick in 1..=3 {
+            client.on_tick(tick * second);
+            assert_eq!(client.take_reconnect(), None);
+        }
+        deliver(&mut client, &frame(&wire::KeepAliveAck { applied_seq: 0 }));
+        for tick in 4..=6 {
+            client.on_tick(tick * second);
+            assert_eq!(client.take_reconnect(), None, "it answered");
+        }
+        client.take_frames();
+        client.on_tick(7 * second);
+        assert_eq!(client.take_reconnect(), Some(Reconnect::Later));
+        assert_eq!(client.target(), "b");
+        assert!(client.take_frames().is_empty(), "no keepalive into the silence");
     }
 
     /// A dropped connection is tried again at the same member if the session was open there,

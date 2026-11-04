@@ -97,7 +97,8 @@ pub struct Config {
     /// How many responses each session keeps for a client that reattaches after a failover. A
     /// client away while more than this are sent misses some ([`crate::client::Event::Lost`]),
     /// so it must cover a gateway's requests in flight times the responses each can cause.
-    /// Every node holds this many per session, and snapshots them.
+    /// Every node holds this many per session, and snapshots them: give every member the same,
+    /// or a client's replay after a failover depends on which leader it reattaches to.
     pub egress_ring_entries: usize,
     /// The highest protocol version this node runs: [`PROTOCOL`], or lower to run as an older
     /// node would.

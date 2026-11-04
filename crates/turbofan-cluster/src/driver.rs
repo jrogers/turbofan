@@ -468,7 +468,7 @@ impl Storage {
         let snapshot = snapshot::load(&snapshots)?;
         let mut entries = Entries::default();
         let mut log = Log::open(&dir.join("log"), fsync, |record| entries.recover(record, window_bytes))?;
-        log.resume(snapshot.as_ref().map(|(s, _)| s.index), &mut entries)?;
+        log.resume(snapshot.as_ref().map(|(s, _)| (s.index, s.term)), &mut entries)?;
         let (meta_file, meta) = MetaFile::open(&dir.join("meta"))?;
         Ok((Self { log, meta: meta_file, snapshots, snapshots_kept: 1 }, meta, snapshot, entries))
     }

@@ -75,7 +75,9 @@ impl Entries {
         self.terms.partition_point(|&(first, _)| first <= index) - 1
     }
 
-    pub(super) fn term_at(&self, index: u64) -> Option<u64> {
+    /// The term of the entry at `index`, if it's in the log.
+    #[must_use]
+    pub fn term_at(&self, index: u64) -> Option<u64> {
         (self.first..=self.last()).contains(&index).then(|| self.terms[self.run_of(index)].1)
     }
 

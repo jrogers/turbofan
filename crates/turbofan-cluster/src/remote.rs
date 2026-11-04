@@ -214,6 +214,11 @@ async fn run(
                     return;
                 }
             }
+            // Over: `recv` returns `None` once the events are read, and nothing reattaches.
+            if client.is_closed() {
+                read.abort();
+                return;
+            }
             up = write(&mut client, &mut writer).await;
             // Redirected: the target already points where to go.
             match client.take_reconnect() {
@@ -495,7 +500,11 @@ impl Admin {
                 match ask(&target, &hello, token, tls, &request(request_id), |reply| answer(reply, request_id)).await {
                     Some(Ok(answer)) => return answer,
                     Some(Err(leader)) if !leader.is_empty() => target = leader,
-                    _ => tokio::time::sleep(RETRY * 4).await,
+                    // The leader it was sent to may be gone: the address finds the next.
+                    _ => {
+                        target.clone_from(&self.addr);
+                        tokio::time::sleep(RETRY * 4).await;
+                    }
                 }
             }
         };

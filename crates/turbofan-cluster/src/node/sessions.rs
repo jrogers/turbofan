@@ -106,7 +106,8 @@ impl<S: Service> Node<S> {
             codec::encode_frame(&message, &mut frame).expect("payloads are within their limit");
             self.local.sends.push((conn, frame));
         }
-        if s.ring.len() == self.config.egress_ring_entries {
+        // Over, not only at, the limit: from a node that kept more, or before it was lowered.
+        while s.ring.len() >= self.config.egress_ring_entries {
             s.ring.pop_front();
         }
         s.ring.push_back((egress_seq, payload));

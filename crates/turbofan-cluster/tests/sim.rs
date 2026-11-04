@@ -112,6 +112,7 @@ fn simulate() {
         assert!(covered.activations > 0, "a new version was never activated");
         assert!(covered.shutdowns > 0, "the cluster was never shut down");
         assert!(covered.torn > 0, "no crash tore an append");
+        assert!(covered.torn_resets > 0, "no crash interrupted a snapshot replacing the log");
         assert!(covered.rotten_records_found > 0, "no rotten record was found");
         assert!(covered.segments_compacted > 0, "no log segment was compacted");
         assert!(covered.promotions > 0, "a lost cluster was never recovered by promotion");
@@ -136,6 +137,9 @@ struct Coverage {
     shutdowns: u64,
     /// Appends a crash tore, the log's tail left partway through a record.
     torn: u64,
+    /// Crashes installing a leader's snapshot in place of the log, before or partway through
+    /// the reset.
+    torn_resets: u64,
     /// Nodes that stopped on finding a rotten record.
     rotten_records_found: u64,
     /// Times a log's first segment was removed.
@@ -162,6 +166,7 @@ impl Coverage {
         self.activations += other.activations;
         self.shutdowns += other.shutdowns;
         self.torn += other.torn;
+        self.torn_resets += other.torn_resets;
         self.rotten_records_found += other.rotten_records_found;
         self.segments_compacted += other.segments_compacted;
         self.promotions += other.promotions;
@@ -457,11 +462,12 @@ impl Disk {
         assert!(self.rotten_record.is_none(), "a rotten record is found");
         assert!(recovered == self.log.concat(), "the log recovers what was written");
         assert_eq!(log.next_index(), self.first + self.log.len() as u64);
-        // As the driver does: a log that ends before the snapshot goes on from it.
+        // As the driver does: a log that ends before the snapshot, or disagrees with it, goes on
+        // from it.
         let mut log = log;
-        let snapshot_index = self.snapshot.as_ref().map(|s| s.index);
-        if log.resume(snapshot_index, &mut entries)? {
-            (self.log, self.first) = (Vec::new(), snapshot_index.expect("reset to follow it") + 1);
+        let snapshot = self.snapshot.as_ref().map(|s| (s.index, s.term));
+        if log.resume(snapshot, &mut entries)? {
+            (self.log, self.first) = (Vec::new(), snapshot.expect("reset to follow it").0 + 1);
         }
         let (meta_file, meta) = MetaFile::open_simulated(&self.dir.path().join("meta"))?;
         assert_eq!(meta, self.meta, "the meta recovers what was written");
@@ -512,6 +518,30 @@ impl Disk {
         }
         // A newer snapshot: the rotten one is no longer read. A record compacted or truncated away.
         self.rotten = self.rotten.filter(|&r| self.snapshot.as_ref().is_some_and(|s| s.index == r));
+        let end = self.first + self.log.len() as u64;
+        self.rotten_record = self.rotten_record.filter(|r| (self.first..end).contains(r));
+        Ok(())
+    }
+
+    /// Power lost installing a leader's `snapshot` in place of the log: the snapshot reaches the
+    /// disk, and some of the old log's newest segments are gone, perhaps none, perhaps all.
+    fn tear_reset(&mut self, snapshot: &Snapshot, rng: &mut Rng) -> io::Result<()> {
+        snapshot::install(self.snapshots.path(), snapshot, false)?;
+        snapshot::remove_older(self.snapshots.path(), snapshot.index, 1).unwrap();
+        self.snapshot = Some(snapshot.clone());
+        self.files = None;
+        let segments = self.segments();
+        let gone = usize::try_from(rng.below(segments.len() as u64 + 1)).unwrap();
+        let kept = segments.len() - gone;
+        for (_, path) in &segments[kept..] {
+            std::fs::remove_file(path).unwrap();
+        }
+        if kept == 0 {
+            (self.log, self.first) = (Vec::new(), 1);
+        } else if let Some(&(first, _)) = segments.get(kept) {
+            self.log.truncate(usize::try_from(first - self.first).unwrap());
+        }
+        self.rotten = self.rotten.filter(|&r| r == snapshot.index);
         let end = self.first + self.log.len() as u64;
         self.rotten_record = self.rotten_record.filter(|r| (self.first..end).contains(r));
         Ok(())
@@ -1148,7 +1178,11 @@ impl Sim {
         let mut batches = std::mem::take(&mut sim_node.writing);
         let (mut reads, mut chunks) = (Vec::new(), Vec::new());
         for i in 0..batches.len() {
-            if self.faults && !batches[i].persist.is_empty() && self.rng.one_in(150) {
+            // Often while a leader's snapshot replaces the log: rare, and where a crash does the
+            // most harm.
+            let resets =
+                batches[i].persist.iter().any(|op| matches!(op, Persist::InstallSnapshot { replace_log: true, .. }));
+            if self.faults && !batches[i].persist.is_empty() && self.rng.one_in(if resets { 3 } else { 150 }) {
                 // Power lost: what it hadn't written yet, it's writing as it crashes.
                 self.nodes.get_mut(&id).unwrap().writing = batches.split_off(i);
                 self.crash(id);
@@ -1770,7 +1804,12 @@ impl Sim {
     /// Power lost partway through writing `ops`: some prefix of them reaches the disk, the last
     /// perhaps only some of its records.
     fn tear_writes(&mut self, id: NodeId, ops: &[Persist]) {
-        let whole = usize::try_from(self.rng.below(ops.len() as u64)).unwrap();
+        let mut whole = usize::try_from(self.rng.below(ops.len() as u64)).unwrap();
+        // Often in a leader's snapshot replacing the log, as there.
+        let reset = ops.iter().position(|op| matches!(op, Persist::InstallSnapshot { replace_log: true, .. }));
+        if let Some(at) = reset.filter(|_| self.rng.below(2) == 0) {
+            whole = at;
+        }
         let disk = &mut self.nodes.get_mut(&id).unwrap().disk;
         for op in &ops[..whole] {
             // Crashing anyway.
@@ -1778,11 +1817,17 @@ impl Sim {
                 break;
             }
         }
-        if let Persist::Append(records) = &ops[whole] {
-            let all: Vec<Record<'_>> = codec::records(records).map(Result::unwrap).collect();
-            let some = usize::try_from(self.rng.below(all.len() as u64)).unwrap();
-            disk.tear(&all, some, &mut self.rng);
-            self.covered.torn += 1;
+        match &ops[whole] {
+            Persist::Append(records) => {
+                let all: Vec<Record<'_>> = codec::records(records).map(Result::unwrap).collect();
+                let some = usize::try_from(self.rng.below(all.len() as u64)).unwrap();
+                disk.tear(&all, some, &mut self.rng);
+                self.covered.torn += 1;
+            }
+            Persist::InstallSnapshot { snapshot, replace_log: true } => {
+                self.covered.torn_resets += u64::from(disk.tear_reset(snapshot, &mut self.rng).is_ok());
+            }
+            _ => {}
         }
     }
 

@@ -23,13 +23,15 @@ impl Raft {
         !missing && have >= self.quorum()
     }
 
-    /// The highest snapshot index a quorum of voters (this node included) has durable, as a
-    /// leader knows.
+    /// The highest snapshot index a quorum of voters (this node among them, if it's one) has
+    /// durable, as a leader knows: one that removed itself leads until that commits.
     #[must_use]
     pub fn quorum_snapshot_index(&self) -> u64 {
         let mut indices: Vec<u64> =
             self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.snapshot_index).collect();
-        indices.push(self.snapshot_index());
+        if self.is_voter(self.config.id) {
+            indices.push(self.snapshot_index());
+        }
         indices.sort_unstable_by(|a, b| b.cmp(a));
         indices[self.quorum() - 1]
     }

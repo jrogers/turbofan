@@ -23,6 +23,30 @@ a patch version (0.1.1) doesn't.
   apply over it, for an operator's network; a heartbeat not under half the timeout is refused.
 - `node::Config::snapshots_kept` (`serve --keep-snapshots <n>`): the newest snapshots each node
   keeps on disk, for copying off it or restoring from. 1 by default, as before.
+- `Client::is_closed`: the session is over.
+
+### Fixed
+
+- A follower that crashed installing a leader's snapshot in place of its log was stuck: after
+  the snapshot was durable but before the log was reset, it kept a log disagreeing with the
+  snapshot and rejected the leader's appends for ever; partway through the reset, its log had a
+  gap and it wouldn't start. A log that disagrees with the snapshot is now reset on restart, and
+  a reset removes the old segments, newest first, before it starts the new one.
+- A client never noticed a leader that went silent (powered off, its link cut), waiting on the
+  socket until TCP gave up, by when its session had timed out. Three keepalives unanswered, it
+  now tries the next member.
+- A session's responses kept for a reattach (`egress_ring_entries`) grew without bound once over
+  the limit, from a node that kept more or the setting lowered, until the snapshot was too big
+  to read.
+- A learner could be promoted as soon as it started, before it had a chance to hear its leader.
+- An operator's request sent again after its connection dropped is answered on the new one; a
+  snapshot or shutdown was never answered, and a member change was refused though it went on.
+  `Admin` goes back to its address after a failure, not on to the leader it was redirected to.
+- `NodeId` parses from 1: `serve --id 0` was a voter no peer would talk to.
+- `add-member --wait`, `transfer-leadership --to` and `activate`'s flags without a value are
+  refused, not taken as absent.
+- `ClusterClient` stops once its session is closed: `recv` returns `None`, as it says.
+- A leader that removed itself counted its own snapshot towards an operator's snapshot quorum.
 
 ## 0.2.0 (2026-11-04)
 

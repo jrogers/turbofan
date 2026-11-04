@@ -882,6 +882,39 @@ fn a_promoted_learner_leads_a_cluster_of_its_own() {
     assert_eq!(learner.entry(tail), Some(&b"x"[..]), "its log as it was");
 }
 
+/// A learner just started hasn't heard its leader yet, which may well be alive: it isn't
+/// promoted until it's been silent an election timeout.
+#[test]
+fn a_learner_just_started_is_not_promoted() {
+    let mut learner = with_learner().remove(2);
+    assert!(!learner.promote(MS));
+    assert!(learner.promote(2 * 150 * MS));
+}
+
+/// A leader that removed itself, leading until that commits, doesn't count its own snapshot
+/// towards a quorum of the voters: only they do.
+#[test]
+fn a_leader_not_voting_does_not_count_towards_a_snapshot_quorum() {
+    let mut rafts = cluster(3);
+    elect(&mut rafts, &[1, 2, 3], 1, 1000 * MS);
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, 1000 * MS);
+    let leader = &mut rafts[0];
+    let snapshot = |leader: &mut Raft| {
+        leader.snapshot = Some(Snapshot { index: 2, term: 1, len: 0, checksum: 0, members: Vec::new() });
+        for peer in &mut leader.peers {
+            peer.snapshot_index = if peer.id == NodeId(2) { 2 } else { 0 };
+        }
+    };
+    snapshot(leader);
+    assert_eq!(leader.quorum_snapshot_index(), 2, "itself and node 2");
+    leader.snapshot = None;
+    assert!(leader.remove_member(NodeId(1)));
+    snapshot(leader);
+    assert_eq!(leader.quorum_snapshot_index(), 0, "node 2 alone, of 2 and 3");
+}
+
 /// The last voter isn't removed, though learners would be left.
 #[test]
 fn the_last_voter_is_not_removed() {

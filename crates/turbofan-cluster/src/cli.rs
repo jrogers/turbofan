@@ -188,10 +188,9 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
         "add-member" => {
             let member = Member { learner: args.iter().any(|a| a == "--learner"), ..member(&flag(args, "--member")?)? };
             let admin = admin.with_timeout(MEMBERS_REQUEST_TIMEOUT);
-            let wait = match flag(args, "--wait") {
-                Ok(n) => Some(n.parse::<u64>().map_err(|_| "--wait: a number of entries".to_owned())?),
-                Err(_) => None,
-            };
+            let wait = optional_flag(args, "--wait")?
+                .map(|n| n.parse::<u64>().map_err(|_| "--wait: a number of entries".to_owned()))
+                .transpose()?;
             let runtime = runtime()?;
             let index = runtime.block_on(admin.add_member(&member)).map_err(failed)?;
             let what = if member.learner { "learner" } else { "member" };
@@ -214,9 +213,9 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             println!("member {id} is a {} from index {index}", if learner { "learner" } else { "voter" });
         }
         "activate" => {
-            let version = |name| match flag(args, name) {
-                Ok(v) => v.parse().map_err(|_| format!("{name}: a number")),
-                Err(_) => Ok(0),
+            let version = |name| match optional_flag(args, name)? {
+                Some(v) => v.parse().map_err(|_| format!("{name}: a number")),
+                None => Ok(0),
             };
             let (protocol, service) = (version("--protocol")?, version("--service")?);
             let index = runtime()?.block_on(admin.activate(protocol, service)).map_err(failed)?;
@@ -233,10 +232,9 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             );
         }
         "transfer-leadership" => {
-            let to = match flag(args, "--to") {
-                Ok(to) => Some(to.parse().map_err(|_| "--to: a number from 1".to_owned())?),
-                Err(_) => None,
-            };
+            let to = optional_flag(args, "--to")?
+                .map(|to| to.parse().map_err(|_| "--to: a number from 1".to_owned()))
+                .transpose()?;
             let leader = runtime()?.block_on(admin.transfer_leadership(to)).map_err(failed)?;
             println!("node {leader} leads");
         }
@@ -367,11 +365,10 @@ fn tune(args: &[String], config: &mut driver::Config) -> Result<(), String> {
 
 /// The values of the TLS flags `names`: all of them, or none for no TLS.
 fn tls_flags<const N: usize>(args: &[String], names: [&str; N]) -> Result<Option<[String; N]>, String> {
-    // A flag without its value is an error, not absent: else alone it would mean no TLS.
-    for name in names.iter().filter(|&&name| args.iter().any(|a| a == name)) {
-        flag(args, name)?;
+    let mut given = names.map(|_| None);
+    for (value, name) in given.iter_mut().zip(names) {
+        *value = optional_flag(args, name)?;
     }
-    let given = names.map(|name| flag(args, name).ok());
     if given.iter().all(Option::is_none) {
         return Ok(None);
     }
@@ -395,8 +392,14 @@ fn token(name: &str) -> Result<Option<Vec<u8>>, String> {
 
 /// The value after `name`.
 fn flag(args: &[String], name: &str) -> Result<String, String> {
-    let at = args.iter().position(|a| a == name).ok_or_else(|| format!("missing {name}\n{USAGE}"))?;
-    args.get(at + 1).cloned().ok_or_else(|| format!("{name} needs a value"))
+    optional_flag(args, name)?.ok_or_else(|| format!("missing {name}\n{USAGE}"))
+}
+
+/// The value after `name`, if it's given. Given without one is an error, never taken for
+/// absent: a trailing `--wait` would otherwise not wait.
+fn optional_flag(args: &[String], name: &str) -> Result<Option<String>, String> {
+    let Some(at) = args.iter().position(|a| a == name) else { return Ok(None) };
+    args.get(at + 1).cloned().map(Some).ok_or_else(|| format!("{name} needs a value"))
 }
 
 /// `4=<peer addr>,<client addr>,<admin addr>`.
@@ -443,7 +446,7 @@ fn members(list: &str) -> Result<Vec<(NodeId, SocketAddr)>, String> {
 mod tests {
     use std::time::Duration;
 
-    use super::{learners, serve_config, tls_flags, tune};
+    use super::{learners, optional_flag, serve_config, tls_flags, tune};
     use crate::driver::Fsync;
     use crate::raft::NodeId;
 
@@ -484,6 +487,15 @@ mod tests {
         assert_eq!(tls_flags(&args(&["--a", "1", "--b", "2"]), names), Ok(Some(["1".into(), "2".into()])));
         assert!(tls_flags(&args(&["--a", "1"]), names).is_err());
         assert!(tls_flags(&args(&["--a"]), names).is_err());
+    }
+
+    /// A flag given without its value is an error, not taken for absent.
+    #[test]
+    fn a_flag_without_its_value_is_refused() {
+        let args = |a: &[&str]| a.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+        assert_eq!(optional_flag(&args(&["--x", "1"]), "--wait"), Ok(None));
+        assert_eq!(optional_flag(&args(&["--wait", "5"]), "--wait"), Ok(Some("5".into())));
+        assert!(optional_flag(&args(&["--wait"]), "--wait").is_err());
     }
 
     /// Learners are some of the members, never all: a cluster needs a voter.

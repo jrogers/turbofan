@@ -118,8 +118,9 @@ impl From<NodeId> for usize {
 impl std::str::FromStr for NodeId {
     type Err = std::num::ParseIntError;
 
+    /// From 1: 0 is the wire's "none", and an error.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.parse().map(Self)
+        s.parse().map(|id: std::num::NonZeroU8| Self(id.get()))
     }
 }
 
@@ -443,7 +444,8 @@ pub struct Raft {
     doubt: Option<u64>,
     election_at: u64,
     heartbeat_at: u64,
-    /// When a leader was last heard from, for refusing pre-votes while it's alive.
+    /// When a leader was last heard from, for refusing pre-votes and promotion while it's alive.
+    /// Starting counts: one may be alive that hasn't been heard yet.
     leader_seen_at: Option<u64>,
     rng: u64,
     out: Outputs,
@@ -523,7 +525,7 @@ impl Raft {
             doubt,
             election_at: 0,
             heartbeat_at: 0,
-            leader_seen_at: None,
+            leader_seen_at: Some(now),
             rng,
             out: Outputs::default(),
             snapshot,

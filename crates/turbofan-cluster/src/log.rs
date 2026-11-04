@@ -191,15 +191,18 @@ impl Log {
     }
 
     /// Readies a log just opened, whose records are `entries`, for Raft. One that ends before the
-    /// snapshot of `snapshot_index` (a crash between installing it and resetting the log, or a
-    /// damaged tail it covers, dropped) goes on from the snapshot, without its records. Then
+    /// snapshot `(index, term)`, or holds another term at its index, goes on from the snapshot,
+    /// without its records: a crash between installing a leader's snapshot and resetting the log
+    /// (or partway through the reset), or a damaged tail the snapshot covers, dropped. Then
     /// `entries` carry its doubt. Returns whether it was reset.
     ///
     /// # Errors
     ///
     /// If resetting it fails.
-    pub fn resume(&mut self, snapshot_index: Option<u64>, entries: &mut Entries) -> io::Result<bool> {
-        let reset = snapshot_index.filter(|&index| self.next_index <= index);
+    pub fn resume(&mut self, snapshot: Option<(u64, u64)>, entries: &mut Entries) -> io::Result<bool> {
+        let reset = snapshot
+            .filter(|&(index, term)| self.next_index <= index || entries.term_at(index).is_some_and(|t| t != term))
+            .map(|(index, _)| index);
         if let Some(index) = reset {
             self.reset(index + 1)?;
             *entries = Entries::default();
@@ -401,15 +404,18 @@ impl Log {
     /// If the files can't be changed.
     pub fn reset(&mut self, next_index: u64) -> io::Result<()> {
         self.cursor = None;
+        // Newest first, and all gone before the new one: a crash partway leaves the start of the
+        // old log, which [`Log::resume`] resets, never a gap.
+        for first in std::mem::take(&mut self.segments).into_iter().rev() {
+            fs::remove_file(segment_path(&self.dir, first))?;
+        }
+        if self.sync {
+            sync_dir(&self.dir)?;
+        }
         self.file =
             OpenOptions::new().create(true).truncate(true).write(true).open(segment_path(&self.dir, next_index))?;
         if self.sync {
             self.file.sync_all()?;
-        }
-        for first in std::mem::take(&mut self.segments) {
-            if first != next_index {
-                fs::remove_file(segment_path(&self.dir, first))?;
-            }
         }
         self.segments = vec![next_index];
         self.file_len = 0;
@@ -556,6 +562,51 @@ mod tests {
         drop(log);
         let (log, found) = open(dir.path());
         assert_eq!((found, log.next_index()), (vec![10, 11], 12));
+    }
+
+    /// Opens the log as the driver does, resumed from the snapshot `(index, term)`: whether it
+    /// was reset, and its next index.
+    fn resume(dir: &Path, snapshot: (u64, u64)) -> (bool, u64) {
+        let mut entries = Entries::default();
+        let mut log = Log::open(dir, Fsync::EachBatch, |r| entries.recover(r, usize::MAX)).unwrap();
+        (log.resume(Some(snapshot), &mut entries).unwrap(), log.next_index())
+    }
+
+    /// Records 1 to 6 of term 1, in segments at 1, 3 and 5.
+    fn three_segments(dir: &Path) {
+        let (mut log, _) = open(dir);
+        log.append(&test_records(1, 2)).unwrap();
+        log.file_len = MAX_SEGMENT_BYTES;
+        log.append(&test_records(3, 2)).unwrap();
+        log.file_len = MAX_SEGMENT_BYTES;
+        log.append(&test_records(5, 2)).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.segments, [1, 3, 5]);
+    }
+
+    /// A crash after a leader's snapshot was installed, before the log it replaces was reset:
+    /// the log holds another term at the snapshot's index, and goes on from the snapshot.
+    #[test]
+    fn a_log_disagreeing_with_the_snapshot_is_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        three_segments(dir.path());
+        assert_eq!(resume(dir.path(), (4, 1)), (false, 7), "the same term: kept");
+        assert_eq!(resume(dir.path(), (4, 2)), (true, 5));
+        assert_eq!(open(dir.path()).1, Vec::<u64>::new());
+    }
+
+    /// A crash partway through a reset, which removes the newest segments first: what's left
+    /// opens, and goes on from the snapshot.
+    #[test]
+    fn a_reset_cut_short_resumes_from_the_snapshot() {
+        for gone in 1..=3 {
+            let dir = tempfile::tempdir().unwrap();
+            three_segments(dir.path());
+            for first in [5, 3, 1].into_iter().take(gone) {
+                fs::remove_file(segment_path(dir.path(), first)).unwrap();
+            }
+            assert_eq!(resume(dir.path(), (4, 2)), (true, 5), "{gone} gone");
+        }
     }
 
     #[test]
