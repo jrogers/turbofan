@@ -177,8 +177,11 @@ async fn run(
         let mut conn = Connection::new(stream);
         client.on_connected(now());
         conn.write(&mut client);
+        // One timer, moved only when the deadline does: a new one a pass takes tokio's timer lock twice a message.
+        let mut sleep = Box::pin(tokio::time::sleep_until(start.into()));
         loop {
-            let wake = start + Duration::from_nanos(client.next_deadline());
+            let wake = (start + Duration::from_nanos(client.next_deadline())).into();
+            (sleep.deadline() != wake).then(|| sleep.as_mut().reset(wake));
             tokio::select! {
                 command = commands.recv() => match command {
                     None => return,
@@ -197,7 +200,7 @@ async fn run(
                         }
                     }
                 }
-                () = tokio::time::sleep_until(wake.into()) => client.on_tick(now()),
+                () = &mut sleep => client.on_tick(now()),
                 _ = &mut conn.written => {
                     client.on_disconnected();
                     break;
@@ -260,7 +263,11 @@ impl Connection {
         });
         let (out, mut to_write) = mpsc::unbounded_channel::<Vec<Vec<u8>>>();
         let written = tokio::spawn(async move {
-            while let Some(frames) = to_write.recv().await {
+            while let Some(mut frames) = to_write.recv().await {
+                // Whatever else queued meanwhile goes with it, under one flush.
+                while let Ok(more) = to_write.try_recv() {
+                    frames.extend(more);
+                }
                 if write_frames(&mut writer, frames.iter().map(Vec::as_slice)).await.is_err() {
                     return;
                 }

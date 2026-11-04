@@ -21,6 +21,12 @@ a patch version (0.1.1) doesn't.
   for the connections after. Files that don't load are left until they do, counted in
   `turbofan_tls_reloads`.
 
+### Changed
+
+- `ClusterClient` keeps one timer rather than making one a message, whose registering, under
+  tokio's timer lock, held up several clients at once, and writes what queued together under one
+  flush: the benchmark's throughput nearly doubles.
+
 ### Breaking
 
 - `NodeTls::admin_ca` is an `Option`. `NodeTls::new` and `NodeTls::admin_only` are as they were.
