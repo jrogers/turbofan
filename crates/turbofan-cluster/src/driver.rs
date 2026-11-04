@@ -91,6 +91,46 @@ pub struct Config {
 /// The longest token a hello carries.
 pub const MAX_TOKEN_BYTES: usize = 255;
 
+/// Starts a new cluster from the snapshot file `from`: a copy of a node's, taken off it to back
+/// the cluster up. Writes `config.data_dir` for [`serve`] to run, with the same `config`, as the
+/// one member of the new cluster: this node, from the snapshot's state, of a new epoch so that
+/// nodes of the old cluster can't talk to it. It grows with [`Admin::add_member`]. What the old
+/// cluster applied after the snapshot is lost; a client that saw any of it closes its session
+/// ([`CloseReason::Diverged`](crate::CloseReason::Diverged)). Returns the snapshot's index and
+/// the new epoch.
+///
+/// [`Admin::add_member`]: crate::Admin::add_member
+///
+/// # Errors
+///
+/// If `data_dir` holds anything (it's never overwritten), this node isn't among `config`'s
+/// members, the snapshot can't be read or is damaged, or writing fails: then empty `data_dir`
+/// and try again.
+pub fn restore(from: &Path, config: &Config) -> io::Result<(u64, u64)> {
+    let dir = &config.data_dir;
+    if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} isn't empty", dir.display())));
+    }
+    let id = config.node.raft.id;
+    let me = config.node.raft.members.iter().find(|m| m.id == id);
+    let me = me.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "this node isn't among the members"))?;
+    let me = Member { learner: false, ..me.clone() };
+    let (snapshot, mut bytes) = snapshot::open(from)?;
+    let epoch = node::mint_epoch(wall_ns(), id);
+    let state = node::with_epoch(&mut bytes, epoch)?;
+    let snapshots = dir.join("snapshots");
+    std::fs::create_dir_all(&snapshots)?;
+    let writer: node::SnapshotWriter = Box::new(move |out| {
+        out.write_all(&state)?;
+        io::copy(&mut bytes, out).map(drop)
+    });
+    snapshot::save(&snapshots, snapshot.index, snapshot.term, vec![me], writer, true)?;
+    // Its first election is of a term after the snapshot's, as the old cluster's next would be.
+    let (mut meta, _) = MetaFile::open(&dir.join("meta"))?;
+    meta.save(crate::meta::Meta { term: snapshot.term, vote: None })?;
+    Ok((snapshot.index, epoch))
+}
+
 enum Input {
     Peer(NodeId, Vec<u8>),
     Client(ConnId, Vec<u8>),
@@ -117,8 +157,9 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     }
     let tls = config.tls.as_ref().map(tls::Loaded::load).transpose()?;
     let id = config.node.raft.id;
-    let (storage, meta, snapshot, log) =
+    let (mut storage, meta, snapshot, log) =
         Storage::open(&config.data_dir, config.log_fsync, config.node.raft.log_window_bytes)?;
+    storage.snapshots_kept = config.node.snapshots_kept;
     let mut clock = Clock::new();
     let mut node =
         Node::new(config.node.clone(), service, meta, snapshot.as_ref().map(|s| s.0.clone()), log, clock.now());
@@ -377,6 +418,8 @@ struct Storage {
     log: Log,
     meta: MetaFile,
     snapshots: PathBuf,
+    /// [`node::Config::snapshots_kept`].
+    snapshots_kept: usize,
 }
 
 impl Storage {
@@ -394,7 +437,7 @@ impl Storage {
         let mut log = Log::open(&dir.join("log"), fsync, |record| entries.recover(record, window_bytes))?;
         log.resume(snapshot.as_ref().map(|(s, _)| s.index), &mut entries)?;
         let (meta_file, meta) = MetaFile::open(&dir.join("meta"))?;
-        Ok((Self { log, meta: meta_file, snapshots }, meta, snapshot, entries))
+        Ok((Self { log, meta: meta_file, snapshots, snapshots_kept: 1 }, meta, snapshot, entries))
     }
 
     /// Writes `batches` in order, each one's reads after its operations, then syncs. Returns the
@@ -453,12 +496,12 @@ impl Storage {
             Persist::Trust => self.log.trust()?,
             Persist::Compact { log, snapshot } => {
                 self.log.compact_to(*log)?;
-                snapshot::remove_older(&self.snapshots, *snapshot)?;
+                snapshot::remove_older(&self.snapshots, *snapshot, self.snapshots_kept)?;
             }
             Persist::SnapshotChunk { offset, bytes, .. } => snapshot::write_chunk(&self.snapshots, *offset, bytes)?,
             Persist::InstallSnapshot { snapshot, replace_log } => {
                 snapshot::install(&self.snapshots, snapshot, true)?;
-                snapshot::remove_older(&self.snapshots, snapshot.index)?;
+                snapshot::remove_older(&self.snapshots, snapshot.index, self.snapshots_kept)?;
                 if *replace_log {
                     self.log.reset(snapshot.index + 1)?;
                 } else {

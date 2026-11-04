@@ -399,14 +399,14 @@ impl Disk {
             Persist::Compact { log: to, snapshot } => {
                 let first = log.compact_to(*to)?;
                 self.compact_to(first);
-                snapshot::remove_older(self.snapshots.path(), *snapshot).unwrap();
+                snapshot::remove_older(self.snapshots.path(), *snapshot, 1).unwrap();
             }
             Persist::SnapshotChunk { offset, bytes, .. } => {
                 snapshot::write_chunk(self.snapshots.path(), *offset, bytes).unwrap();
             }
             Persist::InstallSnapshot { snapshot, replace_log } => {
                 snapshot::install(self.snapshots.path(), snapshot, false)?;
-                snapshot::remove_older(self.snapshots.path(), snapshot.index).unwrap();
+                snapshot::remove_older(self.snapshots.path(), snapshot.index, 1).unwrap();
                 if *replace_log {
                     log.reset(snapshot.index + 1)?;
                     self.log.clear();
@@ -1612,6 +1612,7 @@ impl Sim {
             },
             session_timeout: Duration::from_millis(10_000),
             snapshot_every_entries: 300,
+            snapshots_kept: 1,
             // Covers a client's messages in flight, each with its response and some a timer's.
             egress_ring_entries: 2 * client::MAX_UNACKED,
             protocol: u32::from(sim_node.upgraded),

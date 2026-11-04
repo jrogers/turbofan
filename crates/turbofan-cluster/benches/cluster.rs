@@ -253,6 +253,7 @@ fn start(dir: &Path, tls: bool, fsync: driver::Fsync) -> (Vec<String>, Option<Cl
                 },
                 session_timeout: Duration::from_millis(10_000),
                 snapshot_every_entries: 100_000,
+                snapshots_kept: 1,
                 egress_ring_entries: 1024,
                 protocol: node::PROTOCOL,
             },

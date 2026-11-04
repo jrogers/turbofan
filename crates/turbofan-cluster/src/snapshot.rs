@@ -5,8 +5,9 @@
 //! place and the directory synced, so a crash leaves the previous snapshot or the new one,
 //! whole. A node's own snapshots are written by [`save`], on a thread of their own while the node
 //! goes on; one arriving from the leader by [`write_chunk`] and [`install`]. Older ones are
-//! removed by [`remove_older`] once the node has moved on to a newer one, since until then it may
-//! still be reading chunks of them for a follower.
+//! removed by [`remove_older`], but the newest so many kept, once the node has moved on to a
+//! newer one, since until then it may still be reading chunks of them for a follower. A copy
+//! taken off the node is a backup, read back by [`open`].
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -85,14 +86,16 @@ pub fn install(dir: &Path, snapshot: &Snapshot, durable: bool) -> io::Result<()>
     finish(dir, &temp, file, snapshot, durable)
 }
 
-/// Removes the snapshots older than `index`.
+/// Removes the snapshots older than `index`, but the newest `kept - 1` of them: `kept` with the
+/// one of `index`, for an operator to copy off the node or restore from.
 ///
 /// # Errors
 ///
 /// If one can't be removed.
-pub fn remove_older(dir: &Path, index: u64) -> io::Result<()> {
-    for older in list(dir)?.into_iter().filter(|&i| i < index) {
-        fs::remove_file(path(dir, older))?;
+pub fn remove_older(dir: &Path, index: u64, kept: usize) -> io::Result<()> {
+    let older: Vec<u64> = list(dir)?.into_iter().filter(|&i| i < index).collect();
+    for &old in &older[..older.len().saturating_sub(kept.saturating_sub(1))] {
+        fs::remove_file(path(dir, old))?;
     }
     Ok(())
 }
@@ -110,17 +113,36 @@ pub fn load(dir: &Path) -> io::Result<Option<(Snapshot, io::Take<BufReader<File>
     Ok(Some((snapshot, BufReader::new(file).take(len))))
 }
 
+/// The snapshot file at `file`, wherever it is (a copy taken off a node, say), checked whole, and
+/// its bytes to read.
+///
+/// # Errors
+///
+/// If it can't be read, isn't a snapshot, or is damaged.
+pub fn open(file: &Path) -> io::Result<(Snapshot, io::Take<BufReader<File>>)> {
+    let (snapshot, file) = open_file(file, None)?;
+    let len = snapshot.len;
+    Ok((snapshot, BufReader::new(file).take(len)))
+}
+
 /// The snapshot of `index`, checked whole, and its file at its bytes.
 fn open_checked(dir: &Path, index: u64) -> io::Result<(Snapshot, File)> {
-    let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("snapshot {index}: {what}"));
-    let mut file = File::open(path(dir, index))?;
+    open_file(&path(dir, index), Some(index))
+}
+
+/// The snapshot at `at`, of `index` if given, checked whole, and its file at its bytes.
+fn open_file(at: &Path, index: Option<u64>) -> io::Result<(Snapshot, File)> {
+    let name = at.display();
+    let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("snapshot {name}: {what}"));
+    let mut file = File::open(at)?;
     let mut header = [0; HEADER];
     file.read_exact(&mut header).map_err(|_| invalid("not a snapshot"))?;
     let word = |i: usize| u64::from_le_bytes(header[8 + i * 8..16 + i * 8].try_into().expect("eight bytes"));
-    let (stored_index, term, len, sum) = (word(0), word(1), word(2), word(3));
-    if &header[..8] != MAGIC || stored_index != index {
+    let (stored, term, len, sum) = (word(0), word(1), word(2), word(3));
+    if &header[..8] != MAGIC || index.is_some_and(|index| index != stored) {
         return Err(invalid("not a snapshot"));
     }
+    let index = stored;
     if file.metadata()?.len() < crate::widen(HEADER) + len {
         return Err(invalid("wrong length"));
     }
@@ -301,8 +323,40 @@ mod tests {
         assert_eq!(read(dir.path(), 20, 2, 3).unwrap(), b"ent");
         assert_eq!(read(dir.path(), 20, 4, 100).unwrap(), b"ty", "not the members after it");
         assert_eq!(list(dir.path()).unwrap(), [10, 20], "kept until the node moves on");
-        remove_older(dir.path(), 20).unwrap();
+        remove_older(dir.path(), 20, 1).unwrap();
         assert_eq!(list(dir.path()).unwrap(), [20]);
+    }
+
+    /// Kept: the newest so many, the one moved on to among them; never one it may still read.
+    #[test]
+    fn so_many_snapshots_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in [10, 20, 30, 40] {
+            save(dir.path(), index, 2, members(), writer(b"state"), true).unwrap();
+        }
+        remove_older(dir.path(), 30, 2).unwrap();
+        assert_eq!(list(dir.path()).unwrap(), [20, 30, 40], "the newest of those before 30, and 30 on");
+        remove_older(dir.path(), 40, 3).unwrap();
+        assert_eq!(list(dir.path()).unwrap(), [20, 30, 40]);
+        remove_older(dir.path(), 40, 0).unwrap();
+        assert_eq!(list(dir.path()).unwrap(), [40], "none is one: the newest");
+    }
+
+    /// A copy of a snapshot, wherever it's put, opens checked, and damaged it doesn't.
+    #[test]
+    fn a_copied_snapshot_opens_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), 10, 2, members(), writer(b"state"), true).unwrap();
+        let copy = dir.path().join("backup");
+        fs::copy(path(dir.path(), 10), &copy).unwrap();
+        let (snapshot, mut bytes) = open(&copy).unwrap();
+        let mut read = Vec::new();
+        bytes.read_to_end(&mut read).unwrap();
+        assert_eq!((snapshot.index, snapshot.term, snapshot.members, read), (10, 2, members(), b"state".to_vec()));
+        let mut damaged = fs::read(&copy).unwrap();
+        damaged[HEADER] ^= 1;
+        fs::write(&copy, damaged).unwrap();
+        assert_eq!(open(&copy).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

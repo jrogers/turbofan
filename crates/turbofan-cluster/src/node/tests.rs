@@ -88,6 +88,7 @@ fn leader() -> Node<Recorder> {
         },
         session_timeout: Duration::from_nanos(TIMEOUT),
         snapshot_every_entries: 1000,
+        snapshots_kept: 1,
         egress_ring_entries: 1024,
         protocol: PROTOCOL,
     };
@@ -267,6 +268,7 @@ fn a_follower_redirects_clients_to_the_leader() {
         },
         session_timeout: Duration::from_nanos(TIMEOUT),
         snapshot_every_entries: 1000,
+        snapshots_kept: 1,
         egress_ring_entries: 1024,
         protocol: PROTOCOL,
     };

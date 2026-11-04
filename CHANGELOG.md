@@ -4,6 +4,21 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Breaking
+
+- `node::Config` has a new field, `snapshots_kept`: one built field by field needs it (`1` keeps
+  what a node did), or `..node::Config::new(..)`.
+
+### Added
+
+- Backup and restore. A snapshot copied off a node is a backup; `driver::restore` (`restore
+  --from <file>` with `serve`'s flags) makes a data directory of it for one node, which `serve`
+  runs as the one member of a new cluster, of a new epoch, to grow with `add-member`.
+- `node::Config::snapshots_kept` (`serve --keep-snapshots <n>`): the newest snapshots each node
+  keeps on disk, for copying off it or restoring from. 1 by default, as before.
+
 ## 0.2.0 (2026-11-04)
 
 ### Breaking

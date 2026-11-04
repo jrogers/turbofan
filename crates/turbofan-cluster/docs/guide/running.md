@@ -41,7 +41,7 @@ refuses a client, operator or peer of another service, so two clusters can't be 
 | `log/lock` | Held while the node runs: a second process on the same directory is refused. |
 | `log/doubt` | There while the node doubts its log (see [Members][membership]). |
 | `meta` | The current term and vote. |
-| `snapshots/` | The latest snapshot. |
+| `snapshots/` | The latest snapshot, or the latest `node.snapshots_kept`. |
 
 A node that restarts loads its snapshot, replays the log after it and rejoins. Each snapshot
 drops the log before it, but for a tail of 100,000 entries (`log_tail_entries`) kept for followers
@@ -74,6 +74,7 @@ once, which may lose entries already committed. Spread the nodes over power doma
 | `node.raft.max_uncommitted_bytes` | 64 MiB | A leader with this much proposed and not yet committed takes nothing more from clients. |
 | `node.session_timeout` | 10 s | A session the leader hears nothing from for this long is closed. |
 | `node.snapshot_every_entries` | 100,000 | Each node snapshots once this many entries follow its last snapshot. |
+| `node.snapshots_kept` | 1 | The newest snapshots each node keeps on disk (`--keep-snapshots`): see [Operations][operations]. |
 | `node.egress_ring_entries` | 8192 | Responses kept per session for a client that reattaches (up to `MAX_EGRESS_RING`). |
 | `log_fsync` | `Fsync::Never` | `Fsync::EachBatch` is `--fsync`. |
 | `admin_token`, `peer_token` | none | See below. |

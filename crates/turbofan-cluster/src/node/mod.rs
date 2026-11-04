@@ -40,6 +40,7 @@ mod sessions;
 mod state;
 
 pub use service::{Ctx, Effect, PayloadTooLong, Service, SessionId};
+pub(crate) use state::with_epoch;
 use state::{Session, State, decode_state, encode_state};
 
 /// A client connection's ID, which the driver assigns.
@@ -85,6 +86,10 @@ pub struct Config {
     pub session_timeout: Duration,
     /// Each node snapshots, and compacts its log, once this many entries follow its last snapshot.
     pub snapshot_every_entries: u64,
+    /// How many of its snapshots each node keeps on disk, the newest: past 1, older ones for an
+    /// operator to copy off the node, or restore from ([`crate::driver::restore`]). Each holds the
+    /// whole state. The driver deletes the rest; the node itself only ever reads the newest.
+    pub snapshots_kept: usize,
     /// How many responses each session keeps for a client that reattaches after a failover. A
     /// client away while more than this are sent misses some ([`crate::client::Event::Lost`]),
     /// so it must cover a gateway's requests in flight times the responses each can cause.
@@ -99,8 +104,8 @@ impl Config {
     /// The defaults for node `id` of a cluster that starts with `members`, this node among them,
     /// or of none to join a running one: a 300 ms election timeout, a 50 ms heartbeat, 64 MiB of
     /// applied records kept in memory, clients held back past 64 MiB of proposals uncommitted, a
-    /// 10 s session timeout, a snapshot every 100,000 entries with 100,000 kept before it, and 8192
-    /// responses kept per session. Change any field after.
+    /// 10 s session timeout, a snapshot every 100,000 entries with 100,000 kept before it, one
+    /// snapshot kept on disk, and 8192 responses kept per session. Change any field after.
     #[must_use]
     pub fn new(id: NodeId, members: Vec<Member>) -> Self {
         Self {
@@ -116,6 +121,7 @@ impl Config {
             },
             session_timeout: Duration::from_secs(10),
             snapshot_every_entries: 100_000,
+            snapshots_kept: 1,
             egress_ring_entries: 8192,
             protocol: PROTOCOL,
         }
@@ -568,7 +574,7 @@ impl<S: Service> Node<S> {
 
 /// An epoch no other cluster has: from the time, and the node naming it, so two learners
 /// promoted at once don't name the same. Never 0, which is none.
-fn mint_epoch(now: u64, id: NodeId) -> u64 {
+pub(crate) fn mint_epoch(now: u64, id: NodeId) -> u64 {
     (now ^ (u64::from(id.0) << 56)).max(1)
 }
 

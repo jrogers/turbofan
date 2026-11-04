@@ -32,7 +32,44 @@ snapshot taken at index 1830413
 
 A snapshot is what a restarting node loads, so a fresh one makes restarts quicker. It's also
 where to look for the service's state at a known index: the latest is in each node's
-`snapshots/` directory.
+`snapshots/` directory, and `serve --keep-snapshots <n>` keeps the newest `n` there, not just one.
+
+## Backup and restore
+
+A snapshot is a backup: one file of the whole state (the service's, its sessions and timers, the
+members), checked against a checksum, and written whole or not at all. To take one, ask for it,
+then copy the newest snapshot in any node's `snapshots/` directory off the machine, with whatever
+you copy files with:
+
+```sh
+$ my-service snapshot --admin 10.0.0.1:7201
+snapshot taken at index 1830413
+$ ssh 10.0.0.1 'ls /var/lib/my-service/snapshots/*.snapshot | tail -1'
+/var/lib/my-service/snapshots/00000000000001830413.snapshot
+$ scp 10.0.0.1:/var/lib/my-service/snapshots/00000000000001830413.snapshot backups/
+```
+
+Copy the newest rather than the one named by the index: a node snapshots on its own too, and
+then deletes the older one, unless `--keep-snapshots` keeps it. The newest is at least as
+recent. Run this on a schedule; what's applied after the last backup is what a restore loses.
+For a loss measured in milliseconds, keep a standby instead (see [Members][membership]).
+
+With the cluster lost, `restore` makes a data directory from a backup, for one node, with
+`serve`'s flags; `serve` then runs it, as the one member of a new cluster:
+
+```sh
+my-service restore --from backups/00000000000001830413.snapshot --id 1 --data /var/lib/my-service \
+    --peers 1=10.0.0.1:7001 --clients 1=10.0.0.1:7101 --admin 1=10.0.0.1:7201
+my-service serve --id 1 --data /var/lib/my-service \
+    --peers 1=10.0.0.1:7001 --clients 1=10.0.0.1:7101 --admin 1=10.0.0.1:7201
+```
+
+It refuses a data directory that isn't empty. The new cluster has the snapshot's state, and a new
+epoch, as a promoted standby does: the old cluster's nodes, if any come back, can't talk to it.
+Grow it with `add-member`, each new node with an empty data directory. Sessions are in the
+snapshot, so clients reattach; one that saw messages or responses from after it closes its
+session (`CloseReason::Diverged`, see [Clients][clients]), to open another and ask the service
+what it has.
 
 ## Rolling restarts
 

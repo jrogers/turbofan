@@ -1,7 +1,8 @@
 //! Three nodes over real TCP and real files, with a gateway client: messages answered once and in
 //! order while every node in turn, the leader among them, is killed and restarted from disk, and
-//! while a fourth joins and the first leaves; and a fourth, a learner, promoted to a cluster of
-//! its own once the three are lost, that they can't take back.
+//! while a fourth joins and the first leaves; a fourth, a learner, promoted to a cluster of its
+//! own once the three are lost, that they can't take back; and the three, lost, restored from a
+//! copy of a snapshot.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -100,6 +101,7 @@ impl Cluster {
                     },
                     session_timeout: Duration::from_millis(10_000),
                     snapshot_every_entries: 50,
+                    snapshots_kept: 1,
                     egress_ring_entries: 1024,
                     protocol: node::PROTOCOL,
                 },
@@ -316,6 +318,65 @@ async fn a_promoted_learner_leads_a_cluster_of_its_own() {
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     exchange(&mut cluster, &mut promoted, 101, 200).await;
+}
+
+/// Backup and restore: a snapshot taken on demand and copied off a node restores the cluster,
+/// lost whole, as a cluster of one of a new epoch, which grows with `add-member`. A client that
+/// saw what came after the snapshot closes its session; the old nodes, back, can't take it over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new(dir.path(), None);
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 100).await;
+    let addrs: Vec<String> = cluster.configs.iter().map(|c| c.admin_listen.to_string()).collect();
+    let admin = |i: usize| Admin::new(&addrs[i], SERVICE_ID).with_token(TOKEN).with_timeout(Duration::from_secs(20));
+    let asked = admin(0).request_snapshot().await.unwrap();
+    // The newest snapshot in its directory: at least the one asked for, and whole.
+    let snapshots = cluster.configs[0].data_dir.join("snapshots");
+    let newest = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "snapshot"))
+        .max()
+        .unwrap();
+    let backup = dir.path().join("backup.snapshot");
+    std::fs::copy(newest, &backup).unwrap();
+    // Applied after the backup: lost with the cluster.
+    exchange(&mut cluster, &mut client, 101, 150).await;
+    for i in 0..3 {
+        cluster.kill(i).await;
+    }
+
+    let restored = driver::Config { data_dir: dir.path().join("restored"), ..cluster.configs[0].clone() };
+    let (index, _) = driver::restore(&backup, &restored).unwrap();
+    assert!(index >= asked, "the newest snapshot, {index}, is at least the one asked for, {asked}");
+    let again = driver::restore(&backup, &restored).unwrap_err();
+    assert_eq!(again.kind(), io::ErrorKind::AlreadyExists, "a data directory is never overwritten");
+    cluster.configs[0] = restored;
+    cluster.start(0);
+
+    // The client saw 150 applied, the restored cluster has at most 100 of them: it can't go on.
+    let closed = tokio::time::timeout(Duration::from_secs(20), client.recv()).await.unwrap();
+    let Some(Event::Closed { reason: CloseReason::Diverged, unapplied }) = closed else { panic!("{closed:?}") };
+    assert!((50..=150).contains(&unapplied), "{unapplied} the restored cluster never applied");
+    let restored = vec![cluster.configs[0].client_listen.to_string()];
+    let mut client = ClusterClient::connect(restored, SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 100).await;
+
+    // The old cluster's other two come back, a majority of its three, and elect a leader of their
+    // own; the restored one, of another epoch, goes on as it was, and grows.
+    for i in 1..3 {
+        cluster.start(i);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    exchange(&mut cluster, &mut client, 101, 150).await;
+    assert_eq!(admin(0).status().await.unwrap().members.len(), 1, "it alone");
+    cluster.start(3);
+    admin(0).add_member(&member(&cluster.addrs, NodeId(4))).await.unwrap();
+    exchange(&mut cluster, &mut client, 151, 200).await;
+    assert_eq!(admin(0).status().await.unwrap().members.len(), 2);
 }
 
 /// A CA's certificate and key, and a certificate it signs for `127.0.0.1`, under `dir`, as PEM:

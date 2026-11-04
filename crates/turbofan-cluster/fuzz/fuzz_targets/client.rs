@@ -134,6 +134,7 @@ fuzz_target!(|steps: Vec<Step>| {
         session_timeout: Duration::from_millis(1000),
         // Small, so snapshots and a full egress ring are within reach.
         snapshot_every_entries: 16,
+        snapshots_kept: 1,
         egress_ring_entries: 4,
         protocol: node::PROTOCOL,
     };

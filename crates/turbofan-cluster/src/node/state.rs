@@ -126,6 +126,32 @@ pub(super) fn decode_state(from: &mut dyn Read) -> io::Result<State> {
     Ok(state)
 }
 
+/// The `NodeState` that starts a snapshot's bytes, read from `from`, written again with
+/// `epoch`: for a cluster restored from the snapshot, which mustn't be taken for the one it was
+/// taken from. `from` is left after it, at the rest of the state, which is the same.
+///
+/// # Errors
+///
+/// If reading fails, or what's read isn't a `NodeState`.
+pub(crate) fn with_epoch(from: &mut dyn Read, epoch: u64) -> io::Result<Vec<u8>> {
+    let frame = read_message(from)?;
+    let wire::Decoded::NodeState(n) = decoded(&frame)? else { return Err(bad("no NodeState")) };
+    let node = wire::NodeState {
+        applied: n.applied(),
+        time: n.time(),
+        next_proposal: n.next_proposal(),
+        sessions: n.sessions(),
+        timers: n.timers(),
+        proposals: n.proposals(),
+        protocol: n.protocol(),
+        service_version: n.service_version(),
+        epoch,
+    };
+    let mut out = Vec::new();
+    codec::encode_frame(&node, &mut out).expect("a NodeState is within its limits");
+    Ok(out)
+}
+
 /// The next framed message of a snapshot, read no further.
 fn read_message(from: &mut dyn Read) -> io::Result<Vec<u8>> {
     let mut len = [0; 4];

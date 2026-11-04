@@ -39,6 +39,13 @@
 //! one member of a new cluster, of a new epoch, from its log as it is: fence the old cluster first.
 //! Its nodes can't talk to the new one, which grows with `add-member`.
 //!
+//! A snapshot is a backup: `snapshot --admin <addr>` takes one, which the node writes to
+//! `<data>/snapshots/`, whole and checked, and the newest there is a file to copy off the node.
+//! `serve --keep-snapshots <n>` keeps the newest `n` (1 by default). With the cluster lost,
+//! `restore --from <file>`, with `serve`'s flags, makes a data directory of it for this node,
+//! then `serve` runs it as the one member of a new cluster, of a new epoch, which grows with
+//! `add-member`. What was applied after the snapshot is lost.
+//!
 //! The log isn't synced to disk: the other nodes' copies are the redundancy, and a crashed
 //! process loses nothing, but a majority losing power together may lose committed entries.
 //! `serve --fsync` syncs it once a batch, before acknowledging it.
@@ -83,8 +90,9 @@ const WAIT_POLL: Duration = Duration::from_secs(2);
 
 const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
-        [--join | --learners <n,...>]
+        [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
         [--tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca <pem>]
+  restore --from <snapshot file>, then serve's flags: a new cluster of one, this node
   snapshot --admin <addr>
   add-member --admin <addr> --member <n>=<peer addr>,<client addr>,<admin addr> [--learner]
         [--wait <entries>]
@@ -114,6 +122,7 @@ pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
             }
             runtime()?.block_on(serve(config, service)).map_err(|e| format!("node stopped: {e}"))
         }),
+        Some("restore") => restore(&args[1..], service_id),
         Some(command) if COMMANDS.contains(&command) => operate(command, &args[1..], service_id),
         _ => Err(USAGE.to_owned()),
     };
@@ -124,6 +133,19 @@ pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `restore`: a data directory for `serve`, with the same flags, from a snapshot file.
+fn restore(args: &[String], service_id: u32) -> Result<(), String> {
+    let config = serve_config(args, service_id)?;
+    let (index, epoch) =
+        driver::restore(flag(args, "--from")?.as_ref(), &config).map_err(|e| format!("restore: {e}"))?;
+    println!(
+        "restored the snapshot of index {index} into {}: serve it with the same flags, as a new cluster \
+         of epoch {epoch}, then add-member the others",
+        config.data_dir.display()
+    );
+    Ok(())
 }
 
 /// An operator's `command`, one of [`COMMANDS`], through the admin listener `--admin` names.
@@ -267,6 +289,10 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
             .collect()
     };
     let mut node = node::Config::new(id, members);
+    if args.iter().any(|a| a == "--keep-snapshots") {
+        let kept = flag(args, "--keep-snapshots")?.parse().ok().filter(|&n| n > 0);
+        node.snapshots_kept = kept.ok_or("--keep-snapshots: a number from 1")?;
+    }
     node.raft.seed ^= nanos(std::time::UNIX_EPOCH.elapsed().unwrap_or_default());
     Ok(driver::Config {
         node,
