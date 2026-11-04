@@ -62,17 +62,20 @@ on it.
 
 ## Replacing a node
 
-A node whose disk is lost, or damaged anywhere but its last record, is replaced, not repaired:
+A node whose disk is lost, or that finds damage as it runs (reading back a record or a snapshot
+for a follower), is replaced, not repaired:
 remove it, then add a new one with an empty data directory. In a three-node cluster, that leaves
 two voters for a while, and no room for another failure: add first, then remove, if the cluster
 has room for one more member.
 
 ## A log in doubt
 
-A node that finds a damaged record at the end of its log, after a crash, drops it: it's a write
-that power cut off partway, never acknowledged. But bit rot in the last record looks the same,
-and that record may have been acknowledged. So the node doubts its log, durably (a `doubt` file
-in its `log/` directory), and its votes say so, until a leader has caught it up. While any voter
+A node that finds a damaged record in its log as it starts drops it, and everything after it:
+it's a write that power cut off partway, never acknowledged. (A batch is one write, and the disk
+may keep a later page of it and lose an earlier, so whole records can follow the damage; and
+unsynced, a segment may lose its tail and the next one keep its records.) But bit rot looks the
+same, and what's dropped may have been acknowledged. So the node doubts its log, durably (a
+`doubt` file in its `log/` directory), and its votes say so, until a leader has caught it up. While any voter
 doubts, an election needs a vote more than a majority for each voter in doubt, so that the voters
 still include one that holds whatever was committed. The `turbofan_in_doubt` metric is 1 while a
 node doubts.

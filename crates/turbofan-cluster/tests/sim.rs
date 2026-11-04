@@ -9,11 +9,12 @@
 //! the next record torn), then restarting from what's on disk; nodes persisting as the driver
 //! does, batches taken while one is written queued behind it and written together, and inputs
 //! handled meanwhile; slow disks, what waits for a write late; and log records and snapshot files
-//! rotting on disk. A node that finds its disk damaged stops, as the driver does, and is replaced:
-//! removed from the members, wiped, and started again to join, as an operator would. A rotten last
-//! record is dropped on restart, as a torn write is, and the node doubts its log; if that leaves
-//! no leader to replace a broken member with, the operator ends the doubt of nodes that only lost
-//! power.
+//! rotting on disk; a crash tearing a record with the rest of its append whole after it, as a disk
+//! keeping a later page and losing an earlier does. A node that finds its disk damaged as it runs
+//! stops, as the driver does, and is replaced: removed from the members, wiped, and started again
+//! to join, as an operator would. On restart, a log is cut at a rotten or torn record, as the log
+//! does, and the node doubts it; if that leaves no leader to replace a broken member with, the
+//! operator ends the doubt of nodes that only lost power.
 //!
 //! Each node's log, meta and snapshots are real files, as the driver writes them, the log in small
 //! segments so they roll and compact. Nodes snapshot every few hundred entries and when an operator
@@ -46,7 +47,7 @@
 //! timer fire once, and every message the service proposed applied once.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::{self, Read};
 use std::time::Duration;
 
@@ -112,8 +113,9 @@ fn simulate() {
         assert!(covered.activations > 0, "a new version was never activated");
         assert!(covered.shutdowns > 0, "the cluster was never shut down");
         assert!(covered.torn > 0, "no crash tore an append");
+        assert!(covered.torn_mid_batch > 0, "no crash tore an append with records whole after the tear");
+        assert!(covered.rot_cut > 0, "no rotten record was cut from a log with records after it");
         assert!(covered.torn_resets > 0, "no crash interrupted a snapshot replacing the log");
-        assert!(covered.rotten_records_found > 0, "no rotten record was found");
         assert!(covered.segments_compacted > 0, "no log segment was compacted");
         assert!(covered.promotions > 0, "a lost cluster was never recovered by promotion");
         assert!(covered.restores > 0, "a lost cluster was never restored from a snapshot");
@@ -137,11 +139,13 @@ struct Coverage {
     shutdowns: u64,
     /// Appends a crash tore, the log's tail left partway through a record.
     torn: u64,
+    /// Of them, those with whole records after the torn one.
+    torn_mid_batch: u64,
+    /// Logs cut at a rotten record on restart, with records after it.
+    rot_cut: u64,
     /// Crashes installing a leader's snapshot in place of the log, before or partway through
     /// the reset.
     torn_resets: u64,
-    /// Nodes that stopped on finding a rotten record.
-    rotten_records_found: u64,
     /// Times a log's first segment was removed.
     segments_compacted: u64,
     /// Lost clusters recovered by promoting a learner, and by restoring a snapshot.
@@ -166,8 +170,9 @@ impl Coverage {
         self.activations += other.activations;
         self.shutdowns += other.shutdowns;
         self.torn += other.torn;
+        self.torn_mid_batch += other.torn_mid_batch;
+        self.rot_cut += other.rot_cut;
         self.torn_resets += other.torn_resets;
-        self.rotten_records_found += other.rotten_records_found;
         self.segments_compacted += other.segments_compacted;
         self.promotions += other.promotions;
         self.restores += other.restores;
@@ -445,21 +450,23 @@ impl Disk {
     }
 
     /// Opens the log and meta, as a restarted node does, closing them first if a crash left them
-    /// open. Returns the log's records, or the error that stops the node: damage.
-    fn open(&mut self, window: usize) -> io::Result<Entries> {
+    /// open. Returns the log's records, and whether it cut away whole records after a rotten one;
+    /// or the error that stops the node: damage.
+    fn open(&mut self, window: usize) -> io::Result<(Entries, bool)> {
         self.files = None;
         let (mut entries, mut recovered) = (Entries::default(), Vec::new());
         let log = Log::open_simulated(&self.dir.path().join("log"), self.segment_bytes, |record| {
             entries.recover(record, window);
             record.encode_into(&mut recovered);
         })?;
-        // Damage to the last record looks like a torn write, and is dropped with nothing said.
-        if self.rotten_record.is_some_and(|r| r + 1 == self.first + self.log.len() as u64) {
-            self.log.pop();
-            self.rotten_record = None;
+        // Damage looks like a torn write: the log is cut there, with nothing said, and doubted.
+        let mut cut = false;
+        if let Some(rotten) = self.rotten_record.take() {
+            let at = usize::try_from(rotten - self.first).unwrap();
+            cut = at + 1 < self.log.len();
+            self.log.truncate(at);
             self.rot_doubt = true;
         }
-        assert!(self.rotten_record.is_none(), "a rotten record is found");
         assert!(recovered == self.log.concat(), "the log recovers what was written");
         assert_eq!(log.next_index(), self.first + self.log.len() as u64);
         // As the driver does: a log that ends before the snapshot, or disagrees with it, goes on
@@ -472,7 +479,7 @@ impl Disk {
         let (meta_file, meta) = MetaFile::open_simulated(&self.dir.path().join("meta"))?;
         assert_eq!(meta, self.meta, "the meta recovers what was written");
         self.files = Some((log, meta_file));
-        Ok(entries)
+        Ok((entries, cut))
     }
 
     fn apply(&mut self, op: &Persist) -> io::Result<()> {
@@ -554,18 +561,28 @@ impl Disk {
     }
 
     /// Power lost partway through appending `records`: the first `whole` reach the disk, and
-    /// some of the next one's bytes after them.
-    fn tear(&mut self, records: &[Record<'_>], whole: usize, rng: &mut Rng) {
+    /// some of the next one's bytes after them; or, now and then, the disk keeping later pages
+    /// and losing an earlier, the next one's with the rest of it garbage (every byte changed:
+    /// zeros could match its own), and the ones after it whole. Returns whether it was that.
+    fn tear(&mut self, records: &[Record<'_>], whole: usize, rng: &mut Rng) -> bool {
         let (log, _) = self.files.as_mut().expect("open while its node runs");
         let bytes: Vec<u8> = records[..whole].iter().copied().flat_map(encode).collect();
         log.append(&bytes).unwrap();
         self.log.extend(records[..whole].iter().copied().map(encode));
         self.files = None;
-        let torn = encode(records[whole]);
+        let mut torn = encode(records[whole]);
         let cut = 1 + usize::try_from(rng.below(torn.len() as u64 - 1)).unwrap();
+        let later = whole + 1 < records.len() && rng.one_in(3);
+        if later {
+            torn[cut..].iter_mut().for_each(|b| *b ^= 0xa5);
+            torn.extend(records[whole + 1..].iter().copied().flat_map(encode));
+        } else {
+            torn.truncate(cut);
+        }
         let (_, path) = self.segments().pop().unwrap();
         let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-        std::io::Write::write_all(&mut file, &torn[..cut]).unwrap();
+        std::io::Write::write_all(&mut file, &torn).unwrap();
+        later
     }
 
     /// The log's segment files, by their first index, oldest first.
@@ -714,6 +731,8 @@ struct SimClient {
     responses: u64,
     timers: BTreeSet<u64>,
     proposals: BTreeSet<u64>,
+    /// What the node had of the session as it sent the last `Opened` the client read.
+    opened_with: (u64, u64),
 }
 
 /// A client connection: in order each way, like TCP.
@@ -723,6 +742,9 @@ struct Conn {
     up: bool,
     to_node_at: u64,
     to_client_at: u64,
+    /// What the node had of the session as it sent each `Opened` still on its way: the last
+    /// message applied, and the responses. It may apply more before the client reads it.
+    opened: VecDeque<(u64, u64)>,
 }
 
 struct Sim {
@@ -816,6 +838,7 @@ fn new_client(c: usize, again: bool) -> SimClient {
         responses: 0,
         timers: BTreeSet::new(),
         proposals: BTreeSet::new(),
+        opened_with: (0, 0),
     }
 }
 
@@ -1075,7 +1098,10 @@ impl Sim {
         };
         let conn = self.next_conn;
         self.next_conn += 1;
-        self.conns.insert(conn, Conn { client: ADMIN, node: id, up: true, to_node_at: 0, to_client_at: 0 });
+        self.conns.insert(
+            conn,
+            Conn { client: ADMIN, node: id, up: true, to_node_at: 0, to_client_at: 0, opened: VecDeque::new() },
+        );
         self.admin_frames.insert(conn, frame.clone());
         let node = self.nodes.get_mut(&id).unwrap().node.as_mut().unwrap();
         node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, self.now);
@@ -1135,6 +1161,15 @@ impl Sim {
             self.send_peer(id, to, frame);
         }
         for (conn, frame) in taken.client_sends {
+            if let turbofan_cluster::wire::Decoded::Opened(m) = codec::decode_frame(&frame).unwrap().unwrap().0 {
+                let service = self.nodes[&id].node.as_ref().unwrap().service();
+                let session = SessionId(m.session());
+                let had = (
+                    service.last.get(&session).copied().unwrap_or(0),
+                    service.responses.get(&session).copied().unwrap_or(0),
+                );
+                self.conns.get_mut(&conn).unwrap().opened.push_back(had);
+            }
             self.send_conn(conn, frame, false);
         }
         // A snapshot from the leader that replaced the log: what it covers is checked by its
@@ -1388,7 +1423,12 @@ impl Sim {
             }
             return;
         }
-        self.clients[c].client.on_frame(&codec::decode_frame(frame).unwrap().unwrap().0);
+        let message = codec::decode_frame(frame).unwrap().unwrap().0;
+        if matches!(message, turbofan_cluster::wire::Decoded::Opened(_)) {
+            self.clients[c].opened_with =
+                self.conns.get_mut(&conn).unwrap().opened.pop_front().expect("recorded as sent");
+        }
+        self.clients[c].client.on_frame(&message);
         self.flush_client(c);
     }
 
@@ -1402,7 +1442,10 @@ impl Sim {
         }
         let conn = self.next_conn;
         self.next_conn += 1;
-        self.conns.insert(conn, Conn { client: c, node: target, up: true, to_node_at: 0, to_client_at: 0 });
+        self.conns.insert(
+            conn,
+            Conn { client: c, node: target, up: true, to_node_at: 0, to_client_at: 0, opened: VecDeque::new() },
+        );
         self.clients[c].conn = Some(conn);
         self.clients[c].client.on_connected(self.now);
         self.flush_client(c);
@@ -1522,25 +1565,15 @@ impl Sim {
         }
     }
 
-    /// What the cluster client `c` is connected to has of its session: the last message applied,
-    /// and the responses sent.
-    fn session_on_cluster(&self, c: usize) -> (u64, u64) {
-        let conn = self.clients[c].conn.expect("told on its connection");
-        let node = self.nodes[&self.conns[&conn].node].node.as_ref().expect("up: it told the client");
-        let session = self.clients[c].client.session().expect("it has one");
-        let service = node.service();
-        (service.last.get(&session).copied().unwrap_or(0), service.responses.get(&session).copied().unwrap_or(0))
-    }
-
-    /// A client's session opened again on the recovered cluster: it has all the client saw of it,
-    /// messages applied and responses, or the client should have closed it as diverged. (Before,
-    /// the node may since have crashed, or restarted behind what it said.)
+    /// A client's session opened again on the recovered cluster: it had all the client saw of it,
+    /// messages applied and responses, as it sent the `Opened`, or the client should have closed
+    /// it as diverged. (Before, the node may since have crashed, or restarted behind what it said.)
     fn carried_on(&mut self, c: usize) {
         if !self.disaster.as_ref().is_some_and(|d| d.recovered) {
             return;
         }
-        let (applied, responses) = self.session_on_cluster(c);
         let (seed, client) = (self.seed, &self.clients[c]);
+        let (applied, responses) = client.opened_with;
         assert!(
             applied >= client.client.applied() && responses >= client.responses,
             "seed {seed}: client {c} carried on, having seen {} applied and {} responses, the cluster {applied} and {responses}",
@@ -1550,12 +1583,12 @@ impl Sim {
     }
 
     /// A client closed its session on the recovered cluster as `Diverged`: only if that cluster
-    /// lacks some of what it saw, and counting what it never applied. A gateway then opens another.
+    /// lacked some of what it saw as it sent the `Opened`, and counting what it never applied. A gateway then opens another.
     fn diverged(&mut self, c: usize, unapplied: usize) {
         let seed = self.seed;
         assert!(self.disaster.as_ref().is_some_and(|d| d.recovered), "seed {seed}: client {c} diverged");
         let conn = self.clients[c].conn.expect("told on its connection");
-        let (had, responses) = self.session_on_cluster(c);
+        let (had, responses) = self.clients[c].opened_with;
         let (sent, seen) = (self.clients[c].sent, self.clients[c].responses);
         // The client's own idea of what's applied is what it had: it let go of no more since.
         let applied = self.clients[c].client.applied();
@@ -1714,7 +1747,6 @@ impl Sim {
         sim_node.node = None;
         sim_node.incarnation += 1;
         if !sim_node.broken {
-            self.covered.rotten_records_found += u64::from(sim_node.disk.rotten_record.is_some());
             (sim_node.broken, sim_node.broken_at) = (true, self.now);
             self.broken += 1;
             self.schedule(200 * MS, Event::Replace(id));
@@ -1821,7 +1853,7 @@ impl Sim {
             Persist::Append(records) => {
                 let all: Vec<Record<'_>> = codec::records(records).map(Result::unwrap).collect();
                 let some = usize::try_from(self.rng.below(all.len() as u64)).unwrap();
-                disk.tear(&all, some, &mut self.rng);
+                self.covered.torn_mid_batch += u64::from(disk.tear(&all, some, &mut self.rng));
                 self.covered.torn += 1;
             }
             Persist::InstallSnapshot { snapshot, replace_log: true } => {
@@ -1853,7 +1885,10 @@ impl Sim {
         config.protocol = u32::from(sim_node.upgraded);
         // Its log or snapshot is damaged: it refuses to start.
         let log = match sim_node.disk.open(self.window) {
-            Ok(log) => log,
+            Ok((log, cut)) => {
+                self.covered.rot_cut += u64::from(cut);
+                log
+            }
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 self.break_disk(id);
                 return;
@@ -2032,7 +2067,10 @@ impl Sim {
             self.covered.promotions += 1;
             let conn = self.next_conn;
             self.next_conn += 1;
-            self.conns.insert(conn, Conn { client: ADMIN, node: id, up: true, to_node_at: 0, to_client_at: 0 });
+            self.conns.insert(
+                conn,
+                Conn { client: ADMIN, node: id, up: true, to_node_at: 0, to_client_at: 0, opened: VecDeque::new() },
+            );
             let mut frame = Vec::new();
             codec::encode_frame(&turbofan_cluster::wire::Promote { request_id: self.rng.next() }, &mut frame).unwrap();
             let node = self.nodes.get_mut(&id).unwrap().node.as_mut().unwrap();
@@ -2149,7 +2187,7 @@ impl Sim {
         }
         let sent: u64 = self.clients.iter().map(|c| c.sent).sum();
         eprintln!(
-            "seed {seed}: members {members:?} after {} changes from {}, {} handovers, {} terms, {} crashes, {commit} committed, {sent} messages, {} snapshots, {} installed, {}/{} manual, {} reads (window {}, chunk {}), {} stalls, {} rots, {} broken ({} by a record), {} torn, {} overridden, {} segments compacted (of {} bytes)",
+            "seed {seed}: members {members:?} after {} changes from {}, {} handovers, {} terms, {} crashes, {commit} committed, {sent} messages, {} snapshots, {} installed, {}/{} manual, {} reads (window {}, chunk {}), {} stalls, {} rots, {} broken, {} cut at rot, {} torn ({} mid-batch), {} overridden, {} segments compacted (of {} bytes)",
             self.member_changes,
             self.initial,
             self.transfers,
@@ -2165,8 +2203,9 @@ impl Sim {
             self.stalls,
             self.rots,
             self.broken,
-            self.covered.rotten_records_found,
+            self.covered.rot_cut,
             self.covered.torn,
+            self.covered.torn_mid_batch,
             self.overrides,
             self.covered.segments_compacted,
             self.segment_bytes

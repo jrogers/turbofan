@@ -213,7 +213,7 @@ session lasts:
 
 | What | Where | How it survives a crash |
 |---|---|---|
-| The log | `log.rs` | Records in segment files named by their first index, not synced by default (`Fsync::Never`): a crashed process loses nothing, and the other nodes' copies cover a machine lost; a majority losing power together may lose committed entries. It's still synced behind the writes, every 4 MiB, on a thread nothing waits for: else the OS lets unwritten data pile up, then stalls every write for seconds while it writes it out. `Fsync::EachBatch` (`serve --fsync`) syncs once a batch. On open, a torn last record is truncated; damage anywhere else stops the node, to be replaced. |
+| The log | `log.rs` | Records in segment files named by their first index, not synced by default (`Fsync::Never`): a crashed process loses nothing, and the other nodes' copies cover a machine lost; a majority losing power together may lose committed entries. It's still synced behind the writes, every 4 MiB, on a thread nothing waits for: else the OS lets unwritten data pile up, then stalls every write for seconds while it writes it out. `Fsync::EachBatch` (`serve --fsync`) syncs once a batch. On open, the log is truncated at its first damaged record (a torn write, or rot: they look the same), or a gap between segments, and doubted. Damage found as the node runs stops it, to be replaced. |
 | Term and vote | `meta.rs` | Two fixed slots, written alternately and synced, each with a generation and a checksum: a torn write leaves the other whole. |
 | Snapshots | `snapshot.rs` | Written to a temporary file, synced, renamed, then the directory synced: the old one or the new one, whole. A checksum covers the bytes and the members. |
 
@@ -221,10 +221,10 @@ The node keeps every entry's term in memory, and the records of the entries not 
 a window of the latest applied (`log_window_bytes`). A follower further behind gets records read
 back from disk, or the latest snapshot, in chunks.
 
-**Doubt.** Bit rot in the last record looks like a torn write, so the record dropped may have been
+**Doubt.** Bit rot looks like a torn write, so the records dropped from the damage on may have been
 acknowledged. The node then doubts its log, durably (a `doubt` file), and its votes say so. An
 election needs one vote more than a majority for each voter in doubt, so the voters still include
-one that holds any committed entry. The doubt ends once the node holds an entry or snapshot of a
+one that holds any committed entry, however much this one dropped. The doubt ends once the node holds an entry or snapshot of a
 later term, or the whole log of the leader it follows.
 
 ## Changing a running cluster

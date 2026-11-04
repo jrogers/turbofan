@@ -3,14 +3,16 @@
 //! Appends are written straight away and, with [`Fsync::EachBatch`], made durable by [`Log::sync`],
 //! which the driver calls once per batch (group commit). By default ([`Fsync::Never`]) the log
 //! isn't synced: a crashed process loses nothing, but a machine losing power may lose what it
-//! acknowledged, and the copies on the other nodes are what keep it. On open, the last segment's tail is scanned and a torn record
-//! (power lost mid-write) truncated: damage with nothing whole after it. Damage anywhere else is an
-//! error, since those records were synced and may be committed and acknowledged: a node with it
-//! refuses to start, to be replaced, rather than lose them.
+//! acknowledged, and the copies on the other nodes are what keep it.
 //!
-//! A torn tail and bit rot in the last record look the same, so a truncated tail may have been
-//! synced and acknowledged. The log is then [in doubt](Log::in_doubt), durably, until Raft has
-//! caught it up ([`Log::trust`]): a `doubt` file, written before the tail is truncated.
+//! On open, the log is truncated at its first damaged record, and at a gap between segments: the
+//! records after it, and the segments, go. A power cut mid-write leaves that: a torn last record;
+//! or, the disk keeping a later page of a batch and losing an earlier one, a torn record with
+//! whole ones after it; or, unsynced, a segment's tail lost and the next one kept. Bit rot looks
+//! the same, so what's truncated may have been synced and acknowledged. The log is then [in
+//! doubt](Log::in_doubt), durably, until Raft has caught it up ([`Log::trust`]): a `doubt` file,
+//! written before anything is truncated. However much was dropped, the doubt keeps elections
+//! safe, and the node catches up from the others rather than refusing to start.
 //!
 //! [`Log::read`] reads records back, for a follower that's behind what the node keeps in memory,
 //! and checks them: damage is an error there too, never served.
@@ -76,8 +78,7 @@ impl Log {
     ///
     /// # Errors
     ///
-    /// If the directory is locked by another process, can't be read, or holds damaged records
-    /// before the last segment's tail.
+    /// If the directory is locked by another process, or can't be read or truncated.
     pub fn open(dir: &Path, fsync: Fsync, each: impl FnMut(Record<'_>)) -> io::Result<Self> {
         let mut log = Self::open_with(dir, MAX_SEGMENT_BYTES, fsync == Fsync::EachBatch, each)?;
         if fsync == Fsync::Never {
@@ -114,36 +115,31 @@ impl Log {
         }
         let mut bytes = Vec::new();
         let mut next_index = segments[0];
-        let last = segments.len() - 1;
-        let mut file_len = 0;
-        let mut doubt = dir.join("doubt").exists();
+        let (mut file_len, mut damaged, mut kept) = (0, false, segments.len());
         for (i, &first) in segments.iter().enumerate() {
+            // A gap: the segment before lost its tail, and this one and the rest go.
             if first != next_index {
-                return Err(invalid(format!("segment {first} doesn't follow index {}", next_index - 1)));
+                (damaged, kept) = (true, i);
+                break;
             }
             bytes.clear();
             File::open(segment_path(dir, first))?.read_to_end(&mut bytes)?;
-            let valid = match scan(&bytes, &mut next_index) {
-                Ok(len) => len,
-                // A torn write leaves nothing whole after it; synced records damaged do.
-                Err(len) if i == last && !whole_record_in(&bytes[len..]) => len,
-                Err(_) => return Err(invalid(format!("damaged record in segment {first}"))),
-            };
+            let valid = scan(&bytes, &mut next_index);
             for record in crate::codec::records(&bytes[..valid]) {
                 each(record.expect("scanned"));
             }
             file_len = crate::widen(valid);
-            if valid < bytes.len() && !doubt {
-                // Durably, before the tail goes.
-                File::create(dir.join("doubt"))?;
-                if sync {
-                    sync_dir(dir)?;
-                }
-                doubt = true;
+            if valid < bytes.len() {
+                (damaged, kept) = (true, i + 1);
+                break;
             }
         }
-        let file = OpenOptions::new().write(true).open(segment_path(dir, segments[last]))?;
-        // Drops a torn tail; a no-op otherwise.
+        let doubt = dir.join("doubt").exists() || damaged;
+        if damaged {
+            cut_segments(dir, &mut segments, kept, sync)?;
+        }
+        let file = OpenOptions::new().write(true).open(segment_path(dir, segments[kept - 1]))?;
+        // Drops what follows the damage; a no-op otherwise.
         file.set_len(file_len)?;
         if sync {
             file.sync_all()?;
@@ -440,9 +436,28 @@ impl Log {
     }
 }
 
-/// How many bytes of `bytes` are whole, valid records continuing from `next_index`: `Err` if
-/// they stop before the end.
-fn scan(bytes: &[u8], next_index: &mut u64) -> Result<usize, usize> {
+/// Doubts the log in `dir`, durably, then removes its `segments` from the `kept`th on: newest
+/// first, so a crash partway leaves a prefix of the log, which opens the same.
+fn cut_segments(dir: &Path, segments: &mut Vec<u64>, kept: usize, sync: bool) -> io::Result<()> {
+    if !dir.join("doubt").exists() {
+        File::create(dir.join("doubt"))?;
+    }
+    if sync {
+        sync_dir(dir)?;
+    }
+    for &first in segments[kept..].iter().rev() {
+        fs::remove_file(segment_path(dir, first))?;
+    }
+    segments.truncate(kept);
+    if sync {
+        sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// How many bytes of `bytes`, from the start, are whole, valid records continuing from
+/// `next_index`: fewer than all of them if damage stops them.
+fn scan(bytes: &[u8], next_index: &mut u64) -> usize {
     let mut at = 0;
     while at < bytes.len() {
         match Record::decode(&bytes[at..]) {
@@ -450,17 +465,11 @@ fn scan(bytes: &[u8], next_index: &mut u64) -> Result<usize, usize> {
                 at += len;
                 *next_index += 1;
             }
-            Ok(_) | Err(CodecError::Checksum | CodecError::Short | CodecError::TooLong { .. }) => return Err(at),
+            Ok(_) | Err(CodecError::Checksum | CodecError::Short | CodecError::TooLong { .. }) => break,
             Err(_) => unreachable!("Record::decode returns only record errors"),
         }
     }
-    Ok(at)
-}
-
-/// Whether a whole record starts anywhere in `bytes`: after damage, the sign it's corruption of
-/// what was synced, not a torn write.
-fn whole_record_in(bytes: &[u8]) -> bool {
-    (1..bytes.len()).any(|at| matches!(Record::decode(&bytes[at..]), Ok(Some(_))))
+    at
 }
 
 fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
@@ -683,15 +692,19 @@ mod tests {
         assert!(!log.in_doubt());
     }
 
-    /// Synced records damaged in the last segment, with whole ones after them, aren't taken for a
-    /// torn write and truncated: the node refuses to start, and doesn't lose them.
+    /// A power cut mid-batch that kept a later page and lost an earlier: a damaged record with
+    /// whole ones after it. The log is truncated at the damage, in doubt, and goes on from there.
     #[test]
-    fn damage_with_records_after_it_is_an_error() {
+    fn damage_with_records_after_it_is_truncated() {
         let dir = tempfile::tempdir().unwrap();
         let mut records = test_records(1, 3);
         records[RECORD_HEADER + 2] ^= 1;
         fs::write(segment_path(dir.path(), 1), records).unwrap();
-        assert_eq!(Log::open(dir.path(), Fsync::EachBatch, |_| {}).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let (mut log, found) = open(dir.path());
+        assert_eq!((found, log.in_doubt()), (vec![], true));
+        log.append(&test_records(1, 1)).unwrap();
+        drop(log);
+        assert_eq!(open(dir.path()).1, [1], "the damage and what followed it gone");
     }
 
     /// What's read back for a follower is checked: damage is an error, not served.
@@ -751,14 +764,29 @@ mod tests {
         assert_eq!(log.truncate_from(3).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
+    /// Damage before the last segment, or a gap between segments (unsynced, a segment's tail lost
+    /// and the next kept): truncated there, the later segments gone, in doubt.
     #[test]
-    fn damage_before_the_last_segment_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut first = test_records(1, 2);
-        first[10] ^= 1;
-        fs::write(segment_path(dir.path(), 1), first).unwrap();
-        fs::write(segment_path(dir.path(), 3), test_records(3, 1)).unwrap();
-        assert_eq!(Log::open(dir.path(), Fsync::EachBatch, |_| {}).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    fn damage_or_a_gap_before_the_last_segment_drops_the_rest() {
+        let damaged = || {
+            let mut first = test_records(1, 2);
+            let second = codec::records(&first).next().unwrap().unwrap().payload.len() + RECORD_HEADER;
+            first[second + 10] ^= 1;
+            first
+        };
+        let lost_tail = || {
+            let first = test_records(1, 2);
+            first[..codec::records(&first).next().unwrap().unwrap().payload.len() + RECORD_HEADER].to_vec()
+        };
+        for first in [damaged(), lost_tail()] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(segment_path(dir.path(), 1), first).unwrap();
+            fs::write(segment_path(dir.path(), 3), test_records(3, 1)).unwrap();
+            fs::write(segment_path(dir.path(), 4), test_records(4, 1)).unwrap();
+            let (log, found) = open(dir.path());
+            assert_eq!((found, log.in_doubt(), log.next_index()), (vec![1], true, 2));
+            assert_eq!(list_segments(dir.path()).unwrap(), [1], "the later segments gone");
+        }
     }
 
     #[test]
