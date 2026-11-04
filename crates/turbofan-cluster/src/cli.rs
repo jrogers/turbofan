@@ -213,12 +213,13 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             println!("member {id} is a {} from index {index}", if learner { "learner" } else { "voter" });
         }
         "activate" => {
-            let version = |name| match optional_flag(args, name)? {
-                Some(v) => v.parse().map_err(|_| format!("{name}: a number")),
-                None => Ok(0),
+            let version = |name| {
+                let value = optional_flag(args, name)?;
+                value.map(|v: String| v.parse::<u32>().map_err(|_| format!("{name}: a number"))).transpose()
             };
             let (protocol, service) = (version("--protocol")?, version("--service")?);
-            let index = runtime()?.block_on(admin.activate(protocol, service)).map_err(failed)?;
+            let (protocol, service, index) =
+                runtime()?.block_on(activate(&admin, protocol, service)).map_err(failed)?;
             println!("protocol {protocol} and service version {service} active from index {index}");
         }
         "shutdown" => {
@@ -244,6 +245,19 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
     Ok(())
 }
 
+/// `activate`: a version left out is the one active, so that naming the other doesn't step it
+/// back. Returns the versions, and the index they're active from.
+async fn activate(admin: &Admin, protocol: Option<u32>, service: Option<u32>) -> Result<(u32, u32, u64), AdminError> {
+    let (protocol, service) = match (protocol, service) {
+        (Some(protocol), Some(service)) => (protocol, service),
+        _ => {
+            let status = admin.status().await?;
+            (protocol.or(status.protocol).unwrap_or(0), service.or(status.service_version).unwrap_or(0))
+        }
+    };
+    Ok((protocol, service, admin.activate(protocol, service).await?))
+}
+
 /// `set-role`'s `--learner` (true) or `--voter` (false): one of them.
 fn learner_flag(args: &[String]) -> Result<bool, String> {
     match (args.iter().any(|a| a == "--voter"), args.iter().any(|a| a == "--learner")) {
@@ -255,6 +269,9 @@ fn learner_flag(args: &[String]) -> Result<bool, String> {
 
 fn print_status(status: &ClusterStatus) {
     println!("leader {}, last index {}, commit index {}", status.leader, status.last_index, status.commit_index);
+    if let (Some(protocol), Some(service)) = (status.protocol, status.service_version) {
+        println!("protocol {protocol}, service version {service}");
+    }
     for m in &status.members {
         let (role, lag) = (if m.learner { "learner" } else { "voter" }, status.lag(m.id).unwrap_or(0));
         println!("member {} {role}: matched {}, {lag} behind", m.id, m.matched);

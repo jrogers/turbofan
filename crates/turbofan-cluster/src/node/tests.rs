@@ -405,6 +405,11 @@ fn versions_activate_once_every_member_has_them() {
     client(&mut node, 7, &wire::Message { session: session.0, client_seq: 1, payload: b"later" }, 0);
     assert!(node.service.0.contains(&"as version 1".to_owned()));
     assert!(activate(&mut node, 0, 0).contains("index: 0"), "not back");
+    let mut frame = Vec::new();
+    codec::encode_frame(&wire::StatusRequest { request_id: 2 }, &mut frame).unwrap();
+    node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 1_000_000_000);
+    let status = drive(&mut node).join(" ");
+    assert!(status.contains("protocol: Some(0), service_version: Some(1)"), "status shows them: {status}");
 
     let bytes = encode_state(&node.state);
     let state = decode_state(&mut &bytes[..]).unwrap();

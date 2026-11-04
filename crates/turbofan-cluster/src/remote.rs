@@ -452,6 +452,8 @@ impl Admin {
                 leader: NodeId(m.leader()),
                 last_index: m.last_index(),
                 commit_index: m.commit_index(),
+                protocol: m.protocol(),
+                service_version: m.service_version(),
                 members: m
                     .member()
                     .map(|m| MemberStatus { id: NodeId(m.id()), learner: m.learner() == 1, matched: m.matched() })
@@ -566,6 +568,7 @@ impl Admin {
 
 /// The cluster as its leader knows it, from [`Admin::status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClusterStatus {
     /// The leader that answered.
     pub leader: NodeId,
@@ -573,6 +576,10 @@ pub struct ClusterStatus {
     pub last_index: u64,
     /// The leader's commit index.
     pub commit_index: u64,
+    /// The protocol active ([`Admin::activate`]), or `None` from a leader older than 0.4.0.
+    pub protocol: Option<u32>,
+    /// The service version active, or `None` from a leader older than 0.4.0.
+    pub service_version: Option<u32>,
     /// Each member, the leader among them.
     pub members: Vec<MemberStatus>,
 }

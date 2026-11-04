@@ -9,10 +9,14 @@ a patch version (0.1.1) doesn't.
 ### Breaking
 
 - `wire::Opened` and `wire::Reattach` have an `epoch`, `wire::RequestVote` and `wire::Vote` a
-  `round`, and `wire::NodeState` an `epoch_since`: code building them sets them.
+  `round`, `wire::NodeState` an `epoch_since`, and `wire::Status` the
+  `protocol` and `service_version` active: code building them sets them. `ClusterStatus` has them
+  too, and is `#[non_exhaustive]`.
 
 ### Changed
 
+- `activate` without `--protocol` or `--service` leaves that version as it is, from the leader's
+  `status`, which shows them now. Before, one left out was 0, refused as a step back once higher.
 - A log is truncated on open at its first damaged record, wherever it is, and at a gap between
   segments, the records and segments after it dropped, and doubted: the node catches up from the
   others. Before, only damage with nothing whole after it was truncated, and any other refused to
@@ -28,7 +32,7 @@ a patch version (0.1.1) doesn't.
   the ring is replicated state: members with different values replayed different responses to a
   client after a failover. Protocol 1 (`node::PROTOCOL`) logs the leader's in each `Activated`
   entry, and every node keeps that many; until `activate --protocol 1`, each its own, as before.
-  Once it's active, name it in every `activate`: the default, 0, is refused as a step back.
+  `activate` leaves a version it isn't given as it is.
 - An operator's request retried after it was made, its answer lost or its leader gone, was
   refused: a member change, say, though the members showed it. A change the members already show,
   committed, is answered `MembersChanged` at the latest change's index, by any leader; a transfer

@@ -293,13 +293,15 @@
     <sbe:message name="StatusRequest" id="74">
         <field name="requestId" id="1" type="uint64"/>
     </sbe:message>
-    <!-- From `leader`: the end of its log, its commit index, and how far each member's log is
-         known durable (`matched`; the leader's own, its last index). -->
+    <!-- From `leader`: the end of its log, its commit index, how far each member's log is known
+         durable (`matched`; the leader's own, its last index), and the versions active. -->
     <sbe:message name="Status" id="75">
         <field name="requestId" id="1" type="uint64"/>
         <field name="leader" id="2" type="uint8"/>
         <field name="lastIndex" id="3" type="uint64"/>
         <field name="commitIndex" id="4" type="uint64"/>
+        <field name="protocol" id="9" type="uint32" sinceVersion="5"/>
+        <field name="serviceVersion" id="10" type="uint32" sinceVersion="5"/>
         <group name="member" id="5" dimensionType="groupSizeEncoding">
             <field name="id" id="6" type="uint8"/>
             <!-- 1: it takes the log but doesn't vote. -->

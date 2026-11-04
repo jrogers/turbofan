@@ -136,7 +136,10 @@ impl<S: Service> Node<S> {
             .map(|&(m, matched)| wire::StatusMember { id: m.id.0, learner: u8::from(m.learner), matched })
             .collect();
         let (leader, last_index, commit_index) = (self.raft.id().0, self.raft.last_index(), self.raft.commit_index());
-        self.send_client(conn, &wire::Status { request_id, leader, last_index, commit_index, member: &member });
+        let (protocol, service_version) = (self.state.protocol, self.state.service_version);
+        let status =
+            wire::Status { request_id, leader, last_index, commit_index, protocol, service_version, member: &member };
+        self.send_client(conn, &status);
     }
 
     /// `AddMember`, `RemoveMember` or `SetRole`.
