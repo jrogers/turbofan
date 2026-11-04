@@ -153,8 +153,11 @@ pub(crate) fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).expect("under 584 years")
 }
 
-/// Timing and identity.
+/// Timing and identity, in [`crate::NodeConfig::raft`], which [`crate::NodeConfig::new`] fills in.
+///
+/// Non-exhaustive, so that a new setting isn't a breaking change: set what differs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// This node.
     pub id: NodeId,

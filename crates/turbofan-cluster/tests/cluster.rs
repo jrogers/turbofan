@@ -87,34 +87,18 @@ impl Cluster {
         let members: Vec<raft::Member> = ids[..3].iter().map(|&id| member(&addrs, id)).collect();
         let configs = ids
             .iter()
-            .map(|&id| driver::Config {
-                node: node::Config {
-                    raft: raft::Config {
-                        id,
-                        members: if id == NodeId(4) { Vec::new() } else { members.clone() },
-                        election_timeout: Duration::from_millis(300),
-                        heartbeat: Duration::from_millis(50),
-                        seed: u64::from(id),
-                        log_window_bytes: 64 << 20,
-                        log_tail_entries: 100_000,
-                        max_uncommitted_bytes: 64 << 20,
-                    },
-                    session_timeout: Duration::from_millis(10_000),
-                    snapshot_every_entries: 50,
-                    snapshots_kept: 1,
-                    egress_ring_entries: 1024,
-                    protocol: node::PROTOCOL,
-                },
-                service_id: SERVICE_ID,
-                data_dir: dir.join(id.to_string()),
-                log_fsync: driver::Fsync::default(),
+            .map(|&id| {
+                let mut node = node::Config::new(id, if id == NodeId(4) { Vec::new() } else { members.clone() });
+                node.snapshot_every_entries = 50;
+                node.egress_ring_entries = 1024;
                 // The first three know nothing of the fourth until it's added.
-                peer_addrs: ids.iter().filter(|&&m| m <= id.max(NodeId(3))).map(|&m| (m, addr(0, m))).collect(),
-                client_listen: addr(4, id),
-                admin_listen: addr(8, id),
-                admin_token: Some(TOKEN.to_vec()),
-                peer_token: Some(PEER_TOKEN.to_vec()),
-                tls: tls.clone(),
+                let peers = ids.iter().filter(|&&m| m <= id.max(NodeId(3))).map(|&m| (m, addr(0, m))).collect();
+                let mut config =
+                    driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(4, id), addr(8, id));
+                config.admin_token = Some(TOKEN.to_vec());
+                config.peer_token = Some(PEER_TOKEN.to_vec());
+                config.tls = tls.clone();
+                config
             })
             .collect();
         let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None] };
@@ -349,7 +333,8 @@ async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
         cluster.kill(i).await;
     }
 
-    let restored = driver::Config { data_dir: dir.path().join("restored"), ..cluster.configs[0].clone() };
+    let mut restored = cluster.configs[0].clone();
+    restored.data_dir = dir.path().join("restored");
     let (index, _) = driver::restore(&backup, &restored).unwrap();
     assert!(index >= asked, "the newest snapshot, {index}, is at least the one asked for, {asked}");
     let again = driver::restore(&backup, &restored).unwrap_err();
@@ -408,12 +393,7 @@ async fn a_cluster_over_tls_takes_only_who_it_should() {
     certify(&certs, "node");
     certify(&certs, "operator");
     let file = |name: &str| certs.join(name);
-    let tls = NodeTls {
-        cert: file("node.pem"),
-        key: file("node.key"),
-        peer_ca: file("node-ca.pem"),
-        admin_ca: file("operator-ca.pem"),
-    };
+    let tls = NodeTls::new(file("node.pem"), file("node.key"), file("node-ca.pem"), file("operator-ca.pem"));
     let mut cluster = Cluster::new(dir.path(), Some(tls));
 
     // A hundred messages committed: the peers took each other's appends.

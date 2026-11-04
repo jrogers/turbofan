@@ -114,30 +114,22 @@ fn drive(node: &mut Node<Checker>) {
 }
 
 fuzz_target!(|steps: Vec<Step>| {
-    let config = node::Config {
-        raft: raft::Config {
-            id: raft::NodeId(1),
-            members: vec![raft::Member {
-                id: raft::NodeId(1),
-                peer: "p1".into(),
-                client: "n1".into(),
-                admin: "a1".into(),
-                learner: false,
-            }],
-            election_timeout: Duration::from_millis(150),
-            heartbeat: Duration::from_millis(50),
-            seed: 1,
-            log_window_bytes: usize::MAX,
-            log_tail_entries: 0,
-            max_uncommitted_bytes: usize::MAX,
-        },
-        session_timeout: Duration::from_millis(1000),
-        // Small, so snapshots and a full egress ring are within reach.
-        snapshot_every_entries: 16,
-        snapshots_kept: 1,
-        egress_ring_entries: 4,
-        protocol: node::PROTOCOL,
+    let me = raft::Member {
+        id: raft::NodeId(1),
+        peer: "p1".into(),
+        client: "n1".into(),
+        admin: "a1".into(),
+        learner: false,
     };
+    let mut config = node::Config::new(raft::NodeId(1), vec![me]);
+    config.raft.election_timeout = Duration::from_millis(150);
+    config.raft.log_window_bytes = usize::MAX;
+    config.raft.log_tail_entries = 0;
+    config.raft.max_uncommitted_bytes = usize::MAX;
+    config.session_timeout = Duration::from_millis(1000);
+    // Small, so snapshots and a full egress ring are within reach.
+    config.snapshot_every_entries = 16;
+    config.egress_ring_entries = 4;
     let mut node = Node::new(config, Checker::default(), Meta::default(), None, raft::Entries::default(), 0);
     let mut now = node.next_deadline();
     node.on_tick(now);

@@ -59,7 +59,11 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where a node keeps its state, and where it listens.
+///
+/// Non-exhaustive, so that a new setting isn't a breaking change: build it with `new`, then set
+/// what differs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// The node's own configuration.
     pub node: node::Config,
@@ -86,6 +90,35 @@ pub struct Config {
     /// TLS on all three listeners and to peers. With none, everything is plain TCP, and every
     /// node of the cluster must agree.
     pub tls: Option<NodeTls>,
+}
+
+impl Config {
+    /// A node of `node`'s configuration, serving cluster `service_id`, with its state in
+    /// `data_dir`, listening for peers on its own of `peer_addrs` (which it dials the others of),
+    /// for clients on `client_listen` and for operators on `admin_listen`. Its log isn't synced,
+    /// and it has no tokens and no TLS: set them after.
+    #[must_use]
+    pub fn new(
+        node: node::Config,
+        service_id: u32,
+        data_dir: impl Into<PathBuf>,
+        peer_addrs: Vec<(NodeId, SocketAddr)>,
+        client_listen: SocketAddr,
+        admin_listen: SocketAddr,
+    ) -> Self {
+        Self {
+            node,
+            service_id,
+            data_dir: data_dir.into(),
+            log_fsync: Fsync::Never,
+            peer_addrs,
+            client_listen,
+            admin_listen,
+            admin_token: None,
+            peer_token: None,
+            tls: None,
+        }
+    }
 }
 
 /// The longest token a hello carries.

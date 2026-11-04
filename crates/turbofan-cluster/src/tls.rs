@@ -27,7 +27,11 @@ use rustls_impl as imp;
 use without as imp;
 
 /// A node's TLS: its own certificate, and the CAs it checks others' against. PEM files.
+///
+/// Non-exhaustive, so that a new setting isn't a breaking change: build it with
+/// [`NodeTls::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NodeTls {
     /// The node's certificate chain, its own first. It's a client's too, to the peers it dials,
     /// so if it has an extended key usage, that must allow both `serverAuth` and `clientAuth`:
@@ -39,6 +43,20 @@ pub struct NodeTls {
     pub peer_ca: PathBuf,
     /// The CA that signed operators' certificates.
     pub admin_ca: PathBuf,
+}
+
+impl NodeTls {
+    /// The node's certificate `cert` and its `key`, the `peer_ca` that signed every node's, and
+    /// the `admin_ca` that signed operators'.
+    #[must_use]
+    pub fn new(
+        cert: impl Into<PathBuf>,
+        key: impl Into<PathBuf>,
+        peer_ca: impl Into<PathBuf>,
+        admin_ca: impl Into<PathBuf>,
+    ) -> Self {
+        Self { cert: cert.into(), key: key.into(), peer_ca: peer_ca.into(), admin_ca: admin_ca.into() }
+    }
 }
 
 /// A client's or operator's TLS: the CA the nodes' certificates are checked against, and for an

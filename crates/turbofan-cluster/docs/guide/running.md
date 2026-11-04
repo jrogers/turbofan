@@ -135,18 +135,12 @@ async fn main() -> io::Result<()> {
     node.session_timeout = Duration::from_secs(30);
     node.snapshot_every_entries = 1_000_000;
     let addr = |s: &str| s.parse().expect("an address");
-    let config = driver::Config {
-        node,
-        service_id: 1,
-        data_dir: "/var/lib/my-service".into(),
-        log_fsync: Fsync::EachBatch,
-        peer_addrs: members.iter().map(|m| (m.id, addr(&m.peer))).collect(),
-        client_listen: addr(&members[0].client),
-        admin_listen: addr(&members[0].admin),
-        admin_token: std::env::var("TURBOFAN_ADMIN_TOKEN").ok().map(String::into_bytes),
-        peer_token: std::env::var("TURBOFAN_PEER_TOKEN").ok().map(String::into_bytes),
-        tls: None,
-    };
+    let peers = members.iter().map(|m| (m.id, addr(&m.peer))).collect();
+    let (client, admin) = (addr(&members[0].client), addr(&members[0].admin));
+    let mut config = driver::Config::new(node, 1, "/var/lib/my-service", peers, client, admin);
+    config.log_fsync = Fsync::EachBatch;
+    config.admin_token = std::env::var("TURBOFAN_ADMIN_TOKEN").ok().map(String::into_bytes);
+    config.peer_token = std::env::var("TURBOFAN_PEER_TOKEN").ok().map(String::into_bytes);
     driver::serve(config, Counter::default()).await
 }
 ```
@@ -185,7 +179,7 @@ my-service serve ... \
     --tls-cert node.pem --tls-key node-key.pem --tls-peer-ca peer-ca.pem --tls-admin-ca admin-ca.pem
 ```
 
-or `driver::Config::tls`, a `tls::NodeTls` of the same four files. Then:
+or `driver::Config::tls`, a `tls::NodeTls::new` of the same four files. Then:
 
 - **Peers** check each other's certificates against the peer CA, both ways. A node's certificate
   is its client certificate too when it dials a peer, so if it has an extended key usage, that

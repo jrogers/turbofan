@@ -128,7 +128,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::time::Duration;
 
 use turbofan_cluster::client::Event;
-use turbofan_cluster::driver::{self, Fsync};
+use turbofan_cluster::driver;
 use turbofan_cluster::{Admin, ClusterClient, Member, NodeConfig, NodeId};
 
 /// This cluster's service ID: a client or node of another service is refused.
@@ -151,18 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         learner: false,
     };
     let data = tempfile::tempdir()?;
-    let config = driver::Config {
-        node: NodeConfig::new(id, vec![member]),
-        service_id: SERVICE_ID,
-        data_dir: data.path().into(),
-        log_fsync: Fsync::Never,
-        peer_addrs: vec![(id, peer)],
-        client_listen: client,
-        admin_listen: admin,
-        admin_token: None,
-        peer_token: None,
-        tls: None,
-    };
+    let node = NodeConfig::new(id, vec![member]);
+    let config = driver::Config::new(node, SERVICE_ID, data.path(), vec![(id, peer)], client, admin);
     let node = tokio::spawn(driver::serve(config, Counter::default()));
 
     // Credentials are for the service to check; Counter takes anyone.

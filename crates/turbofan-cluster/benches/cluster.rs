@@ -239,34 +239,13 @@ fn start(dir: &Path, tls: bool, fsync: driver::Fsync) -> (Vec<String>, Option<Cl
         })
         .collect();
     for id in ids {
-        let config = driver::Config {
-            node: node::Config {
-                raft: raft::Config {
-                    id,
-                    members: members.clone(),
-                    election_timeout: Duration::from_millis(300),
-                    heartbeat: Duration::from_millis(50),
-                    seed: u64::from(id),
-                    log_window_bytes: 64 << 20,
-                    log_tail_entries: 100_000,
-                    max_uncommitted_bytes: 64 << 20,
-                },
-                session_timeout: Duration::from_millis(10_000),
-                snapshot_every_entries: 100_000,
-                snapshots_kept: 1,
-                egress_ring_entries: 1024,
-                protocol: node::PROTOCOL,
-            },
-            service_id: SERVICE_ID,
-            data_dir: dir.join(id.to_string()),
-            log_fsync: fsync,
-            peer_addrs: ids.iter().map(|&m| (m, addr(0, m))).collect(),
-            client_listen: addr(3, id),
-            admin_listen: addr(6, id),
-            admin_token: None,
-            peer_token: None,
-            tls: node_tls.clone(),
-        };
+        let mut node = node::Config::new(id, members.clone());
+        node.egress_ring_entries = 1024;
+        let peers = ids.iter().map(|&m| (m, addr(0, m))).collect();
+        let mut config =
+            driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(3, id), addr(6, id));
+        config.log_fsync = fsync;
+        config.tls = node_tls.clone();
         tokio::spawn(async move { serve(config, Ack).await.unwrap() });
     }
     let client_tls = node_tls.map(|t| ClientTls::load(&t.peer_ca, None).unwrap());
@@ -290,12 +269,7 @@ fn certify(dir: &Path) -> NodeTls {
         dir.join(name)
     };
     let peer_ca = file("ca.pem", ca.pem());
-    NodeTls {
-        cert: file("node.pem", cert.pem()),
-        key: file("node.key", key.serialize_pem()),
-        admin_ca: peer_ca.clone(),
-        peer_ca,
-    }
+    NodeTls::new(file("node.pem", cert.pem()), file("node.key", key.serialize_pem()), peer_ca.clone(), peer_ca)
 }
 
 /// A client with its session open.

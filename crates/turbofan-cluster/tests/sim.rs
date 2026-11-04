@@ -47,7 +47,7 @@ use turbofan_cluster::meta::{Meta, MetaFile};
 use turbofan_cluster::node::{self, ConnId, Node, SaveSnapshot};
 use turbofan_cluster::pipeline::{Batch, Pipeline};
 use turbofan_cluster::raft::{
-    Config, Entries, MAX_MEMBERS, MAX_READ_BYTES, Member, NodeId, Persist, Role, Snapshot, SnapshotRead,
+    Entries, MAX_MEMBERS, MAX_READ_BYTES, Member, NodeId, Persist, Role, Snapshot, SnapshotRead,
 };
 use turbofan_cluster::{Ctx, Service, SessionId, SnapshotWriter, snapshot};
 
@@ -1594,29 +1594,21 @@ impl Sim {
         if sim_node.node.is_some() || sim_node.broken {
             return;
         }
-        let config = node::Config {
-            raft: Config {
-                id,
-                members: if id.0 <= self.initial && !sim_node.wiped {
-                    (1..=self.initial).map(|id| member(NodeId(id))).collect()
-                } else {
-                    Vec::new()
-                },
-                election_timeout: Duration::from_millis(150),
-                heartbeat: Duration::from_millis(50),
-                seed: self.seed ^ (u64::from(id) << 32) ^ sim_node.incarnation,
-                log_window_bytes: self.window,
-                // None, some, or more than a snapshot's interval.
-                log_tail_entries: [0, 50, 1000][usize::try_from(self.seed % 3).unwrap()],
-                max_uncommitted_bytes: 64 << 20,
-            },
-            session_timeout: Duration::from_millis(10_000),
-            snapshot_every_entries: 300,
-            snapshots_kept: 1,
-            // Covers a client's messages in flight, each with its response and some a timer's.
-            egress_ring_entries: 2 * client::MAX_UNACKED,
-            protocol: u32::from(sim_node.upgraded),
+        let members = if id.0 <= self.initial && !sim_node.wiped {
+            (1..=self.initial).map(|id| member(NodeId(id))).collect()
+        } else {
+            Vec::new()
         };
+        let mut config = node::Config::new(id, members);
+        config.raft.election_timeout = Duration::from_millis(150);
+        config.raft.seed = self.seed ^ (u64::from(id) << 32) ^ sim_node.incarnation;
+        config.raft.log_window_bytes = self.window;
+        // None, some, or more than a snapshot's interval.
+        config.raft.log_tail_entries = [0, 50, 1000][usize::try_from(self.seed % 3).unwrap()];
+        config.snapshot_every_entries = 300;
+        // Covers a client's messages in flight, each with its response and some a timer's.
+        config.egress_ring_entries = 2 * client::MAX_UNACKED;
+        config.protocol = u32::from(sim_node.upgraded);
         // Its log or snapshot is damaged: it refuses to start.
         let log = match sim_node.disk.open(self.window) {
             Ok(log) => log,

@@ -78,7 +78,11 @@ impl fmt::Debug for SaveSnapshot {
 }
 
 /// A node's configuration.
+///
+/// Non-exhaustive, so that a new setting isn't a breaking change: build it with `new`, then set
+/// what differs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// Identity and Raft timing.
     pub raft: raft::Config,

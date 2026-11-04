@@ -8,8 +8,10 @@ a patch version (0.1.1) doesn't.
 
 ### Breaking
 
-- `node::Config` has a new field, `snapshots_kept`: one built field by field needs it (`1` keeps
-  what a node did), or `..node::Config::new(..)`.
+- `driver::Config`, `node::Config`, `raft::Config` and `tls::NodeTls` are `#[non_exhaustive]`,
+  so that a new setting is no longer a breaking change. Outside the crate they can't be built
+  field by field, nor with `..`: build them with `driver::Config::new`, `node::Config::new` and
+  `tls::NodeTls::new`, which are new but for `node::Config`'s, then set what differs.
 
 ### Added
 
