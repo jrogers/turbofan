@@ -368,8 +368,8 @@ impl Admin {
 
     /// Adds `member` to the cluster, as a learner if it's [`Member::learner`]: it catches up from
     /// the leader, then joins. Start it first, with `--join`. Returns the index of the change,
-    /// once it's committed; or, if `member` is one already, as it is, of the latest change, so
-    /// that a request retried after it was made isn't refused.
+    /// once it's committed; or, if `member` is one already, as it is, of the latest change (or
+    /// a snapshot since), so that a request retried after it was made isn't refused.
     ///
     /// # Errors
     ///
@@ -386,7 +386,8 @@ impl Admin {
     }
 
     /// Removes member `id` from the cluster. Returns the index of the change, once it's
-    /// committed: stop the node then. If `id` isn't a member, that of the latest change.
+    /// committed: stop the node then. If `id` isn't a member, that of the latest change (or a
+    /// snapshot since).
     ///
     /// # Errors
     ///
@@ -400,7 +401,7 @@ impl Admin {
     /// Makes member `id` a learner, or a voter, in place, rather than removing it and adding it
     /// again, which ships it the whole log. A learner made a voter catches up first: check
     /// [`Admin::status`] that it's close. Returns the index of the change, once it's committed;
-    /// if it has that role already, that of the latest change.
+    /// if it has that role already, that of the latest change (or a snapshot since).
     ///
     /// # Errors
     ///

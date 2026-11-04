@@ -13,10 +13,13 @@ cd "$(dirname "$0")/../crates/turbofan-cluster"
 
 seconds=${1:-60}
 targets=${2:-$(cargo +nightly fuzz list)}
+# The toolchain's host, not the one cargo-fuzz was built for (a prebuilt one may be musl, which
+# the sanitizers can't link).
+host=$(rustc +nightly -vV | sed -n 's/^host: //p')
 failed=
 for target in $targets; do
     echo "== $target (${seconds}s)"
-    cargo +nightly fuzz run "$target" -- -max_total_time="$seconds" || failed="$failed $target"
+    cargo +nightly fuzz run --target "$host" "$target" -- -max_total_time="$seconds" || failed="$failed $target"
 done
 if [ -n "$failed" ]; then
     echo "failed:$failed" >&2

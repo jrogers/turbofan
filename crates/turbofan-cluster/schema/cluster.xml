@@ -233,7 +233,8 @@
         <field name="id" id="2" type="uint8"/>
     </sbe:message>
     <!-- The change is committed, at `index`; or the members were as asked already (a request sent
-         again after it was made), as of the latest change, at `index`. -->
+         again after it was made), as of the latest change, at `index`: or a snapshot since,
+         which keeps no index of it. -->
     <sbe:message name="MembersChanged" id="44">
         <field name="requestId" id="1" type="uint64"/>
         <field name="index" id="2" type="uint64"/>
