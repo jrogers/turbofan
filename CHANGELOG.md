@@ -6,6 +6,9 @@ a patch version (0.1.1) doesn't.
 
 ## 0.4.0 (2026-11-04)
 
+Once every node runs 0.4.0, switch protocol 1 on with `activate --protocol 1` (see the egress ring,
+under Fixed).
+
 ### Breaking
 
 - `wire::Opened` and `wire::Reattach` have an `epoch`, `wire::RequestVote` and `wire::Vote` a
