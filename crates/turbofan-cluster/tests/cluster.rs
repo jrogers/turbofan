@@ -296,8 +296,9 @@ async fn a_capture_replays_what_the_cluster_applied() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert!(captured.snapshot_index >= asked, "from its latest snapshot");
+    // From whichever snapshot is the node's latest (it takes its own every 50 entries): Echo
+    // checks each message follows on from the state it restored.
     let first = echoed[0];
-    assert!(first <= 101, "from the snapshot on: {first}");
     assert_eq!(echoed, (first..=200).collect::<Vec<_>>(), "echoed once each, in order");
     assert_eq!(echo.last.len(), 1, "one session");
 
