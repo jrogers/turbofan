@@ -6,6 +6,11 @@ a patch version (0.1.1) doesn't.
 
 ## Unreleased
 
+### Breaking
+
+- `wire::Opened` and `wire::Reattach` have an `epoch`, `wire::RequestVote` and `wire::Vote` a
+  `round`, and `wire::NodeState` an `epoch_since`: code building them sets them.
+
 ### Fixed
 
 - A client reattaching after a recovery could be given another client's session. A session's
