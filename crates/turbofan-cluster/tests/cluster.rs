@@ -82,7 +82,7 @@ struct Cluster {
 
 impl Cluster {
     /// Three members started, and a fourth that can join.
-    fn new(dir: &Path, tls: Option<NodeTls>) -> Self {
+    fn new(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>) -> Self {
         let addrs = ports(12);
         let ids: Vec<NodeId> = [1, 2, 3, 4].map(NodeId).into();
         let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
@@ -99,7 +99,7 @@ impl Cluster {
                     driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(4, id), addr(8, id));
                 config.admin_token = Some(TOKEN.to_vec());
                 config.peer_token = Some(PEER_TOKEN.to_vec());
-                config.tls = tls.clone();
+                config.tls = tls(id);
                 config
             })
             .collect();
@@ -174,7 +174,7 @@ async fn exchange(cluster: &mut Cluster, client: &mut ClusterClient, from: u64, 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cluster_answers_every_message_once_through_failovers() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::new(dir.path(), None);
+    let mut cluster = Cluster::new(dir.path(), |_| None);
     let mut client =
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
@@ -236,7 +236,7 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_member_joins_and_another_leaves() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::new(dir.path(), None);
+    let mut cluster = Cluster::new(dir.path(), |_| None);
     let mut client =
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
@@ -270,7 +270,7 @@ async fn a_member_joins_and_another_leaves() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_capture_replays_what_the_cluster_applied() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::new(dir.path(), None);
+    let mut cluster = Cluster::new(dir.path(), |_| None);
     let mut client =
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
@@ -317,7 +317,7 @@ async fn a_capture_replays_what_the_cluster_applied() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_promoted_learner_leads_a_cluster_of_its_own() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::new(dir.path(), None);
+    let mut cluster = Cluster::new(dir.path(), |_| None);
     let mut client =
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
@@ -366,7 +366,7 @@ async fn a_promoted_learner_leads_a_cluster_of_its_own() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::new(dir.path(), None);
+    let mut cluster = Cluster::new(dir.path(), |_| None);
     let mut client =
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
@@ -432,18 +432,28 @@ async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
 /// `<name>-ca.pem`, `<name>.pem`, `<name>.key`.
 #[cfg(feature = "tls")]
 fn certify(dir: &Path, name: &str) {
+    certify_named(dir, name, &[(name, &[])]);
+}
+
+/// A CA, `<ca>-ca.pem`, and for each of `certs` a certificate it signs, `<name>.pem` and
+/// `<name>.key`, for `127.0.0.1` and the DNS names given, under `dir`.
+#[cfg(feature = "tls")]
+fn certify_named(dir: &Path, ca_name: &str, certs: &[(&str, &[&str])]) {
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
-    let key = KeyPair::generate().unwrap();
-    // Both, as a node's must be: it serves its listeners and dials its peers with the one.
-    let mut params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key, &ca).unwrap();
-    std::fs::write(dir.join(format!("{name}-ca.pem")), ca.pem()).unwrap();
-    std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).unwrap();
-    std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).unwrap();
+    std::fs::write(dir.join(format!("{ca_name}-ca.pem")), ca.pem()).unwrap();
+    for (name, dns) in certs {
+        let key = KeyPair::generate().unwrap();
+        let names = ["127.0.0.1"].iter().chain(*dns).map(|&n| n.to_owned()).collect::<Vec<_>>();
+        // Both, as a node's must be: it serves its listeners and dials its peers with the one.
+        let mut params = CertificateParams::new(names).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = params.signed_by(&key, &ca).unwrap();
+        std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).unwrap();
+        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).unwrap();
+    }
 }
 
 /// With TLS, nodes replicate to each other, and a client and an operator get through; a client
@@ -458,7 +468,7 @@ async fn a_cluster_over_tls_takes_only_who_it_should() {
     certify(&certs, "operator");
     let file = |name: &str| certs.join(name);
     let tls = NodeTls::new(file("node.pem"), file("node.key"), file("node-ca.pem"), file("operator-ca.pem"));
-    let mut cluster = Cluster::new(dir.path(), Some(tls));
+    let mut cluster = Cluster::new(dir.path(), |_| Some(tls.clone()));
 
     // A hundred messages committed: the peers took each other's appends.
     let gateway = ClientTls::load(&file("node-ca.pem"), None).unwrap();
@@ -504,7 +514,7 @@ async fn tls_on_the_admin_listener_alone() {
     certify(&certs, "operator");
     let file = |name: &str| certs.join(name);
     let tls = NodeTls::admin_only(file("node.pem"), file("node.key"), file("operator-ca.pem"));
-    let mut cluster = Cluster::new(dir.path(), Some(tls));
+    let mut cluster = Cluster::new(dir.path(), |_| Some(tls.clone()));
 
     let mut client =
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
@@ -530,7 +540,7 @@ async fn tls_without_an_admin_ca_takes_operators_by_their_token() {
     let file = |name: &str| certs.join(name);
     let mut tls = NodeTls::admin_only(file("node.pem"), file("node.key"), file("node-ca.pem"));
     tls.admin_ca = None;
-    let mut cluster = Cluster::new(dir.path(), Some(tls));
+    let mut cluster = Cluster::new(dir.path(), |_| Some(tls.clone()));
     let mut client =
         ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
     exchange(&mut cluster, &mut client, 1, 100).await;
@@ -542,4 +552,47 @@ async fn tls_without_an_admin_ca_takes_operators_by_their_token() {
     assert!(admin.clone().with_token(TOKEN).request_snapshot().await.unwrap() > 100);
     let error = admin.with_token(b"wrong").request_snapshot().await.unwrap_err();
     assert!(matches!(error, AdminError::Denied(_)), "{error:?}");
+}
+
+/// With `peer_ids`, each node's certificate names its node ID: nodes 1 and 2, whose do, replicate
+/// to each other; node 3, given a certificate naming node 1, is taken by neither, nor reached.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_ids_take_a_peer_only_as_the_node_its_certificate_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let certs = dir.path().join("certs");
+    std::fs::create_dir(&certs).unwrap();
+    let names = [("node-1", &["node-1.turbofan"][..]), ("node-2", &["node-2.turbofan"][..])];
+    certify_named(&certs, "node", &names);
+    let file = |name: &str| certs.join(name);
+    let tls = |id: NodeId| {
+        // Node 3 with node 1's certificate, as if misissued or stolen.
+        let cert = if id == NodeId(2) { "node-2" } else { "node-1" };
+        let mut tls =
+            NodeTls::new(file(&format!("{cert}.pem")), file(&format!("{cert}.key")), file("node-ca.pem"), file("x"));
+        (tls.admin_ca, tls.peer_ids) = (None, true);
+        Some(tls)
+    };
+    let mut cluster = Cluster::new(dir.path(), tls);
+
+    let gateway = ClientTls::load(&file("node-ca.pem"), None).unwrap();
+    let mut client = ClusterClient::connect_tls(
+        cluster.client_addrs()[..2].to_vec(),
+        SERVICE_ID,
+        b"ok".to_vec(),
+        Duration::from_millis(500),
+        gateway.clone(),
+    )
+    .unwrap();
+    exchange(&mut cluster, &mut client, 1, 100).await;
+
+    let admin = Admin::new(cluster.configs[0].admin_listen.to_string(), SERVICE_ID)
+        .with_token(TOKEN)
+        .with_tls(gateway)
+        .with_timeout(Duration::from_secs(10));
+    let status = admin.status().await.unwrap();
+    let matched = |id| status.members.iter().find(|m| m.id == id).unwrap().matched;
+    assert!(status.leader != NodeId(3));
+    assert!(matched(NodeId(1)) > 100 && matched(NodeId(2)) > 100, "{status:?}");
+    assert_eq!(matched(NodeId(3)), 0, "node 3 was reached");
 }

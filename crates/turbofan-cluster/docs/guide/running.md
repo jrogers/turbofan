@@ -195,7 +195,12 @@ A certificate is checked against the address dialled, so a node's must name, as 
 alternative names, every host it's reached at: its peer, client and admin addresses'.
 
 A peer certificate stands for the cluster, not one node: any node holding one may say it's any
-member, as with the peer token. Certificates are read when the node starts, so replacing one is a
+member, as with the peer token. Unless `--tls-peer-ids` (`NodeTls::peer_ids`): then each node's
+certificate names its node ID, as the DNS name `node-<id>.turbofan` beside its hosts', and a peer
+is taken only as the node its certificate names. A node refuses a peer whose hello says another
+ID, and won't send to one whose certificate doesn't name the member it dialled. To turn it on in a
+running cluster, give every node a certificate naming its ID first, then restart the nodes with the
+flag one at a time. Certificates are read when the node starts, so replacing one is a
 rolling restart. A node with TLS and one without can't talk, so a cluster turns TLS on or off all
 at once.
 

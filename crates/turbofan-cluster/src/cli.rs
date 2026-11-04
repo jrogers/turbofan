@@ -105,7 +105,7 @@ const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
         [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
         [--election-timeout <ms>] [--heartbeat <ms>]
-        [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem>]]
+        [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]]
         (without --tls-peer-ca, TLS on the admin listener only; without --tls-admin-ca,
         operators present no certificate, and the admin token says who they are)
   restore --from <snapshot file>, then serve's flags: a new cluster of one, this node
@@ -398,15 +398,18 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
 /// a peer CA for TLS beyond the admin listener.
 fn node_tls(args: &[String]) -> Result<Option<NodeTls>, String> {
     let (peer_ca, admin_ca) = (optional_flag(args, "--tls-peer-ca")?, optional_flag(args, "--tls-admin-ca")?);
+    let peer_ids = args.iter().any(|a| a == "--tls-peer-ids");
     match tls_flags(args, ["--tls-cert", "--tls-key"])? {
+        Some(_) if peer_ids && peer_ca.is_none() => Err("--tls-peer-ids takes --tls-peer-ca".into()),
         Some([cert, key]) => Ok(Some(NodeTls {
             cert: cert.into(),
             key: key.into(),
             peer_ca: peer_ca.map(Into::into),
             admin_ca: admin_ca.map(Into::into),
+            peer_ids,
         })),
-        None if peer_ca.is_some() || admin_ca.is_some() => {
-            Err("--tls-peer-ca and --tls-admin-ca take --tls-cert and --tls-key".into())
+        None if peer_ca.is_some() || admin_ca.is_some() || peer_ids => {
+            Err("--tls-peer-ca, --tls-admin-ca and --tls-peer-ids take --tls-cert and --tls-key".into())
         }
         None => Ok(None),
     }
@@ -583,8 +586,11 @@ mod tests {
         let no_admin_ca = node_tls(&args(&tls[..4])).unwrap().unwrap();
         assert_eq!((no_admin_ca.peer_ca, no_admin_ca.admin_ca), (None, None));
         assert!(node_tls(&args(&["--tls-admin-ca", "a"])).is_err());
+        let ids = node_tls(&args(&[&tls[..], &["--tls-peer-ca", "p", "--tls-peer-ids"]].concat())).unwrap().unwrap();
+        assert!(ids.peer_ids);
+        assert!(node_tls(&args(&[&tls[..], &["--tls-peer-ids"]].concat())).is_err(), "without a peer CA");
         let all = node_tls(&args(&[&tls[..], &["--tls-peer-ca", "p"]].concat())).unwrap().unwrap();
-        assert_eq!(all.peer_ca, Some("p".into()));
+        assert_eq!((all.peer_ca, all.peer_ids), (Some("p".into()), false));
         assert!(node_tls(&args(&["--tls-peer-ca", "p"])).is_err());
         assert!(node_tls(&args(&[])).unwrap().is_none());
     }

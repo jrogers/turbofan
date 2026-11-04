@@ -12,6 +12,10 @@ a patch version (0.1.1) doesn't.
   `None`) encrypts the admin listener and has operators present no certificate, the admin token
   saying who they are, as a client's credentials do. The operators' commands take `--tls-ca`
   alone for it.
+- Per-node identity: `serve --tls-peer-ids` (`NodeTls::peer_ids`) has each node's certificate name
+  its node ID, as the DNS name `node-<id>.turbofan`, and takes a peer only as the node its
+  certificate names: a node with another's certificate can't say it's that one, nor be sent its
+  appends. Off by default; turn it on once every node's certificate names its ID.
 
 ### Breaking
 

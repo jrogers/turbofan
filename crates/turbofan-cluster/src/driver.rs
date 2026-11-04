@@ -234,7 +234,9 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     let hello = Hello { service_id: config.service_id, node_id: Some(id), epoch };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
     let (dial, tls_peers) = (tls.as_ref().and_then(|t| t.dial.clone()), tls.as_ref().and_then(|t| t.peer.clone()));
-    tasks.spawn(accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls_peers, inputs.clone()));
+    let peer_ids = tls.as_ref().is_some_and(|t| t.peer_ids);
+    let peers = accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls_peers, peer_ids, inputs.clone());
+    tasks.spawn(peers);
     let next_conn = Arc::new(AtomicU64::new(1));
     let (tls_clients, idle) = (tls.as_ref().and_then(|t| t.client.clone()), Some(config.node.session_timeout));
     let clients = Gate {
@@ -264,6 +266,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
         hello,
         peer_token: peer_token.unwrap_or_else(|| Arc::from(&[][..])),
         tls: dial,
+        peer_ids,
         contacts,
         peers: HashMap::new(),
         dials: JoinSet::new(),
@@ -294,6 +297,8 @@ struct Core<S> {
     peer_token: Arc<[u8]>,
     /// What it dials peers with, if it has TLS.
     tls: Option<ClientTls>,
+    /// Whether a peer's certificate must name the member dialled ([`NodeTls::peer_ids`]).
+    peer_ids: bool,
     /// Peers to dial whatever the members are.
     contacts: Vec<(NodeId, String)>,
     /// The peers dialled: where, the frames for them, and the task dialling.
@@ -451,6 +456,7 @@ impl<S: Service + 'static> Core<S> {
                     self.hello.clone(),
                     self.peer_token.clone(),
                     self.tls.clone(),
+                    self.peer_ids.then_some(id),
                     rx,
                 ));
                 self.peers.insert(id, (addr, tx, task));
@@ -753,12 +759,14 @@ async fn read_within(reader: &mut (impl AsyncRead + Unpin), idle: Option<Duratio
 }
 
 /// Reads from peers: any node of this service whose hello has `token`, if there is one, since a
-/// member this node hasn't heard was added may lead.
+/// member this node hasn't heard was added may lead; and with `peer_ids`, whose certificate names
+/// the node its hello says.
 async fn accept_peers(
     listener: TcpListener,
     hello: Hello,
     token: Option<Arc<[u8]>>,
     tls: Option<TlsAcceptor>,
+    peer_ids: bool,
     inputs: mpsc::Sender<Input>,
 ) {
     let mut conns = JoinSet::new();
@@ -772,18 +780,20 @@ async fn accept_peers(
         let (inputs, token, tls, hello) = (inputs.clone(), token.clone(), tls.clone(), hello.clone());
         conns.spawn(async move {
             let handshake = async {
-                let mut stream = tls::accept(stream, tls.as_ref()).await?;
+                let (mut stream, cert) = tls::accept(stream, tls.as_ref()).await?;
                 let first = read_frame(&mut stream).await?;
-                io::Result::Ok((stream, first))
+                io::Result::Ok((stream, cert, first))
             };
-            let Ok(Ok((mut stream, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else { return };
+            let Ok(Ok((mut stream, cert, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else {
+                return;
+            };
             let theirs = hello.check(&first, wire::Role::Peer);
             let theirs = theirs.filter(|h| token.as_ref().is_none_or(|token| same(h.token(), token)));
             let theirs = theirs.filter(|h| hello.same_cluster(h.epoch()));
             let Some((from, epoch)) = theirs.and_then(|h| Some((NodeId::from_wire(h.node_id())?, h.epoch()))) else {
                 return;
             };
-            if Some(from) == hello.node_id {
+            if Some(from) == hello.node_id || (peer_ids && !tls::names(cert.as_ref(), from)) {
                 return;
             }
             while let Ok(frame) = read_valid_frame(&mut stream).await {
@@ -840,7 +850,7 @@ async fn accept(listener: TcpListener, gate: Gate, next_conn: Arc<AtomicU64>) {
 async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
     let Gate { role, hello, token, tls, inputs, idle } = gate;
     let handshake = async {
-        let mut stream = tls::accept(stream, tls.as_ref()).await?;
+        let (mut stream, _) = tls::accept(stream, tls.as_ref()).await?;
         let first = read_frame(&mut stream).await?;
         io::Result::Ok((stream, first))
     };
@@ -900,12 +910,13 @@ async fn dial_peer(
     hello: Hello,
     token: Arc<[u8]>,
     tls: Option<ClientTls>,
+    node: Option<NodeId>,
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut batch = Vec::new();
     let mut redial = REDIAL;
     loop {
-        let connected = tokio::time::timeout(HELLO_TIMEOUT, tls::connect(&addr, tls.as_ref())).await;
+        let connected = tokio::time::timeout(HELLO_TIMEOUT, tls::connect(&addr, tls.as_ref(), node)).await;
         let Ok(Ok(mut stream)) = connected else {
             tokio::time::sleep(redial).await;
             redial = backoff(redial);

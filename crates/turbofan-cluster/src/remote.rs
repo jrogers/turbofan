@@ -296,7 +296,8 @@ async fn handshake(
     tls: Option<&ClientTls>,
 ) -> io::Result<Conn> {
     let timed_out = |_| io::Error::from(io::ErrorKind::TimedOut);
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, tls::connect(addr, tls)).await.map_err(timed_out)??;
+    let mut stream =
+        tokio::time::timeout(CONNECT_TIMEOUT, tls::connect(addr, tls, None)).await.map_err(timed_out)??;
     write_frames(&mut stream, [&hello.frame(role, token)[..]]).await?;
     let reply = tokio::time::timeout(CONNECT_TIMEOUT, read_frame(&mut stream)).await.map_err(timed_out)??;
     if let Ok(Some((wire::Decoded::Unauthorized(_), _))) = codec::decode_frame(&reply) {

@@ -14,7 +14,10 @@
 //! certificate first, then any intermediates, which are sent with it.
 //!
 //! A peer certificate stands for the cluster, not for one node: any node with one may say it's
-//! any member, as with the peer token.
+//! any member, as with the peer token. Unless [`NodeTls::peer_ids`]: then each node's certificate
+//! names its node ID, as the DNS name `node-<id>.turbofan` beside its hosts', and a peer is taken
+//! only as the node its certificate names, both ways: a node accepting a connection checks the
+//! node ID the hello says, and one dialling, the member it dials.
 //!
 //! Without a peer CA ([`NodeTls::admin_only`]), only operators connect over TLS: peers and clients
 //! stay on plain TCP, so a cluster can put TLS on its admin listeners alone, one node at a time.
@@ -30,6 +33,8 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncRead, AsyncWrite, BufStream};
 use tokio::net::TcpStream;
+
+use crate::raft::NodeId;
 
 #[cfg(feature = "tls")]
 use rustls_impl as imp;
@@ -56,6 +61,11 @@ pub struct NodeTls {
     /// connection is encrypted and the node's certificate checked, but only the admin token says
     /// who an operator is.
     pub admin_ca: Option<PathBuf>,
+    /// Whether every peer's certificate must name its node ID, as the DNS name
+    /// `node-<id>.turbofan`: a peer is taken only as the node its certificate names. Off, a peer
+    /// certificate stands for any member. Only with a peer CA. Turn it on once every node's
+    /// certificate names its ID; a wildcard name, `*.turbofan`, names every node.
+    pub peer_ids: bool,
 }
 
 impl NodeTls {
@@ -68,14 +78,20 @@ impl NodeTls {
         peer_ca: impl Into<PathBuf>,
         admin_ca: impl Into<PathBuf>,
     ) -> Self {
-        Self { cert: cert.into(), key: key.into(), peer_ca: Some(peer_ca.into()), admin_ca: Some(admin_ca.into()) }
+        Self {
+            cert: cert.into(),
+            key: key.into(),
+            peer_ca: Some(peer_ca.into()),
+            admin_ca: Some(admin_ca.into()),
+            peer_ids: false,
+        }
     }
 
     /// TLS on the admin listener only: the node's certificate `cert` and its `key`, and the
     /// `admin_ca` that signed operators'. Peers and clients are plain TCP.
     #[must_use]
     pub fn admin_only(cert: impl Into<PathBuf>, key: impl Into<PathBuf>, admin_ca: impl Into<PathBuf>) -> Self {
-        Self { cert: cert.into(), key: key.into(), peer_ca: None, admin_ca: Some(admin_ca.into()) }
+        Self { cert: cert.into(), key: key.into(), peer_ca: None, admin_ca: Some(admin_ca.into()), peer_ids: false }
     }
 }
 
@@ -119,6 +135,8 @@ pub(crate) struct Loaded {
     pub(crate) client: Option<Acceptor>,
     pub(crate) admin: Acceptor,
     pub(crate) dial: Option<ClientTls>,
+    /// [`NodeTls::peer_ids`], with a peer CA.
+    pub(crate) peer_ids: bool,
 }
 
 impl Loaded {
@@ -126,19 +144,28 @@ impl Loaded {
         let (cluster, admin) = imp::acceptors(tls)?;
         let dial = tls.peer_ca.as_deref().map(|ca| ClientTls::load(ca, Some((&tls.cert, &tls.key)))).transpose()?;
         let (peer, client) = cluster.unzip();
-        Ok(Self { peer, client, admin, dial })
+        Ok(Self { peer, client, admin, dial, peer_ids: tls.peer_ids && tls.peer_ca.is_some() })
     }
 }
 
 /// A TCP connection to `addr` (`host:port`), over TLS if there's `tls`, checking the
-/// certificate names `host`.
-pub(crate) async fn connect(addr: &str, tls: Option<&ClientTls>) -> io::Result<Conn> {
+/// certificate names `host`, and node `node` if there's one: else it's
+/// [`io::ErrorKind::PermissionDenied`].
+pub(crate) async fn connect(addr: &str, tls: Option<&ClientTls>, node: Option<NodeId>) -> io::Result<Conn> {
     let stream = TcpStream::connect(addr).await?;
     let _ = stream.set_nodelay(true);
     match tls {
-        Some(tls) => imp::connect(&tls.0, addr, stream).await,
+        Some(tls) => imp::connect(&tls.0, addr, stream, node).await,
         None => Ok(plain(stream)),
     }
+}
+
+/// The certificate a connection's other end presented, if any.
+pub(crate) type Cert = imp::Cert;
+
+/// Whether `cert` names node `id`.
+pub(crate) fn names(cert: Option<&Cert>, id: NodeId) -> bool {
+    cert.is_some_and(|cert| imp::names(cert, id))
 }
 
 /// Plain TCP, buffered both ways as rustls buffers TLS: else every frame written is a system
@@ -147,12 +174,13 @@ fn plain(stream: TcpStream) -> Conn {
     Box::new(BufStream::new(stream))
 }
 
-/// An accepted TCP connection, over TLS if there's `tls`.
-pub(crate) async fn accept(stream: TcpStream, tls: Option<&Acceptor>) -> io::Result<Conn> {
+/// An accepted TCP connection, over TLS if there's `tls`, and the certificate the other end
+/// presented, if it did.
+pub(crate) async fn accept(stream: TcpStream, tls: Option<&Acceptor>) -> io::Result<(Conn, Option<Cert>)> {
     let _ = stream.set_nodelay(true);
     match tls {
         Some(tls) => imp::accept(tls, stream).await,
-        None => Ok(plain(stream)),
+        None => Ok((plain(stream), None)),
     }
 }
 
@@ -165,14 +193,17 @@ mod rustls_impl {
     use std::sync::Arc;
 
     use tokio::net::TcpStream;
+    use tokio_rustls::rustls::client::verify_server_name;
     use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
     use tokio_rustls::rustls::pki_types::pem::PemObject;
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-    use tokio_rustls::rustls::server::WebPkiClientVerifier;
+    use tokio_rustls::rustls::server::{ParsedCertificate, WebPkiClientVerifier};
     use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
     pub(crate) use tokio_rustls::{TlsAcceptor as Acceptor, TlsConnector as Connector};
 
-    use super::{Conn, NodeTls};
+    use super::{Conn, NodeId, NodeTls};
+
+    pub(crate) type Cert = CertificateDer<'static>;
 
     pub(super) fn connector(ca: &Path, identity: Option<(&Path, &Path)>) -> io::Result<Connector> {
         let builder = ClientConfig::builder_with_provider(provider())
@@ -211,15 +242,36 @@ mod rustls_impl {
         Ok((cluster, server(tls.admin_ca.as_deref())?))
     }
 
-    pub(super) async fn connect(tls: &Connector, addr: &str, stream: TcpStream) -> io::Result<Conn> {
+    pub(super) async fn connect(
+        tls: &Connector,
+        addr: &str,
+        stream: TcpStream,
+        node: Option<NodeId>,
+    ) -> io::Result<Conn> {
         let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
         let host = host.trim_start_matches('[').trim_end_matches(']');
         let name = ServerName::try_from(host.to_owned()).map_err(invalid)?;
-        Ok(Box::new(tls.connect(name, stream).await?))
+        let stream = tls.connect(name, stream).await?;
+        if let Some(node) = node {
+            let cert = stream.get_ref().1.peer_certificates().and_then(<[Cert]>::first);
+            if !cert.is_some_and(|cert| names(cert, node)) {
+                let denied = format!("{addr}: its certificate doesn't name node {node}");
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, denied));
+            }
+        }
+        Ok(Box::new(stream))
     }
 
-    pub(super) async fn accept(tls: &Acceptor, stream: TcpStream) -> io::Result<Conn> {
-        Ok(Box::new(tls.accept(stream).await?))
+    pub(super) async fn accept(tls: &Acceptor, stream: TcpStream) -> io::Result<(Conn, Option<Cert>)> {
+        let stream = tls.accept(stream).await?;
+        let cert = stream.get_ref().1.peer_certificates().and_then(<[Cert]>::first).cloned();
+        Ok((Box::new(stream), cert))
+    }
+
+    /// Whether `cert`, already verified, names node `id`.
+    pub(super) fn names(cert: &Cert, id: NodeId) -> bool {
+        let Ok(name) = ServerName::try_from(format!("node-{id}.turbofan")) else { return false };
+        ParsedCertificate::try_from(cert).is_ok_and(|cert| verify_server_name(&cert, &name).is_ok())
     }
 
     fn provider() -> Arc<CryptoProvider> {
@@ -264,13 +316,14 @@ mod without {
 
     use tokio::net::TcpStream;
 
-    use super::{Conn, NodeTls};
+    use super::{Conn, NodeId, NodeTls};
 
     /// Uninhabited: without the feature, no TLS value can exist.
     #[derive(Clone)]
     pub(crate) enum Never {}
     pub(crate) type Connector = Never;
     pub(crate) type Acceptor = Never;
+    pub(crate) type Cert = Never;
 
     fn unsupported() -> io::Error {
         io::Error::new(io::ErrorKind::Unsupported, "TLS: built without turbofan-cluster's `tls` feature")
@@ -285,13 +338,22 @@ mod without {
     }
 
     #[allow(clippy::unused_async, reason = "the same signature as with the feature")]
-    pub(super) async fn connect(tls: &Connector, _addr: &str, _stream: TcpStream) -> io::Result<Conn> {
+    pub(super) async fn connect(
+        tls: &Connector,
+        _addr: &str,
+        _stream: TcpStream,
+        _node: Option<NodeId>,
+    ) -> io::Result<Conn> {
         match *tls {}
     }
 
     #[allow(clippy::unused_async, reason = "the same signature as with the feature")]
-    pub(super) async fn accept(tls: &Acceptor, _stream: TcpStream) -> io::Result<Conn> {
+    pub(super) async fn accept(tls: &Acceptor, _stream: TcpStream) -> io::Result<(Conn, Option<Never>)> {
         match *tls {}
+    }
+
+    pub(super) fn names(cert: &Cert, _id: NodeId) -> bool {
+        match *cert {}
     }
 
     #[cfg(test)]
@@ -306,7 +368,13 @@ mod without {
             let error = ClientTls::load(Path::new("ca.pem"), None).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
             let file = PathBuf::from;
-            let node = NodeTls { cert: file("c"), key: file("k"), peer_ca: Some(file("p")), admin_ca: Some(file("a")) };
+            let node = NodeTls {
+                cert: file("c"),
+                key: file("k"),
+                peer_ca: Some(file("p")),
+                admin_ca: Some(file("a")),
+                peer_ids: false,
+            };
             assert_eq!(Loaded::load(&node).err().map(|e| e.kind()), Some(std::io::ErrorKind::Unsupported));
         }
     }
