@@ -171,6 +171,21 @@ pub struct Outputs {
     /// As leader, how long each of its entries took from proposed to each stage it reached, in
     /// nanoseconds: see [`crate::metrics`].
     pub latencies: Vec<(raft::Stage, u64)>,
+    /// Captures asked for: make each after `persist`, when the log on disk is the node's as of
+    /// this batch, and answer it.
+    pub captures: Vec<Capture>,
+}
+
+/// An operator's `Capture`: copy the latest snapshot, and the log after it to `to`, this node's
+/// commit index as it was asked, so committed, for [`crate::capture::replay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capture {
+    /// The admin connection to answer on.
+    pub conn: ConnId,
+    /// The request's ID.
+    pub request_id: u64,
+    /// The last entry to copy.
+    pub to: u64,
 }
 
 /// This node's, as leader.
@@ -237,6 +252,10 @@ pub struct Node<S> {
     promoting: Option<(ConnId, u64, u64)>,
     /// The promotion answered: its request ID, index and epoch, for the request sent again.
     promoted: Option<(u64, u64, u64)>,
+    /// Captures asked for, for [`Outputs::captures`].
+    captures: Vec<Capture>,
+    /// Replaying ([`Node::replay`]): the service's effects, as they're made.
+    replayed: Option<Vec<Effect>>,
     /// When the latest snapshot was taken or installed, or the node started.
     snapshot_at: u64,
 }
@@ -269,8 +288,39 @@ impl<S: Service> Node<S> {
             transferring: None,
             promoting: None,
             promoted: None,
+            captures: Vec::new(),
+            replayed: None,
             snapshot_at: now,
         }
+    }
+
+    /// Applies the entry logged at `index`, the next, outside Raft: to replay a log offline
+    /// ([`crate::capture::replay`]), from [`Node::restore`]'s snapshot or a new cluster. Returns
+    /// the effects the service made. Nothing is sent: no client is attached, and the node
+    /// mustn't be ticked or given input.
+    ///
+    /// # Errors
+    ///
+    /// If `payload` isn't a log entry this node can read.
+    ///
+    /// # Panics
+    ///
+    /// If `index` isn't the next to apply, or a restore is waiting.
+    pub fn replay(&mut self, index: u64, payload: &[u8]) -> io::Result<Vec<Effect>> {
+        assert!(self.restoring.is_none(), "restored first");
+        assert_eq!(index, self.state.applied + 1, "replayed in order");
+        let (entry, _) = wire::decode(payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("entry {index}: {e}")))?;
+        self.state.applied = index;
+        self.replayed = Some(Vec::new());
+        self.apply_entry(index, &entry, false);
+        Ok(self.replayed.take().unwrap_or_default())
+    }
+
+    /// The service, given up.
+    #[must_use]
+    pub fn into_service(self) -> S {
+        self.service
     }
 
     /// Its state and counts, at `now`.
@@ -474,6 +524,7 @@ impl<S: Service> Node<S> {
             restore: self.restoring,
             peers: out.peers,
             latencies: out.latencies,
+            captures: std::mem::take(&mut self.captures),
         }
     }
 

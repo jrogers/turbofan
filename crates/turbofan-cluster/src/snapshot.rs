@@ -113,6 +113,15 @@ pub fn load(dir: &Path) -> io::Result<Option<(Snapshot, io::Take<BufReader<File>
     Ok(Some((snapshot, BufReader::new(file).take(len))))
 }
 
+/// The latest snapshot's index, and its file, if there is one: unchecked.
+///
+/// # Errors
+///
+/// If `dir` can't be read.
+pub fn latest(dir: &Path) -> io::Result<Option<(u64, PathBuf)>> {
+    Ok(list(dir)?.last().map(|&index| (index, path(dir, index))))
+}
+
 /// The snapshot file at `file`, wherever it is (a copy taken off a node, say), checked whole, and
 /// its bytes to read.
 ///

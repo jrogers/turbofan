@@ -22,6 +22,11 @@ impl<S: Service> Node<S> {
             self.promote(conn, m.request_id());
             return;
         }
+        // Of this node's log, whatever its role: what it knows committed.
+        if let wire::Decoded::Capture(m) = message {
+            self.captures.push(Capture { conn, request_id: m.request_id(), to: self.raft.commit_index() });
+            return;
+        }
         if request_id(message).is_none() && !matches!(message, wire::Decoded::StatusRequest(_)) {
             return;
         }

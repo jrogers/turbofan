@@ -4,6 +4,20 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Added
+
+- Capture and replay: `capture --admin <addr>` (`Admin::capture`) has that node put its latest
+  snapshot and its log from there to its commit index in `<data>/captures/`, mostly hard links;
+  `replay --capture <dir> [--to <n>]` (`capture::replay`) restores the snapshot into the service
+  and applies the entries, printing every effect, to reproduce a bug from production or compare
+  two versions on real traffic. An older node doesn't answer `Capture`.
+
+### Breaking
+
+- `AdminError` has `CaptureFailed`.
+
 ## 0.4.0 (2026-11-04)
 
 Once every node runs 0.4.0, switch protocol 1 on with `activate --protocol 1` (see the egress ring,

@@ -1,8 +1,8 @@
 //! Three nodes over real TCP and real files, with a gateway client: messages answered once and in
 //! order while every node in turn, the leader among them, is killed and restarted from disk, and
 //! while a fourth joins and the first leaves; a fourth, a learner, promoted to a cluster of its
-//! own once the three are lost, that they can't take back; and the three, lost, restored from a
-//! copy of a snapshot.
+//! own once the three are lost, that they can't take back; the three, lost, restored from a
+//! copy of a snapshot; and a node's capture of its log replayed offline.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -17,7 +17,9 @@ use turbofan_cluster::raft::{self, NodeId};
 #[cfg(feature = "tls")]
 use turbofan_cluster::tls::ClientTls;
 use turbofan_cluster::tls::NodeTls;
-use turbofan_cluster::{Admin, AdminError, CloseReason, ClusterClient, Ctx, Service, SessionId, SnapshotWriter, node};
+use turbofan_cluster::{
+    Admin, AdminError, CloseReason, ClusterClient, Ctx, Effect, Service, SessionId, SnapshotWriter, capture, node,
+};
 
 const SERVICE_ID: u32 = 7;
 /// The operators' token.
@@ -260,6 +262,52 @@ async fn a_member_joins_and_another_leaves() {
     // Two of the three that are left are a majority: one more can go down.
     cluster.kill(1).await;
     exchange(&mut cluster, &mut client, 301, 400).await;
+}
+
+/// A node's capture of its log, from its snapshot to its commit index, replayed offline into the
+/// service, echoes what the cluster echoed after the snapshot, in order, and ends with the
+/// service as the cluster had it: each message once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capture_replays_what_the_cluster_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new(dir.path(), None);
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 100).await;
+    let addrs: Vec<String> = cluster.configs.iter().map(|c| c.admin_listen.to_string()).collect();
+    let admin = |i: usize| Admin::new(&addrs[i], SERVICE_ID).with_token(TOKEN).with_timeout(Duration::from_secs(20));
+    let asked = admin(0).request_snapshot().await.unwrap();
+    exchange(&mut cluster, &mut client, 101, 200).await;
+
+    // Any member: the one asked answers, of what it knows committed, which may lag the leader's.
+    let (captured, echoed, echo) = loop {
+        let captured = admin(1).capture().await.unwrap();
+        let mut echoed = Vec::new();
+        let replayed = capture::replay(Path::new(&captured.dir), Echo::default(), None, |_, effects| {
+            for effect in effects {
+                let Effect::Send(_, payload) = effect else { panic!("{effect:?}") };
+                echoed.push(String::from_utf8(payload.clone()).unwrap().parse::<u64>().unwrap());
+            }
+        })
+        .unwrap();
+        if replayed.last.values().any(|&k| k == 200) {
+            break (captured, echoed, replayed);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(captured.snapshot_index >= asked, "from its latest snapshot");
+    let first = echoed[0];
+    assert!(first <= 101, "from the snapshot on: {first}");
+    assert_eq!(echoed, (first..=200).collect::<Vec<_>>(), "echoed once each, in order");
+    assert_eq!(echo.last.len(), 1, "one session");
+
+    // Stopped short, at an entry before the last; past what's committed, refused.
+    let to = captured.to - 1;
+    let mut last = 0;
+    capture::replay(Path::new(&captured.dir), Echo::default(), Some(to), |index, _| last = index).unwrap();
+    assert_eq!(last, to);
+    let past = capture::replay(Path::new(&captured.dir), Echo::default(), Some(captured.to + 1), |_, _| {});
+    assert!(past.is_err(), "past its commit index");
 }
 
 /// A learner, promoted once its cluster is lost, leads a cluster of its own. The old cluster,

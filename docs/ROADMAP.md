@@ -14,14 +14,6 @@ down when they show.
   majority losing power together may lose committed entries. Spread the nodes over power
   domains, and cover a whole site with a standby (a learner in another region, to `promote`) or
   `serve --fsync`.
-- **Capture and replay.** Copy a cluster's log, from a snapshot on, and replay it into a service
-  offline: to reproduce a bug from production, check a new service version against real traffic
-  (its responses compared with what the cluster sent), or audit what happened. Applying is
-  already deterministic, with time in the entries (`src/node/apply.rs`), and a snapshot copied
-  off a node restores (`driver::restore`). Missing: capturing the committed entries from a node's
-  segments (`src/log.rs`) or a learner, as a file that names its snapshot and epoch; and a replay
-  that restores the snapshot and applies the entries through `Node` without Raft, with the
-  service's outputs to compare.
 
 ## 2. Toward 1.0
 

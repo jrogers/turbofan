@@ -61,7 +61,7 @@ cargo run --example counter -- serve --id 1 --data /tmp/counter/1 \
 
 Run the same command for nodes 2 and 3. The same binary's other commands operate the cluster:
 `status`, `snapshot`, `add-member`, `remove-member`, `set-role`, `transfer-leadership`,
-`activate`, `promote` and `shutdown`.
+`activate`, `promote`, `shutdown`, and `capture` and `replay` (a node's log, replayed offline).
 
 ## Clients
 

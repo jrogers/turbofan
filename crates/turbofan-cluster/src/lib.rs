@@ -31,6 +31,7 @@ macro_rules! guide_links {
 // The guide: from a first service to running a cluster in production (docs/guide).
 pub mod guide;
 
+pub mod capture;
 mod cli;
 pub mod client;
 pub mod codec;
@@ -60,7 +61,7 @@ pub use node::{
     Service, SessionId, SnapshotWriter,
 };
 pub use raft::{Config as RaftConfig, MAX_MEMBERS, Member, NodeId};
-pub use remote::{Admin, AdminError, ClusterClient, ClusterStatus, MemberStatus};
+pub use remote::{Admin, AdminError, Captured, ClusterClient, ClusterStatus, MemberStatus};
 pub use wire::CloseReason;
 
 /// The codecs generated from `schema/cluster.xml`.

@@ -16,7 +16,7 @@
 
 use std::io::{self, Read};
 
-use crate::node::{ConnId, Node, SaveSnapshot, Service};
+use crate::node::{Capture, ConnId, Node, SaveSnapshot, Service};
 use crate::raft::{LogEnd, Member, NodeId, Persist, SnapshotRead};
 
 /// What a write does for one batch, in order: persist, then read.
@@ -28,6 +28,8 @@ pub struct Batch {
     pub reads: Vec<u64>,
     /// And the latest snapshot from these offsets: see [`crate::raft::Outputs::snapshot_reads`].
     pub snapshot_reads: Vec<SnapshotRead>,
+    /// And make these captures: see [`crate::node::Outputs::captures`].
+    pub captures: Vec<Capture>,
 }
 
 /// What waits for a batch's write.
@@ -73,8 +75,12 @@ impl Pipeline {
     pub fn take<S: Service>(&mut self, node: &mut Node<S>) -> Taken {
         let out = node.take_outputs();
         let log_end = node.raft().log_end();
-        let disk = !out.persist.is_empty() || !out.reads.is_empty() || !out.snapshot_reads.is_empty();
-        let batch = Batch { persist: out.persist, reads: out.reads, snapshot_reads: out.snapshot_reads };
+        let disk = !out.persist.is_empty()
+            || !out.reads.is_empty()
+            || !out.snapshot_reads.is_empty()
+            || !out.captures.is_empty();
+        let (persist, reads, snapshot_reads, captures) = (out.persist, out.reads, out.snapshot_reads, out.captures);
+        let batch = Batch { persist, reads, snapshot_reads, captures };
         let waiting = Waiting { restore: out.restore, peer_sends: out.peer_sends, log_end };
         let mut peer_sends = Vec::new();
         if !disk && waiting.restore.is_none() && self.writing.is_none() && self.queued.is_empty() {

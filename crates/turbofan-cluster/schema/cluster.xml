@@ -289,6 +289,21 @@
         <field name="id" id="2" type="uint8"/>
         <field name="learner" id="3" type="uint8"/>
     </sbe:message>
+    <!-- To any member, which answers itself: copy its latest snapshot, and its log from there to
+         its commit index, into a directory of its data directory, to replay offline. An older
+         node doesn't answer. -->
+    <sbe:message name="Capture" id="77">
+        <field name="requestId" id="1" type="uint64"/>
+    </sbe:message>
+    <!-- Captured: the entries after `snapshotIndex` (0: none) to `to`, in the directory `detail`
+         names on that node; or, `refused` 1, not, and `detail` says why. -->
+    <sbe:message name="Captured" id="78">
+        <field name="requestId" id="1" type="uint64"/>
+        <field name="refused" id="2" type="uint8"/>
+        <field name="snapshotIndex" id="3" type="uint64"/>
+        <field name="to" id="4" type="uint64"/>
+        <data name="detail" id="5" type="payloadData"/>
+    </sbe:message>
     <!-- Each member's progress, as the leader knows it. An older leader doesn't answer. -->
     <sbe:message name="StatusRequest" id="74">
         <field name="requestId" id="1" type="uint64"/>

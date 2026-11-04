@@ -396,7 +396,8 @@ impl<S: Service + 'static> Core<S> {
     fn written(&mut self, written: Written) -> io::Result<()> {
         let Written { storage, done } = written;
         self.storage = Some(storage);
-        let (reads, chunks) = done?;
+        let (reads, chunks, captured) = done?;
+        self.send_clients(captured);
         let mut snapshot = None;
         if let Some(index) = self.pipeline.restore() {
             // ponytail: reads the snapshot on the node's task, which waits for it anyway; a
@@ -469,6 +470,7 @@ fn decode(frame: &[u8]) -> wire::Decoded<'_> {
 /// The log, the meta file and the snapshot directory.
 #[derive(Debug)]
 struct Storage {
+    dir: PathBuf,
     log: Log,
     meta: MetaFile,
     snapshots: PathBuf,
@@ -491,18 +493,18 @@ impl Storage {
         let mut log = Log::open(&dir.join("log"), fsync, |record| entries.recover(record, window_bytes))?;
         log.resume(snapshot.as_ref().map(|(s, _)| (s.index, s.term)), &mut entries)?;
         let (meta_file, meta) = MetaFile::open(&dir.join("meta"))?;
-        Ok((Self { log, meta: meta_file, snapshots, snapshots_kept: 1 }, meta, snapshot, entries))
+        Ok((Self { dir: dir.to_owned(), log, meta: meta_file, snapshots, snapshots_kept: 1 }, meta, snapshot, entries))
     }
 
-    /// Writes `batches` in order, each one's reads after its operations, then syncs. Returns the
-    /// records and snapshot chunks read, a read that an earlier batch asked for once.
+    /// Writes `batches` in order, each one's reads and captures after its operations, then syncs.
+    /// Returns the records and snapshot chunks read, a read that an earlier batch asked for once,
+    /// and the answers to the captures.
     ///
     /// Appends running on from one batch to the next are written together: a leader gives a
     /// small batch nearly every turn, and a write of hundreds, each its own syscall, took far
     /// longer than its sync.
-    #[allow(clippy::type_complexity, reason = "the two kinds of read")]
-    fn write(&mut self, batches: &[pipeline::Batch]) -> io::Result<(Vec<Vec<u8>>, Vec<(u64, u64, Vec<u8>)>)> {
-        let (mut reads, mut chunks) = (Vec::new(), Vec::new());
+    fn write(&mut self, batches: &[pipeline::Batch]) -> io::Result<Done> {
+        let (mut reads, mut chunks, mut captured) = (Vec::new(), Vec::new(), Vec::new());
         let (mut froms, mut offsets) = (HashSet::new(), HashSet::new());
         let mut appends = Vec::new();
         for batch in batches {
@@ -514,7 +516,7 @@ impl Storage {
                     self.apply(op)?;
                 }
             }
-            if !batch.reads.is_empty() || !batch.snapshot_reads.is_empty() {
+            if !batch.reads.is_empty() || !batch.snapshot_reads.is_empty() || !batch.captures.is_empty() {
                 self.append(&mut appends)?;
             }
             for &from in &batch.reads {
@@ -527,10 +529,26 @@ impl Storage {
                     chunks.push((index, offset, snapshot::read(&self.snapshots, index, offset, MAX_READ_BYTES)?));
                 }
             }
+            captured.extend(batch.captures.iter().map(|c| (c.conn, self.capture(c))));
         }
         self.append(&mut appends)?;
         self.log.sync()?;
-        Ok((reads, chunks))
+        Ok((reads, chunks, captured))
+    }
+
+    /// Makes `capture`, and answers it: a capture that fails is refused, saying why.
+    fn capture(&self, capture: &node::Capture) -> Vec<u8> {
+        let (refused, snapshot_index, detail) = match crate::capture::make(&self.dir, &self.log, capture.to) {
+            Ok((dir, snapshot)) => (0, snapshot, dir.display().to_string()),
+            Err(e) => (1, 0, format!("capture: {e}")),
+        };
+        // A path or an error, far shorter than a payload: cut to fit, should one not be.
+        let detail = &detail.as_bytes()[..detail.len().min(codec::MAX_PAYLOAD_BYTES)];
+        let mut frame = Vec::new();
+        let (request_id, to) = (capture.request_id, capture.to);
+        let captured = wire::Captured { request_id, refused, snapshot_index, to, detail };
+        codec::encode_frame(&captured, &mut frame).expect("a payload's length fits");
+        frame
     }
 
     /// Writes the `records` gathered so far, if any, and empties them.
@@ -570,9 +588,12 @@ impl Storage {
 /// A write done: what was read for it, or the error that stops the node.
 struct Written {
     storage: Storage,
-    #[allow(clippy::type_complexity, reason = "the two kinds of read")]
-    done: io::Result<(Vec<Vec<u8>>, Vec<(u64, u64, Vec<u8>)>)>,
+    done: io::Result<Done>,
 }
+
+/// What a write read: records, snapshot chunks (index, offset, bytes), and the answers to
+/// captures, for admin connections.
+type Done = (Vec<Vec<u8>>, Vec<(u64, u64, Vec<u8>)>, Vec<(ConnId, Vec<u8>)>);
 
 /// How far the clock is slewed toward the wall clock: up to this many parts per million faster
 /// or slower than the monotonic clock, as NTP slews.
@@ -925,10 +946,11 @@ mod tests {
         let append = |index| {
             let mut records = Vec::new();
             crate::codec::Record { term: 1, index, payload: b"x" }.encode_into(&mut records);
-            pipeline::Batch { persist: vec![Persist::Append(records)], reads: Vec::new(), snapshot_reads: Vec::new() }
+            let (reads, snapshot_reads, captures) = (Vec::new(), Vec::new(), Vec::new());
+            pipeline::Batch { persist: vec![Persist::Append(records)], reads, snapshot_reads, captures }
         };
         let read = pipeline::Batch { reads: vec![1], ..append(3) };
-        let (reads, _) = storage.write(&[append(1), append(2), read, append(4)]).unwrap();
+        let (reads, ..) = storage.write(&[append(1), append(2), read, append(4)]).unwrap();
         let indices: Vec<u64> = crate::codec::records(&reads[0]).map(|r| r.unwrap().index).collect();
         assert_eq!(indices, [1, 2, 3], "the read follows its own batch's append, not the next");
         assert_eq!(storage.log.next_index(), 5);

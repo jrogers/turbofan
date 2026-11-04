@@ -525,6 +525,30 @@ impl Admin {
         .await
     }
 
+    /// Has the node at this address capture its log: its latest snapshot and its log from there
+    /// to its commit index, in a directory of its data directory, to copy off it and replay
+    /// offline ([`crate::capture`]). Any member answers, learners too, of what it has.
+    ///
+    /// # Errors
+    ///
+    /// [`AdminError::CaptureFailed`] if it couldn't, saying why; or [`AdminError::TokenTooLong`],
+    /// [`AdminError::Denied`] or [`AdminError::TimedOut`], which a node too old to capture gives
+    /// too.
+    pub async fn capture(&self) -> Result<Captured, AdminError> {
+        let request = |request_id| frame(&wire::Capture { request_id });
+        self.ask(request, |reply, request_id| match reply {
+            wire::Decoded::Captured(m) if m.request_id() == request_id => {
+                let detail = String::from_utf8_lossy(m.detail()).into_owned();
+                Some(match m.refused() {
+                    0 => Ok(Captured { snapshot_index: m.snapshot_index(), to: m.to(), dir: detail }),
+                    _ => Err(AdminError::CaptureFailed(detail)),
+                })
+            }
+            _ => None,
+        })
+        .await
+    }
+
     /// Sends the `request` for a new request ID to the leader, following redirects from the
     /// address, until `answer` makes something of a reply.
     async fn ask<T>(
@@ -603,6 +627,18 @@ pub struct MemberStatus {
     pub matched: u64,
 }
 
+/// A capture of a node's log, from [`Admin::capture`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Captured {
+    /// The snapshot it starts from (0: none, from the start of the log).
+    pub snapshot_index: u64,
+    /// The last entry it holds, committed.
+    pub to: u64,
+    /// Its directory, on the node.
+    pub dir: String,
+}
+
 /// Why an [`Admin`] request failed.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -626,6 +662,8 @@ pub enum AdminError {
     NotTransferred,
     /// The node isn't a learner, or heard a leader within an election timeout.
     NotPromoted,
+    /// The node couldn't capture its log: this says why.
+    CaptureFailed(String),
     /// No leader answered in time.
     TimedOut,
 }
@@ -643,6 +681,7 @@ impl fmt::Display for AdminError {
             ),
             Self::NotTransferred => f.write_str("the leadership wasn't transferred"),
             Self::NotPromoted => f.write_str("refused: not a learner, or its leader is alive"),
+            Self::CaptureFailed(why) => f.write_str(why),
             Self::TimedOut => f.write_str("no leader answered"),
         }
     }

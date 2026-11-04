@@ -396,6 +396,35 @@ impl Log {
         Ok(self.segments[0])
     }
 
+    /// Puts the segments holding `from` to `to` in `into`: hard links to the closed ones, which
+    /// are never written again, and a copy of the one being appended to. Records outside that
+    /// range come too; what reads them skips them.
+    ///
+    /// # Errors
+    ///
+    /// If the log no longer holds `from`, or doesn't hold `to` yet, or linking or copying fails.
+    pub fn capture(&self, into: &Path, from: u64, to: u64) -> io::Result<()> {
+        if to < from {
+            return Ok(());
+        }
+        if from < self.segments[0] || to >= self.next_index {
+            let held = format!("{}..{}", self.segments[0], self.next_index);
+            return Err(io::Error::other(format!("the log holds {held}, not {from}..={to}")));
+        }
+        for (i, &first) in self.segments.iter().enumerate() {
+            let next = self.segments.get(i + 1).copied();
+            if next.is_some_and(|next| next <= from) || first > to {
+                continue;
+            }
+            let (segment, linked) = (segment_path(&self.dir, first), segment_path(into, first));
+            match next {
+                Some(_) => fs::hard_link(segment, linked)?,
+                None => drop(fs::copy(segment, linked)?),
+            }
+        }
+        Ok(())
+    }
+
     /// Discards the whole log, which a snapshot from the leader replaces: the next record is
     /// `next_index`.
     ///
@@ -814,5 +843,36 @@ mod tests {
         drop(log);
         let (log, found) = open(dir.path());
         assert_eq!((found, log.next_index()), (vec![3, 4], 5));
+    }
+
+    /// A capture takes the segments holding its range: the closed ones linked, so they're the
+    /// same files, the last copied, so the log appending to it later doesn't change it.
+    #[test]
+    fn a_capture_takes_the_segments_holding_its_range() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, _) = open(dir.path());
+        log.append(&test_records(1, 2)).unwrap();
+        for first in [3, 5] {
+            log.file_len = MAX_SEGMENT_BYTES;
+            log.append(&test_records(first, 2)).unwrap();
+        }
+        assert_eq!(log.segments, [1, 3, 5]);
+        let into = tempfile::tempdir().unwrap();
+        log.capture(into.path(), 4, 5).unwrap();
+        let taken = |name: u64| into.path().join(format!("{name:020}.log"));
+        assert!(!taken(1).exists(), "before the range");
+        assert_eq!(fs::metadata(taken(3)).unwrap().nlink(), 2, "closed: linked");
+        assert_eq!(fs::metadata(taken(5)).unwrap().nlink(), 1, "appended to: copied");
+        log.append(&test_records(7, 1)).unwrap();
+        let (_, found) = open(into.path());
+        assert_eq!(found, [3, 4, 5, 6], "as the log was");
+
+        assert!(log.capture(into.path(), 4, 8).is_err(), "not yet held");
+        log.compact_to(4).unwrap();
+        assert!(log.capture(into.path(), 2, 5).is_err(), "no longer held");
+        let none = tempfile::tempdir().unwrap();
+        log.capture(none.path(), 8, 7).unwrap();
+        assert_eq!(fs::read_dir(none.path()).unwrap().count(), 0, "an empty range takes nothing");
     }
 }

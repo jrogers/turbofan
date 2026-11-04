@@ -50,6 +50,11 @@
 //! then `serve` runs it as the one member of a new cluster, of a new epoch, which grows with
 //! `add-member`. What was applied after the snapshot is lost.
 //!
+//! `capture --admin <addr>` has that node copy its latest snapshot and its log from there to its
+//! commit index into `<data>/captures/` (see [`crate::capture`]): copy it off the node, then
+//! delete it there. `replay --capture <dir> [--to <n>]` replays one into this binary's service,
+//! printing every effect it makes, a line each: run it with two versions and diff them.
+//!
 //! The log isn't synced to disk: the other nodes' copies are the redundancy, and a crashed
 //! process loses nothing, but a majority losing power together may lose committed entries.
 //! `serve --fsync` syncs it once a batch, before acknowledging it.
@@ -59,15 +64,16 @@
 //! commands then take `--tls-ca <pem> --tls-cert <pem> --tls-key <pem>`, a certificate the admin
 //! CA signed. Only in a binary built with the `tls` feature; without it, the flags are refused.
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::driver::{self, serve};
 
-use crate::node::{self, Service};
+use crate::node::{self, Effect, Service};
 use crate::raft::{self, Member, NodeId};
-use crate::remote::{Admin, AdminError, ClusterStatus};
+use crate::remote::{Admin, AdminError, Captured, ClusterStatus};
 use crate::tls::{ClientTls, NodeTls};
 
 /// A new member may take a while to catch up.
@@ -78,7 +84,7 @@ const ADMIN_TOKEN: &str = "TURBOFAN_ADMIN_TOKEN";
 /// The peer token's environment variable.
 const PEER_TOKEN: &str = "TURBOFAN_PEER_TOKEN";
 /// The operators' commands.
-const COMMANDS: [&str; 9] = [
+const COMMANDS: [&str; 10] = [
     "snapshot",
     "add-member",
     "remove-member",
@@ -88,6 +94,7 @@ const COMMANDS: [&str; 9] = [
     "transfer-leadership",
     "promote",
     "status",
+    "capture",
 ];
 /// How often `add-member --wait` asks how far behind the new member is.
 const WAIT_POLL: Duration = Duration::from_secs(2);
@@ -108,6 +115,8 @@ const USAGE: &str = "usage:
   shutdown --admin <addr>
   promote --admin <learner's admin addr>
   activate --admin <addr> [--protocol <n>] [--service <n>]
+  capture --admin <addr>: that node's snapshot and log, in a directory of its data directory
+  replay --capture <dir> [--to <n>]: a capture into this service, printing what it does
 an operator's command, over TLS: [--tls-ca <pem> --tls-cert <pem> --tls-key <pem>]";
 
 /// Runs the command line for a node of `service`, which serves cluster `service_id`, with
@@ -147,6 +156,7 @@ pub fn run_with<S: Service + 'static>(
             runtime()?.block_on(serve(config, service)).map_err(|e| format!("node stopped: {e}"))
         }),
         Some("restore") => restore(&args[1..], service_id),
+        Some("replay") => replay(&args[1..], service),
         Some(command) if COMMANDS.contains(&command) => operate(command, &args[1..], service_id),
         _ => Err(USAGE.to_owned()),
     };
@@ -157,6 +167,42 @@ pub fn run_with<S: Service + 'static>(
             ExitCode::FAILURE
         }
     }
+}
+
+/// `replay`: a capture into `service`, printing each effect it makes, a line each, to compare
+/// with another version's: `<index> send <session> <payload in hex>`, and `schedule`, `cancel`,
+/// `close` and `propose` likewise.
+fn replay<S: Service>(args: &[String], service: S) -> Result<(), String> {
+    let to = parsed(args, "--to")?;
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let mut failed = Ok(());
+    let mut last = None;
+    let each = |index, effects: &[Effect]| {
+        last = Some(index);
+        for effect in effects {
+            let line = match effect {
+                Effect::Send(session, payload) => format!("{index} send {} {}", session.0, hex(payload)),
+                Effect::Schedule { id, at } => format!("{index} schedule {id} {at}"),
+                Effect::Cancel(id) => format!("{index} cancel {id}"),
+                Effect::Close(session) => format!("{index} close {}", session.0),
+                Effect::Propose(payload) => format!("{index} propose {}", hex(payload)),
+            };
+            if failed.is_ok() {
+                failed = writeln!(out, "{line}");
+            }
+        }
+    };
+    crate::capture::replay(flag(args, "--capture")?.as_ref(), service, to, each).map_err(|e| format!("replay: {e}"))?;
+    failed.and_then(|()| out.flush()).map_err(|e| format!("replay: {e}"))?;
+    match last {
+        Some(last) => eprintln!("replayed to entry {last}"),
+        None => eprintln!("no entries to replay after the snapshot"),
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `restore`: a data directory for `serve`, with the same flags, from a snapshot file.
@@ -188,9 +234,7 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
         "add-member" => {
             let member = Member { learner: args.iter().any(|a| a == "--learner"), ..member(&flag(args, "--member")?)? };
             let admin = admin.with_timeout(MEMBERS_REQUEST_TIMEOUT);
-            let wait = optional_flag(args, "--wait")?
-                .map(|n| n.parse::<u64>().map_err(|_| "--wait: a number of entries".to_owned()))
-                .transpose()?;
+            let wait: Option<u64> = parsed(args, "--wait")?;
             let runtime = runtime()?;
             let index = runtime.block_on(admin.add_member(&member)).map_err(failed)?;
             let what = if member.learner { "learner" } else { "member" };
@@ -213,11 +257,7 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             println!("member {id} is a {} from index {index}", if learner { "learner" } else { "voter" });
         }
         "activate" => {
-            let version = |name| {
-                let value = optional_flag(args, name)?;
-                value.map(|v: String| v.parse::<u32>().map_err(|_| format!("{name}: a number"))).transpose()
-            };
-            let (protocol, service) = (version("--protocol")?, version("--service")?);
+            let (protocol, service) = (parsed(args, "--protocol")?, parsed(args, "--service")?);
             let (protocol, service, index) =
                 runtime()?.block_on(activate(&admin, protocol, service)).map_err(failed)?;
             println!("protocol {protocol} and service version {service} active from index {index}");
@@ -233,13 +273,14 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             );
         }
         "transfer-leadership" => {
-            let to = optional_flag(args, "--to")?
-                .map(|to| to.parse().map_err(|_| "--to: a number from 1".to_owned()))
-                .transpose()?;
-            let leader = runtime()?.block_on(admin.transfer_leadership(to)).map_err(failed)?;
+            let leader = runtime()?.block_on(admin.transfer_leadership(parsed(args, "--to")?)).map_err(failed)?;
             println!("node {leader} leads");
         }
         "status" => print_status(&runtime()?.block_on(admin.status()).map_err(failed)?),
+        "capture" => {
+            let Captured { snapshot_index, to, dir, .. } = runtime()?.block_on(admin.capture()).map_err(failed)?;
+            println!("captured the snapshot of {snapshot_index} and the log to {to} in {dir}: copy it off the node");
+        }
         _ => unreachable!("one of COMMANDS"),
     }
     Ok(())
@@ -414,6 +455,11 @@ fn flag(args: &[String], name: &str) -> Result<String, String> {
 
 /// The value after `name`, if it's given. Given without one is an error, never taken for
 /// absent: a trailing `--wait` would otherwise not wait.
+/// A flag's value, if it's given, as a number.
+fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>, String> {
+    optional_flag(args, name)?.map(|v| v.parse().map_err(|_| format!("{name}: a number"))).transpose()
+}
+
 fn optional_flag(args: &[String], name: &str) -> Result<Option<String>, String> {
     let Some(at) = args.iter().position(|a| a == name) else { return Ok(None) };
     args.get(at + 1).cloned().map(Some).ok_or_else(|| format!("{name} needs a value"))

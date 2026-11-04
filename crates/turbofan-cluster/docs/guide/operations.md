@@ -73,6 +73,40 @@ snapshot, so clients reattach; one that saw messages or responses from after it 
 session (`CloseReason::Diverged`, see [Clients][clients]), to open another and ask the service
 what it has.
 
+## Capture and replay
+
+Every node applies the same entries, in the same order, at the times logged in them, so the log
+from a snapshot on replays offline to the same state and the same effects: to reproduce a bug
+from production in a debugger, check a new version of the service against real traffic, or audit
+what happened. `capture` has a node put its latest snapshot and its log after it, to its commit
+index, in a directory of its data directory; any member answers, a learner too, of what it has.
+Copy it off, then delete it on the node: its files are mostly hard links to the node's, so it
+costs little until the node compacts its log, then holds what that would have freed.
+
+```sh
+$ my-service capture --admin 10.0.0.2:7201
+captured the snapshot of 1830413 and the log to 1912870 in /var/lib/my-service/captures/1830413-1912870: copy it off the node
+$ scp -r 10.0.0.2:/var/lib/my-service/captures/1830413-1912870 captures/
+$ ssh 10.0.0.2 rm -r /var/lib/my-service/captures/1830413-1912870
+```
+
+`replay` restores a capture's snapshot into the binary's service and applies the entries, to
+`--to <index>` or all of them, printing every effect the service makes, a line each: `<index>
+send <session> <payload in hex>`, and likewise `schedule`, `cancel`, `close` and `propose`. Replay
+with the version that ran, and with the new one, and compare:
+
+```sh
+my-service-old replay --capture captures/1830413-1912870 > old.txt
+my-service replay --capture captures/1830413-1912870 > new.txt
+diff old.txt new.txt
+```
+
+In a test, or under a debugger, `turbofan_cluster::capture::replay` does the same with a closure
+for the effects, and returns the service, to look at its state. A capture starts at the node's
+latest snapshot: to replay from further back, keep more (`serve --keep-snapshots`) and capture
+before the next one. A newer version of the service must still read the old one's snapshots,
+which a rolling upgrade asks of it anyway (see [Upgrades][upgrades]).
+
 ## Rolling restarts
 
 To restart every node (for a new binary, a configuration change, or a new certificate), restart

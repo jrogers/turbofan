@@ -197,6 +197,9 @@ impl<S: Service> Node<S> {
         self.ctx.service_version = self.state.service_version;
         callback(&mut self.service, &mut self.ctx);
         let effects = std::mem::take(&mut self.ctx.effects);
+        if let Some(replayed) = &mut self.replayed {
+            replayed.extend(effects.iter().cloned());
+        }
         for effect in effects {
             match effect {
                 Effect::Send(session, payload) => self.egress(session, payload),

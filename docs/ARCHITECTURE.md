@@ -39,6 +39,7 @@ The cluster is built in layers, each tested on its own:
 | Node | `node/`: `sessions`, `apply`, `state`, `admin`, `service` | Raft plus what the log means: client sessions, de-duplication, egress rings, timers, the service's own proposals, admin requests, all applied to a `Service`. |
 | Storage | `log.rs`, `meta.rs`, `snapshot.rs` | The log in segment files, the term and vote in two alternating slots, snapshot files written whole or not at all. |
 | Driver | `driver.rs` | Runs a `Node` on tokio: listeners for peers, clients and operators, the disk on blocking threads, the batch loop. |
+| Capture | `capture.rs` | A node's snapshot and log from it to its commit index, made by the driver when asked; and replayed offline through a `Node` that isn't running Raft. |
 | Client | `client.rs`, `remote.rs` | A sans-IO gateway session (`Client`) that finds the leader and keeps a session across failovers, run over TCP by `ClusterClient`; operators' requests. |
 | Command line | `cli.rs` | `serve` and the operator commands, so a service's binary is one call to `run`. |
 | Metrics | `metrics.rs` | What a node counts, published by the driver through the `metrics` facade. |
