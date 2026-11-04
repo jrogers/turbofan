@@ -200,8 +200,13 @@ certificate names its node ID, as the DNS name `node-<id>.turbofan` beside its h
 is taken only as the node its certificate names. A node refuses a peer whose hello says another
 ID, and won't send to one whose certificate doesn't name the member it dialled. To turn it on in a
 running cluster, give every node a certificate naming its ID first, then restart the nodes with the
-flag one at a time. Certificates are read when the node starts, so replacing one is a
-rolling restart. A node with TLS and one without can't talk, so a cluster turns TLS on or off all
+flag one at a time. A node rereads its certificate, key and CA files every minute
+(`--tls-reload <secs>`, `NodeTls::reload_every`), and when one has changed, loads them again for
+the connections it makes and takes after; those open keep what they had. So a certificate or CA is
+replaced by rewriting its file, as cert-manager, a Vault agent or SPIRE does, with no restart.
+Files that don't load, half written, say, are left until they do, the node keeping what it had:
+`turbofan_tls_reloads{result="failed"}` counts them. Adding or taking away a CA, which changes
+what TLS is on, is still a restart. A node with TLS and one without can't talk, so a cluster turns TLS on or off all
 at once.
 
 Leave out `--tls-peer-ca` (`tls::NodeTls::admin_only`, with no peer CA) and only the admin listener

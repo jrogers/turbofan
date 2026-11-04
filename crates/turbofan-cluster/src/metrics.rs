@@ -17,6 +17,7 @@
 //! | `turbofan_sessions` | gauge | client sessions open |
 //! | `turbofan_in_doubt` | gauge | 1 while the node doubts its log, which dropped a damaged tail |
 //! | `turbofan_follower_lag_entries` | gauge, by `peer` | as leader, how far behind its log each member is |
+//! | `turbofan_tls_reloads` | counter, by `result` | TLS files found changed and loaded again (`ok`), or not loading (`failed`): see [`crate::tls`] |
 //! | `turbofan_persist_latency_seconds` | histogram | as leader, from its entry proposed to durable on its own disk |
 //! | `turbofan_commit_latency_seconds` | histogram | as leader, from its entry proposed to committed |
 //! | `turbofan_apply_latency_seconds` | histogram | as leader, from its entry proposed to applied, and answered |

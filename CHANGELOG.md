@@ -16,6 +16,10 @@ a patch version (0.1.1) doesn't.
   its node ID, as the DNS name `node-<id>.turbofan`, and takes a peer only as the node its
   certificate names: a node with another's certificate can't say it's that one, nor be sent its
   appends. Off by default; turn it on once every node's certificate names its ID.
+- Certificates reloaded without a restart: a node rereads its TLS files every minute
+  (`--tls-reload <secs>`, `NodeTls::reload_every`), and when they've changed and load, uses them
+  for the connections after. Files that don't load are left until they do, counted in
+  `turbofan_tls_reloads`.
 
 ### Breaking
 

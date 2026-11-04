@@ -22,6 +22,12 @@
 //! Without a peer CA ([`NodeTls::admin_only`]), only operators connect over TLS: peers and clients
 //! stay on plain TCP, so a cluster can put TLS on its admin listeners alone, one node at a time.
 //!
+//! A node rereads its files every [`NodeTls::reload_every`], and when they've changed, loads them
+//! again, for the connections made after: a certificate or CA is replaced by rewriting its file.
+//! Files that don't load, half written, say, are left until they do, the node keeping what it
+//! had, and counted in `turbofan_tls_reloads` (by `result`, `ok` or `failed`). What it has TLS on
+//! is as it started: a CA added or taken away is a restart.
+//!
 //! Only with the `tls` feature. Without it the API is the same, but loading any TLS
 //! configuration ([`ClientTls::load`], or `serve` with a [`NodeTls`]) is an
 //! [`io::ErrorKind::Unsupported`] error, so there is never TLS to run and every connection is
@@ -30,9 +36,11 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, BufStream};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 
 use crate::raft::NodeId;
 
@@ -66,7 +74,13 @@ pub struct NodeTls {
     /// certificate stands for any member. Only with a peer CA. Turn it on once every node's
     /// certificate names its ID; a wildcard name, `*.turbofan`, names every node.
     pub peer_ids: bool,
+    /// How often the node rereads the files, to load them again if they've changed: 60 seconds
+    /// by default. Not zero.
+    pub reload_every: Duration,
 }
+
+/// [`NodeTls::reload_every`]'s default.
+pub(crate) const RELOAD_EVERY: Duration = Duration::from_secs(60);
 
 impl NodeTls {
     /// The node's certificate `cert` and its `key`, the `peer_ca` that signed every node's, and
@@ -84,6 +98,7 @@ impl NodeTls {
             peer_ca: Some(peer_ca.into()),
             admin_ca: Some(admin_ca.into()),
             peer_ids: false,
+            reload_every: RELOAD_EVERY,
         }
     }
 
@@ -91,7 +106,14 @@ impl NodeTls {
     /// `admin_ca` that signed operators'. Peers and clients are plain TCP.
     #[must_use]
     pub fn admin_only(cert: impl Into<PathBuf>, key: impl Into<PathBuf>, admin_ca: impl Into<PathBuf>) -> Self {
-        Self { cert: cert.into(), key: key.into(), peer_ca: None, admin_ca: Some(admin_ca.into()), peer_ids: false }
+        Self {
+            cert: cert.into(),
+            key: key.into(),
+            peer_ca: None,
+            admin_ca: Some(admin_ca.into()),
+            peer_ids: false,
+            reload_every: RELOAD_EVERY,
+        }
     }
 }
 
@@ -141,10 +163,54 @@ pub(crate) struct Loaded {
 
 impl Loaded {
     pub(crate) fn load(tls: &NodeTls) -> io::Result<Self> {
+        if tls.reload_every.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS: reload_every is zero"));
+        }
         let (cluster, admin) = imp::acceptors(tls)?;
         let dial = tls.peer_ca.as_deref().map(|ca| ClientTls::load(ca, Some((&tls.cert, &tls.key)))).transpose()?;
         let (peer, client) = cluster.unzip();
         Ok(Self { peer, client, admin, dial, peer_ids: tls.peer_ids && tls.peer_ca.is_some() })
+    }
+}
+
+/// A node's TLS as it stands: its files' latest that loaded, or none for plain TCP.
+pub(crate) type Current = watch::Receiver<Option<Loaded>>;
+
+/// A node's TLS, if it has any, loaded; and what rereads it, to run as long as the node does.
+pub(crate) fn start(tls: Option<NodeTls>) -> io::Result<(Current, impl Future<Output = ()> + Send + 'static)> {
+    let (current, receiver) = watch::channel(tls.as_ref().map(Loaded::load).transpose()?);
+    let reloading = async move {
+        if let Some(tls) = tls {
+            reload(tls, current).await;
+        }
+    };
+    Ok((receiver, reloading))
+}
+
+/// Rereads `tls`'s files every [`NodeTls::reload_every`], and when they've changed and load, puts
+/// them in `current`.
+async fn reload(tls: NodeTls, current: watch::Sender<Option<Loaded>>) {
+    // Small files, a minute apart: read in place rather than on a blocking thread.
+    let read = |tls: &NodeTls| -> Vec<Option<Vec<u8>>> {
+        let paths = [Some(&tls.cert), Some(&tls.key), tls.peer_ca.as_ref(), tls.admin_ca.as_ref()];
+        paths.into_iter().flatten().map(|path| std::fs::read(path).ok()).collect()
+    };
+    let mut loaded = read(&tls);
+    loop {
+        tokio::time::sleep(tls.reload_every).await;
+        let files = read(&tls);
+        if files == loaded {
+            continue;
+        }
+        let result = match Loaded::load(&tls) {
+            Ok(new) => {
+                current.send_replace(Some(new));
+                loaded = files;
+                "ok"
+            }
+            Err(_) => "failed",
+        };
+        metrics::counter!("turbofan_tls_reloads", "result" => result).increment(1);
     }
 }
 
@@ -374,6 +440,7 @@ mod without {
                 peer_ca: Some(file("p")),
                 admin_ca: Some(file("a")),
                 peer_ids: false,
+                reload_every: std::time::Duration::from_secs(1),
             };
             assert_eq!(Loaded::load(&node).err().map(|e| e.kind()), Some(std::io::ErrorKind::Unsupported));
         }

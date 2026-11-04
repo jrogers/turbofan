@@ -105,7 +105,8 @@ const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
         [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
         [--election-timeout <ms>] [--heartbeat <ms>]
-        [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]]
+        [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]
+         [--tls-reload <secs>]] (the files reread every 60 seconds, or --tls-reload's)
         (without --tls-peer-ca, TLS on the admin listener only; without --tls-admin-ca,
         operators present no certificate, and the admin token says who they are)
   restore --from <snapshot file>, then serve's flags: a new cluster of one, this node
@@ -399,6 +400,12 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
 fn node_tls(args: &[String]) -> Result<Option<NodeTls>, String> {
     let (peer_ca, admin_ca) = (optional_flag(args, "--tls-peer-ca")?, optional_flag(args, "--tls-admin-ca")?);
     let peer_ids = args.iter().any(|a| a == "--tls-peer-ids");
+    let reload = optional_flag(args, "--tls-reload")?;
+    let reload_every = match &reload {
+        Some(secs) => secs.parse().ok().filter(|&n| n > 0).map(Duration::from_secs),
+        None => Some(crate::tls::RELOAD_EVERY),
+    };
+    let reload_every = reload_every.ok_or("--tls-reload: a number of seconds from 1")?;
     match tls_flags(args, ["--tls-cert", "--tls-key"])? {
         Some(_) if peer_ids && peer_ca.is_none() => Err("--tls-peer-ids takes --tls-peer-ca".into()),
         Some([cert, key]) => Ok(Some(NodeTls {
@@ -407,9 +414,10 @@ fn node_tls(args: &[String]) -> Result<Option<NodeTls>, String> {
             peer_ca: peer_ca.map(Into::into),
             admin_ca: admin_ca.map(Into::into),
             peer_ids,
+            reload_every,
         })),
-        None if peer_ca.is_some() || admin_ca.is_some() || peer_ids => {
-            Err("--tls-peer-ca, --tls-admin-ca and --tls-peer-ids take --tls-cert and --tls-key".into())
+        None if peer_ca.is_some() || admin_ca.is_some() || peer_ids || reload.is_some() => {
+            Err("--tls-peer-ca, --tls-admin-ca, --tls-peer-ids and --tls-reload take --tls-cert and --tls-key".into())
         }
         None => Ok(None),
     }
@@ -589,6 +597,11 @@ mod tests {
         let ids = node_tls(&args(&[&tls[..], &["--tls-peer-ca", "p", "--tls-peer-ids"]].concat())).unwrap().unwrap();
         assert!(ids.peer_ids);
         assert!(node_tls(&args(&[&tls[..], &["--tls-peer-ids"]].concat())).is_err(), "without a peer CA");
+        assert_eq!(ids.reload_every, Duration::from_secs(60));
+        let reload = node_tls(&args(&[&tls[..], &["--tls-reload", "5"]].concat())).unwrap().unwrap();
+        assert_eq!(reload.reload_every, Duration::from_secs(5));
+        assert!(node_tls(&args(&[&tls[..], &["--tls-reload", "0"]].concat())).is_err());
+        assert!(node_tls(&args(&["--tls-reload", "5"])).is_err(), "without a certificate");
         let all = node_tls(&args(&[&tls[..], &["--tls-peer-ca", "p"]].concat())).unwrap().unwrap();
         assert_eq!((all.peer_ca, all.peer_ids), (Some("p".into()), false));
         assert!(node_tls(&args(&["--tls-peer-ca", "p"])).is_err());

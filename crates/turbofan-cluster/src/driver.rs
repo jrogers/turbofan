@@ -35,7 +35,7 @@ use crate::metrics;
 use crate::node::{self, ConnId, Node, Service};
 use crate::pipeline::{self, Pipeline};
 use crate::raft::{Entries, MAX_READ_BYTES, Member, NodeId, Persist, SnapshotRead};
-use crate::tls::{self, Acceptor as TlsAcceptor, ClientTls, NodeTls};
+use crate::tls::{self, NodeTls};
 use crate::{snapshot, wire};
 
 /// Inputs waiting for the node, from clients and from the rest: past this, connections wait to
@@ -205,7 +205,8 @@ enum Input {
 /// stops; restart it, and it recovers from what's on disk.
 pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Result<()> {
     check_tokens(&config)?;
-    let tls = config.tls.as_ref().map(tls::Loaded::load).transpose()?;
+    let (tls, reloading) = tls::start(config.tls.clone())?;
+    let peer_ids = tls.borrow().as_ref().is_some_and(|t| t.peer_ids);
     let id = config.node.raft.id;
     let (mut storage, meta, snapshot, log) =
         Storage::open(&config.data_dir, config.log_fsync, config.node.raft.log_window_bytes)?;
@@ -233,24 +234,21 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     let epoch = Arc::new(AtomicU64::new(node.epoch()));
     let hello = Hello { service_id: config.service_id, node_id: Some(id), epoch };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
-    let (dial, tls_peers) = (tls.as_ref().and_then(|t| t.dial.clone()), tls.as_ref().and_then(|t| t.peer.clone()));
-    let peer_ids = tls.as_ref().is_some_and(|t| t.peer_ids);
-    let peers = accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls_peers, peer_ids, inputs.clone());
+    tasks.spawn(reloading);
+    let peers = accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls.clone(), peer_ids, inputs.clone());
     tasks.spawn(peers);
     let next_conn = Arc::new(AtomicU64::new(1));
-    let (tls_clients, idle) = (tls.as_ref().and_then(|t| t.client.clone()), Some(config.node.session_timeout));
+    let idle = Some(config.node.session_timeout);
     let clients = Gate {
         role: wire::Role::Client,
         hello: hello.clone(),
         token: None,
-        tls: tls_clients,
+        tls: tls.clone(),
         inputs: client_inputs,
         idle,
     };
     let token = config.admin_token.as_deref().map(Arc::from);
-    let (tls_admin, admin_inputs) = (tls.as_ref().map(|t| t.admin.clone()), inputs.clone());
-    let operators =
-        Gate { role: wire::Role::Admin, token, tls: tls_admin, inputs: admin_inputs, idle: None, ..clients.clone() };
+    let operators = Gate { role: wire::Role::Admin, token, inputs: inputs.clone(), idle: None, ..clients.clone() };
     tasks.spawn(accept(client_listener, clients, next_conn.clone()));
     tasks.spawn(accept(admin_listener, operators, next_conn));
     let contacts = config.peer_addrs.iter().map(|&(m, a)| (m, a.to_string())).collect();
@@ -265,7 +263,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
         published: Instant::now(),
         hello,
         peer_token: peer_token.unwrap_or_else(|| Arc::from(&[][..])),
-        tls: dial,
+        tls,
         peer_ids,
         contacts,
         peers: HashMap::new(),
@@ -295,8 +293,8 @@ struct Core<S> {
     hello: Hello,
     /// What its hellos to peers carry: [`Config::peer_token`], or nothing.
     peer_token: Arc<[u8]>,
-    /// What it dials peers with, if it has TLS.
-    tls: Option<ClientTls>,
+    /// Its TLS, as it stands: what it dials peers with, if it has it.
+    tls: tls::Current,
     /// Whether a peer's certificate must name the member dialled ([`NodeTls::peer_ids`]).
     peer_ids: bool,
     /// Peers to dial whatever the members are.
@@ -765,7 +763,7 @@ async fn accept_peers(
     listener: TcpListener,
     hello: Hello,
     token: Option<Arc<[u8]>>,
-    tls: Option<TlsAcceptor>,
+    tls: tls::Current,
     peer_ids: bool,
     inputs: mpsc::Sender<Input>,
 ) {
@@ -777,7 +775,8 @@ async fn accept_peers(
             tokio::time::sleep(ACCEPT_RETRY).await;
             continue;
         };
-        let (inputs, token, tls, hello) = (inputs.clone(), token.clone(), tls.clone(), hello.clone());
+        let tls = tls.borrow().as_ref().and_then(|t| t.peer.clone());
+        let (inputs, token, hello) = (inputs.clone(), token.clone(), hello.clone());
         conns.spawn(async move {
             let handshake = async {
                 let (mut stream, cert) = tls::accept(stream, tls.as_ref()).await?;
@@ -822,7 +821,8 @@ struct Gate {
     hello: Hello,
     /// The token their hellos must have, if there is one.
     token: Option<Arc<[u8]>>,
-    tls: Option<TlsAcceptor>,
+    /// The node's TLS, as it stands.
+    tls: tls::Current,
     inputs: mpsc::Sender<Input>,
     /// How long a connection may say nothing: for a client the session timeout, by which its
     /// session is gone.
@@ -849,6 +849,8 @@ async fn accept(listener: TcpListener, gate: Gate, next_conn: Arc<AtomicU64>) {
 /// it, until either side closes or nothing comes for `idle`.
 async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
     let Gate { role, hello, token, tls, inputs, idle } = gate;
+    let admin = role == wire::Role::Admin;
+    let tls = tls.borrow().as_ref().and_then(|t| if admin { Some(t.admin.clone()) } else { t.client.clone() });
     let handshake = async {
         let (mut stream, _) = tls::accept(stream, tls.as_ref()).await?;
         let first = read_frame(&mut stream).await?;
@@ -909,14 +911,15 @@ async fn dial_peer(
     addr: String,
     hello: Hello,
     token: Arc<[u8]>,
-    tls: Option<ClientTls>,
+    tls: tls::Current,
     node: Option<NodeId>,
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut batch = Vec::new();
     let mut redial = REDIAL;
     loop {
-        let connected = tokio::time::timeout(HELLO_TIMEOUT, tls::connect(&addr, tls.as_ref(), node)).await;
+        let dial = tls.borrow().as_ref().and_then(|t| t.dial.clone());
+        let connected = tokio::time::timeout(HELLO_TIMEOUT, tls::connect(&addr, dial.as_ref(), node)).await;
         let Ok(Ok(mut stream)) = connected else {
             tokio::time::sleep(redial).await;
             redial = backoff(redial);

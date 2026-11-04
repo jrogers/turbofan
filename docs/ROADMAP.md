@@ -7,7 +7,7 @@ down when they show.
 ## 1. Operating a cluster
 
 - **Security.** TLS (`src/tls.rs`, the `tls` feature): a peer certificate stands for the whole
-  cluster, not one node ID, unless `--tls-peer-ids`; certificates load at start, so rotating one is a rolling restart; and
+  cluster, not one node ID, unless `--tls-peer-ids`; and
   a cluster turns TLS on or off all at once, since a node with it and one without can't talk.
 - **Durability.** The log isn't fsynced by default (`Fsync::Never`, `src/log.rs`): the other
   nodes' copies are the redundancy, so a crashed process or a lost machine loses nothing, but a

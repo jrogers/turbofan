@@ -611,3 +611,39 @@ async fn peer_ids_take_a_peer_only_as_the_node_its_certificate_names() {
     assert!(matched(NodeId(1)) > 100 && matched(NodeId(2)) > 100, "{status:?}");
     assert_eq!(matched(NodeId(3)), 0, "node 3 was reached");
 }
+
+/// A certificate and CA rewritten in place are loaded again: after the node's files are swapped
+/// for a new CA's, a client trusting only the new CA gets through, and one trusting only the old
+/// doesn't.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_files_rewritten_are_loaded_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certs, rotated) = (dir.path().join("certs"), dir.path().join("rotated"));
+    std::fs::create_dir(&certs).unwrap();
+    std::fs::create_dir(&rotated).unwrap();
+    certify(&certs, "node");
+    certify(&rotated, "node");
+    let file = |name: &str| certs.join(name);
+    let mut tls = NodeTls::new(file("node.pem"), file("node.key"), file("node-ca.pem"), file("node-ca.pem"));
+    tls.reload_every = Duration::from_millis(100);
+    let mut cluster = Cluster::new(dir.path(), |_| Some(tls.clone()));
+    let addrs = cluster.client_addrs();
+    let client = |ca: &Path| {
+        let tls = ClientTls::load(ca, None).unwrap();
+        ClusterClient::connect_tls(addrs.clone(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500), tls).unwrap()
+    };
+    let old_ca = dir.path().join("old-ca.pem");
+    std::fs::copy(file("node-ca.pem"), &old_ca).unwrap();
+    let mut before = client(&old_ca);
+    exchange(&mut cluster, &mut before, 1, 50).await;
+
+    for name in ["node.pem", "node.key", "node-ca.pem"] {
+        std::fs::copy(rotated.join(name), file(name)).unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut after = client(&file("node-ca.pem"));
+    exchange(&mut cluster, &mut after, 1, 50).await;
+    let mut stale = client(&old_ca);
+    assert!(tokio::time::timeout(Duration::from_secs(2), stale.recv()).await.is_err(), "the old CA still taken");
+}
