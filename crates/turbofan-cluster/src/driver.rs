@@ -6,7 +6,9 @@
 //! by the node's rule, without waiting on the disk: a blocking thread writes a batch, reads back
 //! the log records the node asks for, and syncs, while the node goes on with its inputs, and
 //! then the task tells the node and sends what waited for it. The batches taken meanwhile are
-//! written together, with one sync, which is the group commit.
+//! written together, with one sync, which is the group commit. Except a few appends when the
+//! log doesn't sync: a copy to the page cache, made on the task, since the handing over and back
+//! took three times as long, on the path of every commit of a quiet cluster.
 //!
 //! Peer connections go one way: each node dials every other to send to it, and reads what
 //! arrives on the connections dialled to it. It dials the members, as they change, and the
@@ -44,6 +46,8 @@ use crate::{snapshot, wire};
 const MAX_QUEUED_INPUTS: usize = 4096;
 /// Inputs taken into one batch before persisting it.
 const MAX_BATCH_INPUTS: usize = 1024;
+/// The most a write made on the node's own task appends (see [`writes_inline`]).
+const MAX_INLINE_WRITE_BYTES: usize = 4096;
 /// Frames waiting to go to one peer or connection. Past this a peer's are dropped (Raft resends)
 /// and a client too slow to read is disconnected.
 const MAX_QUEUED_FRAMES: usize = 4096;
@@ -270,6 +274,8 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
         peers: HashMap::new(),
         dials: JoinSet::new(),
         conns: HashMap::new(),
+        inline_writes: config.log_fsync == Fsync::Never,
+        written_inline: None,
     };
     let peers = core.node.raft().peers();
     core.dial(&peers);
@@ -279,12 +285,17 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
 /// The node, and everything it sends through.
 struct Core<S> {
     node: Node<S>,
-    /// Away on a blocking thread while it persists.
+    /// Away on a blocking thread while it persists, unless the write is made here.
     storage: Option<Storage>,
     /// The node's batches, between taken and durable.
     pipeline: Pipeline,
     /// The write under way, and the storage back with it.
     writing: Option<JoinHandle<Written>>,
+    /// Whether a small write is made on this task ([`writes_inline`]): only when the log doesn't
+    /// sync, so a write is a copy to the page cache.
+    inline_writes: bool,
+    /// A write made on this task, for the node to be told of before it takes more inputs.
+    written_inline: Option<Written>,
     /// Where snapshots are saved, apart from the batches, reporting back on `inputs`.
     snapshots: PathBuf,
     inputs: mpsc::Sender<Input>,
@@ -310,6 +321,10 @@ impl<S: Service + 'static> Core<S> {
     async fn run(mut self, mut rx: mpsc::Receiver<Input>, mut client_rx: mpsc::Receiver<Input>) -> io::Result<()> {
         loop {
             self.flush();
+            if let Some(written) = self.written_inline.take() {
+                self.written(written)?;
+                continue;
+            }
             if self.published.elapsed() >= METRICS_EVERY {
                 self.published = Instant::now();
                 self.node.metrics(self.clock.now()).publish();
@@ -395,6 +410,11 @@ impl<S: Service + 'static> Core<S> {
         }
         if let Some(batches) = taken.write {
             let mut storage = self.storage.take().expect("storage is back between writes");
+            if self.inline_writes && writes_inline(&batches) {
+                let done = storage.write(&batches);
+                self.written_inline = Some(Written { storage, done });
+                return;
+            }
             self.writing = Some(tokio::task::spawn_blocking(move || {
                 let done = storage.write(&batches);
                 Written { storage, done }
@@ -605,6 +625,25 @@ struct Written {
 /// What a write read: records, snapshot chunks (index, offset, bytes), and the answers to
 /// captures, for admin connections.
 type Done = (Vec<Vec<u8>>, Vec<(u64, u64, Vec<u8>)>, Vec<(ConnId, Vec<u8>)>);
+
+/// Whether to make the write of `batches` on the node's own task rather than a blocking thread:
+/// a few appends, nothing read back or captured. Handed to a thread and back, such a write took
+/// three times as long as it does here: on the path of every commit when the cluster is quiet.
+/// A busy node's batches are bigger, and go to a thread, for the node to go on while they're
+/// written.
+fn writes_inline(batches: &[pipeline::Batch]) -> bool {
+    let mut bytes = 0;
+    for batch in batches {
+        if !batch.reads.is_empty() || !batch.snapshot_reads.is_empty() || !batch.captures.is_empty() {
+            return false;
+        }
+        for op in &batch.persist {
+            let Persist::Append(records) = op else { return false };
+            bytes += records.len();
+        }
+    }
+    bytes <= MAX_INLINE_WRITE_BYTES
+}
 
 /// How far the clock is slewed toward the wall clock: up to this many parts per million faster
 /// or slower than the monotonic clock, as NTP slews.
@@ -1009,6 +1048,30 @@ mod tests {
         let indices: Vec<u64> = crate::codec::records(&reads[0]).map(|r| r.unwrap().index).collect();
         assert_eq!(indices, [1, 2, 3], "the read follows its own batch's append, not the next");
         assert_eq!(storage.log.next_index(), 5);
+    }
+
+    /// A write is made on the node's task only if it's appends alone, of at most
+    /// `MAX_INLINE_WRITE_BYTES` across its batches: anything else, or more, goes to a thread.
+    #[test]
+    fn only_a_few_appends_are_written_inline() {
+        let append = |bytes| {
+            let (reads, snapshot_reads, captures) = (Vec::new(), Vec::new(), Vec::new());
+            pipeline::Batch { persist: vec![Persist::Append(vec![0; bytes])], reads, snapshot_reads, captures }
+        };
+        let half = MAX_INLINE_WRITE_BYTES / 2;
+        assert!(writes_inline(&[append(half), append(half)]), "at the limit, across batches");
+        assert!(!writes_inline(&[append(half), append(half + 1)]), "a byte over");
+        assert!(writes_inline(&[]));
+        let compact = Persist::Compact { log: 1, snapshot: 1 };
+        let not_inline = [
+            pipeline::Batch { persist: vec![compact], ..append(1) },
+            pipeline::Batch { reads: vec![1], ..append(1) },
+            pipeline::Batch { snapshot_reads: vec![SnapshotRead { index: 1, offset: 0 }], ..append(1) },
+            pipeline::Batch { captures: vec![node::Capture { conn: 1, request_id: 1, to: 1 }], ..append(1) },
+        ];
+        for batch in not_inline {
+            assert!(!writes_inline(&[append(1), batch]), "not appends alone");
+        }
     }
 
     /// A capture in a batch sees the batch's appends, and starts after the snapshot: here a log

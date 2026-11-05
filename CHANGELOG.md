@@ -33,6 +33,9 @@ a patch version (0.1.1) doesn't.
 - Client connections over TLS, both ends, buffer what they write and read: each frame was a TLS
   record and a system call of its own, made holding the lock the connection's reader waited on.
   The benchmark's throughput over TLS is four times what it was, as it is without TLS.
+- Without fsync, a node writes a few appends on its own task rather than handing them to a
+  blocking thread, whose handing over and back took three times as long as the write: the
+  benchmark's latency, 66 µs at p50 and 105 µs at p99, is 56 µs and about 85 µs.
 
 ### Breaking
 

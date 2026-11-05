@@ -28,7 +28,9 @@ commit. The busier the cluster, the bigger the batches.
 - **fsync.** Without `--fsync` (the default), a write is the page cache's, and the follower's
   copy is the redundancy (see [Running a cluster][running]). With it, every batch waits for the
   disk: on a fast NVMe drive a little, on network storage a lot. Choose with the benchmark on your
-  hardware.
+  hardware. Without it, a node writes a few appends on its own task, a copy to the page cache,
+  rather than handing them to a thread and back, which took longer than the write: a quiet
+  cluster's commits are the quicker for it.
 - **The service.** Every message is applied on every node, one at a time, on the node's one task.
   A slow callback holds up everything after it. Keep callbacks to the state change and the
   responses; work that can wait goes in a proposal of its own, and work outside the state machine
