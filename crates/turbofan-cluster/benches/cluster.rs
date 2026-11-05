@@ -6,7 +6,9 @@
 //! queues. Then several clients each keeping many in flight, as a gateway does, answering the
 //! responses that have arrived with a batch of as many: throughput, the latency then mostly
 //! waiting in line. Messages are 64 bytes, answered with 8. Each run measures for `BENCH_SECS`
-//! (10 by default) after a second's warm-up.
+//! (10 by default) after a second's warm-up. `BENCH_THROUGHPUT=<clients>x<in flight>` sets the
+//! throughput run's shape (`8x256` by default), each client's at most
+//! [`MAX_UNACKED`](turbofan_cluster::client::MAX_UNACKED).
 //!
 //! With `--features tls`, all the runs again on a cluster over TLS, everywhere: peers, clients.
 //!
@@ -27,7 +29,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use turbofan_cluster::client::Event;
+use turbofan_cluster::client::{Event, MAX_UNACKED};
 use turbofan_cluster::driver::{self, serve};
 use turbofan_cluster::raft::{self, NodeId};
 use turbofan_cluster::tls::{ClientTls, NodeTls};
@@ -113,6 +115,7 @@ impl Service for Ack {
 #[tokio::main]
 async fn main() {
     let secs = std::env::var("BENCH_SECS").map_or(10, |s| s.parse().expect("BENCH_SECS is a number"));
+    let shape = throughput_shape();
     let cpus = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
     println!(
         "Three nodes on one machine ({}, {cpus} CPUs), {PAYLOAD_BYTES}-byte messages, {secs}s a run.",
@@ -139,7 +142,9 @@ async fn main() {
             let (addrs, tls) = start(&dir, tls, fsync);
             // Once a client has a session, there's a leader.
             drop(connect(&addrs, tls.as_ref()).await);
-            for (name, msgs, row, stage_row, reattached) in bench(&addrs, tls.as_ref(), fsync, secs, &stages).await {
+            for (name, msgs, row, stage_row, reattached) in
+                bench(&addrs, tls.as_ref(), fsync, secs, shape, &stages).await
+            {
                 stage_rows.push(stage_row);
                 if reattached > 0 {
                     warnings.push(format!(
@@ -148,22 +153,7 @@ async fn main() {
                     ));
                 }
                 results.push_str(&format!("{name}\t{msgs}\n"));
-                let Some(baseline) = &baseline else {
-                    println!("{row}");
-                    continue;
-                };
-                let Some(&(_, then)) = baseline.iter().find(|&&(r, _)| r == name) else {
-                    println!("{row} new |");
-                    continue;
-                };
-                let percent = msgs * 100 / then.max(1);
-                let flagged = percent < REGRESSION_PERCENT;
-                println!("{row} {percent}%{} |", if flagged { " ⚠️" } else { "" });
-                if flagged {
-                    warnings.push(format!(
-                        "::warning title=Benchmark regression::{name}: {msgs} msgs/s, {percent}% of main's {then}"
-                    ));
-                }
+                println!("{row}{}", compared(&name, msgs, baseline.as_deref(), &mut warnings));
             }
         }
     }
@@ -184,19 +174,45 @@ async fn main() {
     }
 }
 
-/// Both runs on the cluster at `addrs`: each one's name, msgs/s, table row, row of stages, and
-/// how many times its clients reattached.
+/// A run's cell comparing its `msgs` with `baseline`'s, if there's a baseline; a regression is
+/// flagged there, and warned of.
+fn compared(name: &str, msgs: u64, baseline: Option<&[(&str, u64)]>, warnings: &mut Vec<String>) -> String {
+    let Some(baseline) = baseline else { return String::new() };
+    let Some(&(_, then)) = baseline.iter().find(|&&(r, _)| r == name) else { return " new |".into() };
+    let percent = msgs * 100 / then.max(1);
+    let flagged = percent < REGRESSION_PERCENT;
+    if flagged {
+        warnings
+            .push(format!("::warning title=Benchmark regression::{name}: {msgs} msgs/s, {percent}% of main's {then}"));
+    }
+    format!(" {percent}%{} |", if flagged { " ⚠️" } else { "" })
+}
+
+/// The throughput run's clients and messages in flight each, from `BENCH_THROUGHPUT`.
+fn throughput_shape() -> (usize, usize) {
+    let shape = std::env::var("BENCH_THROUGHPUT").unwrap_or_else(|_| "8x256".into());
+    shape
+        .split_once('x')
+        .and_then(|(clients, window)| Some((clients.parse().ok()?, window.parse().ok()?)))
+        .filter(|&(clients, window)| clients > 0 && (1..=MAX_UNACKED).contains(&window))
+        .expect("BENCH_THROUGHPUT is <clients>x<in flight>, at most MAX_UNACKED in flight a client")
+}
+
+/// Both runs on the cluster at `addrs`, the throughput run's `(clients, in flight)` as
+/// `shape`: each one's name, msgs/s, table row, row of stages, and how many times its
+/// clients reattached.
 async fn bench(
     addrs: &[String],
     tls: Option<&ClientTls>,
     fsync: driver::Fsync,
     secs: u64,
+    shape: (usize, usize),
     stages: &Stages,
 ) -> Vec<(String, u64, String, String, usize)> {
     let mut rows = Vec::new();
     let over = if tls.is_some() { ", TLS" } else { "" };
     let over = if fsync == driver::Fsync::EachBatch { format!("{over}, fsync") } else { over.to_owned() };
-    for (name, clients, window) in [("latency", 1, 1), ("throughput", 8, 256)] {
+    for (name, clients, window) in [("latency", 1, 1), ("throughput", shape.0, shape.1)] {
         let (mut latencies, by_stage, reattached) = run(addrs, tls, clients, window, secs, stages).await;
         latencies.sort_unstable();
         let at = |q: usize| per_mille(&latencies, q);
@@ -241,7 +257,8 @@ fn start(dir: &Path, tls: bool, fsync: driver::Fsync) -> (Vec<String>, Option<Cl
         .collect();
     for id in ids {
         let mut node = node::Config::new(id, members.clone());
-        node.egress_ring_entries = 1024;
+        // Every response a client can have in flight, kept for it.
+        node.egress_ring_entries = MAX_UNACKED;
         let peers = ids.iter().map(|&m| (m, addr(0, m))).collect();
         let mut config =
             driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(3, id), addr(6, id));

@@ -56,7 +56,8 @@ It runs three nodes on one machine, over real TCP and files, with and without fs
 `--features tls`, over TLS too). For each, one client with one message in flight, for latency,
 then several clients with many in flight, for throughput: messages per second, and latency from
 p50 to the maximum. A second table splits the time between persisted, committed and applied.
-`BENCH_SECS` sets how long each run measures (10 s by default).
+`BENCH_SECS` sets how long each run measures (10 s by default), and
+`BENCH_THROUGHPUT=<clients>x<in flight>` the throughput run's shape (`8x256` by default).
 
 Three nodes on one machine share its disk and CPUs, and talk over loopback, so the numbers are
 for comparing changes and configurations, not a promise for a real cluster: measure your own.
