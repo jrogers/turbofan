@@ -1315,4 +1315,52 @@ mod tests {
         // A monotonic reading behind the last changes nothing.
         assert_eq!(clock.advance(SECOND, base), at);
     }
+
+    /// With `peer_ids`, a peer dialling in is taken only as the node its certificate names: one
+    /// with node 1's, saying it's node 1, is; saying it's node 3, it's dropped, whatever it sends.
+    /// The dialling side checks the node it dials, so a cluster test can't see this side's check.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn a_peer_dialling_in_is_taken_only_as_the_node_its_certificate_names() {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| dir.path().join(name);
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        std::fs::write(file("ca.pem"), ca.pem()).unwrap();
+        for id in [1, 2] {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(["127.0.0.1".to_owned(), format!("node-{id}.turbofan")]).unwrap();
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+            std::fs::write(file(&format!("node-{id}.pem")), params.signed_by(&key, &ca).unwrap().pem()).unwrap();
+            std::fs::write(file(&format!("node-{id}.key")), key.serialize_pem()).unwrap();
+        }
+        let mut node_tls = NodeTls::new(file("node-2.pem"), file("node-2.key"), file("ca.pem"), file("ca.pem"));
+        node_tls.peer_ids = true;
+        let (current, _reloading) = tls::start(Some(node_tls)).unwrap();
+        let hello = |id| Hello { service_id: 7, node_id: Some(NodeId(id)), epoch: Arc::new(AtomicU64::new(0)) };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (inputs, mut received) = mpsc::channel(16);
+        tokio::spawn(accept_peers(listener, hello(2), None, current, true, inputs));
+
+        let dialler = tls::ClientTls::load(&file("ca.pem"), Some((&file("node-1.pem"), &file("node-1.key")))).unwrap();
+        for (claims, taken) in [(1, true), (3, false)] {
+            let mut conn = tls::connect(&addr, Some(&dialler), None).await.unwrap();
+            let theirs = hello(claims).frame(wire::Role::Peer, b"");
+            // After the hello, a frame that decodes: what a peer taken hands the node.
+            write_frames(&mut conn, [&theirs[..], &theirs[..]]).await.unwrap();
+            let input = tokio::time::timeout(Duration::from_secs(2), received.recv()).await;
+            match input {
+                Ok(Some(Input::Peer(from, _))) => assert!(taken, "taken as node {from}"),
+                Err(_) => assert!(!taken, "node {claims} wasn't taken"),
+                Ok(_) => panic!("not a peer's input"),
+            }
+            if !taken {
+                let closed = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut conn)).await;
+                assert!(closed.expect("dropped, not left open").is_err(), "a frame from a node that only reads");
+            }
+        }
+    }
 }

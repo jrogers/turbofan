@@ -589,13 +589,16 @@ mod tests {
         assert_eq!(client.send(b"next".to_vec()), Ok(5));
     }
 
-    /// A batch any of which would be refused sends none: one too long, one that doesn't fit under
-    /// `MAX_UNACKED` though some of it would, and one after the session closed.
+    /// A batch any of which would be refused sends none: one too long, one more than
+    /// `MAX_UNACKED` with none waiting, one that doesn't fit though some of it would, and one
+    /// after the session closed.
     #[test]
     fn a_batch_is_sent_whole_or_not_at_all() {
         let mut client = open();
         let too_long = [vec![0; 1], vec![0; MAX_PAYLOAD_BYTES + 1]];
         assert_eq!(client.send_batch(too_long), Err(SendError::TooLong));
+        assert_eq!(client.send_batch(vec![vec![0]; MAX_UNACKED + 1]), Err(SendError::Full));
+        assert_eq!(client.unacked(), 0);
         client.send_batch(vec![vec![0]; MAX_UNACKED - 1]).unwrap();
         client.take_frames();
         assert_eq!(client.send_batch([vec![0], vec![0]]), Err(SendError::Full));
@@ -610,12 +613,15 @@ mod tests {
         assert_eq!(client.send_batch([vec![0]]), Err(SendError::Closed));
     }
 
-    /// A payload of the most a payload can be is sent; one byte more is refused.
+    /// A payload of the most a payload can be is sent, alone or in a batch; one byte more is
+    /// refused.
     #[test]
     fn a_payload_of_the_limit_is_sent() {
         let mut client = open();
         assert!(client.send(vec![0; MAX_PAYLOAD_BYTES]).is_ok());
         assert_eq!(client.send(vec![0; MAX_PAYLOAD_BYTES + 1]), Err(SendError::TooLong));
+        assert!(client.send_batch([vec![0; MAX_PAYLOAD_BYTES]]).is_ok());
+        assert_eq!(client.send_batch([vec![0; MAX_PAYLOAD_BYTES + 1]]), Err(SendError::TooLong));
     }
 
     fn opened(applied_seq: u64, last_egress_seq: u64) -> Vec<u8> {

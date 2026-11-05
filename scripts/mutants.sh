@@ -9,6 +9,7 @@
 # does: 0 if every mutant was caught, 2 if some were missed, 3 if some timed out. Some mutants can't
 # be caught, being the same as the code: see a missed one's line before writing a test for it.
 # Doctests aren't run against mutants: they take long to build, and the other tests cover them.
+# With the `tls` feature: without it, the TLS code isn't built, and its every mutant passes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,4 +21,4 @@ if [[ ! -s $diff ]]; then
     echo "no Rust changed since $base"
     exit 0
 fi
-cargo mutants --in-diff "$diff" --jobs "${MUTANTS_JOBS:-2}" --no-shuffle -- --tests
+cargo mutants --in-diff "$diff" --features turbofan-cluster/tls --jobs "${MUTANTS_JOBS:-2}" --no-shuffle -- --tests

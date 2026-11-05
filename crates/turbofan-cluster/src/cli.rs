@@ -243,7 +243,7 @@ fn operate(command: &str, args: &[String], service_id: u32) -> Result<(), String
             println!("snapshot taken at index {index}");
         }
         "add-member" => {
-            let member = Member { learner: args.iter().any(|a| a == "--learner"), ..member(&flag(args, "--member")?)? };
+            let member = member_to_add(args)?;
             let admin = admin.with_timeout(MEMBERS_REQUEST_TIMEOUT);
             let wait: Option<u64> = parsed(args, "--wait")?;
             let runtime = runtime()?;
@@ -507,6 +507,11 @@ fn member(text: &str) -> Result<Member, String> {
     Ok(Member { id, peer: peer.to_string(), client: client.to_string(), admin: admin.to_string(), learner: false })
 }
 
+/// `add-member`'s member: `--member`, a learner with `--learner`.
+fn member_to_add(args: &[String]) -> Result<Member, String> {
+    Ok(Member { learner: args.iter().any(|a| a == "--learner"), ..member(&flag(args, "--member")?)? })
+}
+
 /// `--learners 3,4`, if given: some of `members`, not all.
 fn learners(args: &[String], members: &[NodeId]) -> Result<Vec<NodeId>, String> {
     if !args.iter().any(|a| a == "--learners") {
@@ -541,7 +546,7 @@ fn members(list: &str) -> Result<Vec<(NodeId, SocketAddr)>, String> {
 mod tests {
     use std::time::Duration;
 
-    use super::{learners, node_tls, optional_flag, serve_config, tls_flags, tune};
+    use super::{learners, member_to_add, node_tls, optional_flag, serve_config, tls_flags, tune};
     use crate::driver::Fsync;
     use crate::raft::NodeId;
 
@@ -571,6 +576,19 @@ mod tests {
         assert!(tuned(&["--heartbeat", "1000"]).is_err(), "a heartbeat not under half the timeout");
         assert!(tuned(&["--election-timeout", "0"]).is_err());
         assert!(tuned(&["--keep-snapshots", "x"]).is_err());
+    }
+
+    /// `add-member` adds a voter, or with `--learner`, a learner.
+    #[test]
+    fn add_member_adds_a_learner_with_learner() {
+        let args = |extra: &[&str]| {
+            let base = ["--admin", "127.0.0.1:3", "--member", "4=127.0.0.1:1,127.0.0.1:2,127.0.0.1:3"];
+            base.iter().chain(extra).map(|&s| s.to_owned()).collect::<Vec<_>>()
+        };
+        let voter = member_to_add(&args(&[])).unwrap();
+        assert_eq!((voter.id, voter.peer.as_str(), voter.learner), (NodeId(4), "127.0.0.1:1", false));
+        assert!(member_to_add(&args(&["--learner"])).unwrap().learner);
+        assert!(member_to_add(&args(&[])[..2]).is_err(), "no --member");
     }
 
     /// All the TLS flags or none; one without its value is refused, never read as no TLS.

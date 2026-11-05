@@ -382,6 +382,46 @@ fn a_follower_redirects_clients_to_the_leader() {
     assert!(sent[0].contains("leader: 1, addr: [110, 49]"), "{sent:?}");
 }
 
+/// What a node had to send its clients still goes when it becomes leader, or stops leading,
+/// before the driver takes it: a redirect from before its election, and an ack of a keepalive
+/// before a leader of a later term was heard.
+#[test]
+fn sends_queued_across_a_change_of_leader_go() {
+    let mut node = leader();
+    let session = open(&mut node, 1, 0);
+    let mut keepalive = Vec::new();
+    codec::encode_frame(&wire::KeepAlive { session: session.0 }, &mut keepalive).unwrap();
+    node.on_client(1, &codec::decode_frame(&keepalive).unwrap().unwrap().0, 1);
+    let mut frame = Vec::new();
+    let append = wire::AppendEntries {
+        term: 2,
+        leader: 2,
+        prev_index: 0,
+        prev_term: 0,
+        commit: 0,
+        count: 0,
+        entries: &[],
+        last_index: 0,
+    };
+    codec::encode_frame(&append, &mut frame).unwrap();
+    node.on_peer(NodeId(2), &codec::decode_frame(&frame).unwrap().unwrap().0, 2);
+    assert_ne!(node.raft().role(), Role::Leader);
+    let sent = drive(&mut node);
+    assert!(sent[0].contains("KeepAliveAck"), "{sent:?}");
+    assert!(sent[1].contains("Redirect"), "{sent:?}");
+
+    // A node not yet elected redirects a client, then is elected before that's taken.
+    let mut node = Node::new(leader().config, Recorder::default(), Meta::default(), None, Entries::default(), 0);
+    let mut connect = Vec::new();
+    codec::encode_frame(&wire::Connect { credentials: b"" }, &mut connect).unwrap();
+    node.on_client(1, &codec::decode_frame(&connect).unwrap().unwrap().0, 0);
+    let deadline = node.next_deadline();
+    node.on_tick(deadline);
+    let sent = drive(&mut node);
+    assert!(sent.first().is_some_and(|s| s.contains("Redirect")), "{sent:?}");
+    assert!(node.is_ready());
+}
+
 /// An operator switches the cluster to versions every member has, at a point in the log;
 /// not to ones a member lacks, or back.
 #[test]
