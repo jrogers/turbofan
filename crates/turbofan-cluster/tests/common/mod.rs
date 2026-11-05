@@ -14,6 +14,8 @@ use turbofan_cluster::raft::{self, NodeId};
 use turbofan_cluster::tls::NodeTls;
 use turbofan_cluster::{ClusterClient, Ctx, Service, SessionId, SnapshotWriter, node};
 
+pub mod proxy;
+
 pub const SERVICE_ID: u32 = 7;
 /// The operators' token.
 pub const TOKEN: &[u8] = b"let me in";
@@ -67,16 +69,29 @@ pub fn ports(n: usize) -> Vec<SocketAddr> {
 }
 
 pub struct Cluster {
-    /// Peers', then clients', then operators' addresses, four of each.
+    /// Peers', then clients', then operators' addresses, four of each; and, with a proxy, the
+    /// peer listeners' own, behind it.
     pub addrs: Vec<SocketAddr>,
     pub configs: Vec<driver::Config>,
     pub nodes: Vec<Option<JoinHandle<std::io::Result<()>>>>,
+    /// The proxy between the nodes, if there's one ([`Cluster::proxied`]).
+    pub proxy: Option<proxy::Proxy>,
 }
 
 impl Cluster {
     /// Three members started, and a fourth that can join.
     pub fn new(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>) -> Self {
-        let addrs = ports(12);
+        Self::with(dir, tls, false)
+    }
+
+    /// As [`Cluster::new`], over plain TCP, with a [`proxy::Proxy`] between the nodes: the
+    /// members' peer addresses are the proxy's, which forwards to each node's own.
+    pub fn proxied(dir: &Path) -> Self {
+        Self::with(dir, |_| None, true)
+    }
+
+    fn with(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>, proxied: bool) -> Self {
+        let addrs = ports(if proxied { 16 } else { 12 });
         let ids: Vec<NodeId> = [1, 2, 3, 4].map(NodeId).into();
         let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
         let members: Vec<raft::Member> = ids[..3].iter().map(|&id| member(&addrs, id)).collect();
@@ -86,8 +101,10 @@ impl Cluster {
                 let mut node = node::Config::new(id, if id == NodeId(4) { Vec::new() } else { members.clone() });
                 node.snapshot_every_entries = 50;
                 node.egress_ring_entries = 1024;
-                // The first three know nothing of the fourth until it's added.
-                let peers = ids.iter().filter(|&&m| m <= id.max(NodeId(3))).map(|&m| (m, addr(0, m))).collect();
+                // The first three know nothing of the fourth until it's added. A node listens at its
+                // own address, behind the proxy if there is one, and dials the others' through it.
+                let known = ids.iter().filter(|&&m| m <= id.max(NodeId(3)));
+                let peers = known.map(|&m| (m, if proxied && m == id { addr(12, m) } else { addr(0, m) })).collect();
                 let mut config =
                     driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(4, id), addr(8, id));
                 config.admin_token = Some(TOKEN.to_vec());
@@ -96,7 +113,9 @@ impl Cluster {
                 config
             })
             .collect();
-        let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None] };
+        let proxy =
+            proxied.then(|| proxy::Proxy::start(ids.iter().map(|&id| (id, addr(0, id), addr(12, id))).collect()));
+        let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None], proxy };
         for i in 0..3 {
             cluster.start(i);
         }

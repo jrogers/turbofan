@@ -2,7 +2,8 @@
 //! order while every node in turn, the leader among them, is killed and restarted from disk, and
 //! while a fourth joins and the first leaves; a fourth, a learner, promoted to a cluster of its
 //! own once the three are lost, that they can't take back; the three, lost, restored from a
-//! copy of a snapshot; and a node's capture of its log replayed offline.
+//! copy of a snapshot; a leader cut off from the others, over a proxy between the nodes,
+//! replaced; and a node's capture of its log replayed offline.
 
 use std::io;
 use std::path::Path;
@@ -15,8 +16,60 @@ use turbofan_cluster::raft::{self, NodeId};
 use turbofan_cluster::tls::{ClientTls, NodeTls};
 use turbofan_cluster::{Admin, AdminError, CloseReason, ClusterClient, Effect, capture};
 
+#[allow(dead_code, reason = "the tests share it; these use only some of it")]
 mod common;
 use common::*;
+
+/// Over a proxy between the nodes: the leader, cut off from the others, is replaced by one of
+/// them, while a client's messages go on being answered; healed, it follows the new leader, and
+/// catches up. The proxy's own check, too: its cut really cuts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_isolated_leader_is_replaced_and_follows_once_healed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::proxied(dir.path());
+    let admins: Vec<Admin> = cluster
+        .configs
+        .iter()
+        .map(|c| {
+            Admin::new(c.admin_listen.to_string(), SERVICE_ID).with_token(TOKEN).with_timeout(Duration::from_secs(10))
+        })
+        .collect();
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 50).await;
+    let old = admins[0].status().await.unwrap().leader;
+    let ids = [NodeId(1), NodeId(2), NodeId(3)];
+    cluster.proxy.as_ref().unwrap().isolate(old, &ids);
+
+    // Asked through another node, which redirects to the leader it knows.
+    let other = &admins[usize::from(if old == NodeId(1) { NodeId(2) } else { NodeId(1) }) - 1];
+    let mut new = old;
+    for _ in 0..100 {
+        if let Ok(status) = other.status().await
+            && status.leader != old
+        {
+            new = status.leader;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_ne!(new, old, "another node elected");
+    exchange(&mut cluster, &mut client, 51, 100).await;
+
+    cluster.proxy.as_ref().unwrap().heal();
+    exchange(&mut cluster, &mut client, 101, 150).await;
+    let mut caught_up = false;
+    for _ in 0..100 {
+        let status = other.status().await.unwrap();
+        assert_eq!(status.leader, new, "the new leader stays");
+        if status.lag(old) == Some(0) {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(caught_up, "the old leader caught up");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cluster_answers_every_message_once_through_failovers() {

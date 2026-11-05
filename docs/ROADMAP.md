@@ -32,10 +32,11 @@ down when they show.
   `Cluster` says of a node.
 - **Faults the simulation doesn't reach.** The simulation (`tests/sim.rs`) runs the node and the
   pipeline, not the driver, the client or TLS, which only the cluster tests and the soak
-  (`tests/soak.rs`) run, over real TCP. The soak kills nodes; nothing yet partitions them, or
-  stalls, slows or drops what a connection carries under load. A proxy between the soak's nodes
-  that does is the cheaper start, the driver's IO in the simulation the thorough one; and the soak
-  over TLS too.
+  (`tests/soak.rs`) run, over real TCP. The soak kills nodes, and through a proxy between them
+  (`tests/common/proxy.rs`) cuts, stalls and slows the links between them under load. What's left:
+  faults between clients and nodes, which the proxy doesn't stand between; the soak over TLS,
+  where the proxy can't read a hello to tell one link from another; and the driver's IO in the
+  simulation, the thorough way.
 
 ## 3. Docs and outreach
 
