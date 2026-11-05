@@ -35,10 +35,13 @@
 
 use std::fmt;
 use std::io;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, BufStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, BufWriter, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
@@ -144,10 +147,77 @@ impl ClientTls {
 /// What a listener accepts TLS with.
 pub(crate) type Acceptor = imp::Acceptor;
 
-/// What a connection runs over: TCP, or TLS over TCP.
+/// What TLS runs over TCP as.
 pub(crate) trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream for T {}
-pub(crate) type Conn = Box<dyn Stream>;
+
+/// What a connection runs over: TCP, buffered both ways as rustls buffers TLS (else every frame
+/// written is a system call, and every one read two), or TLS over TCP. Whatever writes to one
+/// flushes it, as TLS needs too.
+pub(crate) enum Conn {
+    Plain(BufReader<BufWriter<TcpStream>>),
+    #[cfg_attr(not(feature = "tls"), expect(dead_code, reason = "without the feature there is never TLS to run"))]
+    Tls(Box<dyn Stream>),
+}
+
+/// The half of a [`Conn`] read from, and the half written to, apart.
+pub(crate) type ReadHalf = Box<dyn AsyncRead + Unpin + Send>;
+pub(crate) type WriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
+
+impl Conn {
+    /// Split to be read and written at once, by tasks of their own. Plain TCP splits in two
+    /// sockets' worth of halves, each with a buffer of its own: [`tokio::io::split`] would put a
+    /// lock between them, taken on every read and write, which the reader and writer of a busy
+    /// connection wait on. TLS can't: one session's state is both ways'.
+    pub(crate) fn split(self) -> (ReadHalf, WriteHalf) {
+        match self {
+            Self::Plain(stream) => {
+                // Read past the hello, what the other end sent next: read first, before the socket.
+                let read_ahead = stream.buffer().to_vec();
+                let stream = stream.into_inner();
+                assert!(stream.buffer().is_empty(), "a connection is split flushed");
+                let (read, write) = stream.into_inner().into_split();
+                (Box::new(BufReader::new(Cursor::new(read_ahead).chain(read))), Box::new(BufWriter::new(write)))
+            }
+            Self::Tls(stream) => {
+                let (read, write) = tokio::io::split(stream);
+                (Box::new(read), Box::new(write))
+            }
+        }
+    }
+}
+
+impl AsyncRead for Conn {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Conn {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
 
 /// A node's TLS, loaded: what each listener accepts with, and what it dials peers with. Without
 /// a peer CA, only the admin listener's.
@@ -234,10 +304,8 @@ pub(crate) fn names(cert: Option<&Cert>, id: NodeId) -> bool {
     cert.is_some_and(|cert| imp::names(cert, id))
 }
 
-/// Plain TCP, buffered both ways as rustls buffers TLS: else every frame written is a system
-/// call, and every one read two. Whatever writes to a [`Conn`] flushes it, as TLS needs too.
 fn plain(stream: TcpStream) -> Conn {
-    Box::new(BufStream::new(stream))
+    Conn::Plain(BufReader::new(BufWriter::new(stream)))
 }
 
 /// An accepted TCP connection, over TLS if there's `tls`, and the certificate the other end
@@ -325,13 +393,13 @@ mod rustls_impl {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, denied));
             }
         }
-        Ok(Box::new(stream))
+        Ok(Conn::Tls(Box::new(stream)))
     }
 
     pub(super) async fn accept(tls: &Acceptor, stream: TcpStream) -> io::Result<(Conn, Option<Cert>)> {
         let stream = tls.accept(stream).await?;
         let cert = stream.get_ref().1.peer_certificates().and_then(<[Cert]>::first).cloned();
-        Ok((Box::new(stream), cert))
+        Ok((Conn::Tls(Box::new(stream)), cert))
     }
 
     /// Whether `cert`, already verified, names node `id`.
@@ -444,5 +512,44 @@ mod without {
             };
             assert_eq!(Loaded::load(&node).err().map(|e| e.kind()), Some(std::io::ErrorKind::Unsupported));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    use super::{accept, connect};
+    use crate::driver::{read_frame, write_frames};
+
+    /// Split plain TCP, its halves go on from where the whole left off: what was read ahead past the
+    /// hello, in the buffer, is read first, then the socket's; and each half works while the other
+    /// waits, the reader blocked as the writer writes.
+    #[tokio::test]
+    async fn a_split_connection_loses_nothing_read_ahead() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dialled = tokio::spawn(async move { connect(&addr, None, None).await.unwrap() });
+        let (mut accepted, _) = accept(listener.accept().await.unwrap().0, None).await.unwrap();
+        let mut dialled = dialled.await.unwrap();
+        let frame = |byte: u8| [&3_u32.to_le_bytes()[..], &[byte; 3]].concat();
+        // The hello and the frame after it in one write, read into one buffer.
+        write_frames(&mut dialled, [&frame(1)[..], &frame(2)[..]]).await.unwrap();
+        assert_eq!(read_frame(&mut accepted).await.unwrap(), frame(1), "the hello");
+
+        let (mut reader, mut writer) = accepted.split();
+        // Lost, it would never come: waited for a while, not for ever.
+        let read_ahead = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader)).await;
+        assert_eq!(read_ahead.expect("read ahead before the split").unwrap(), frame(2));
+        let waiting = tokio::spawn(async move { (read_frame(&mut reader).await.unwrap(), reader) });
+        write_frames(&mut writer, [&frame(3)[..]]).await.unwrap();
+        assert_eq!(read_frame(&mut dialled).await.unwrap(), frame(3), "written while the reader waits");
+        dialled.write_all(&frame(4)).await.unwrap();
+        dialled.flush().await.unwrap();
+        let (read, _reader) = waiting.await.unwrap();
+        assert_eq!(read, frame(4), "from the socket, after the buffer");
     }
 }

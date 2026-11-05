@@ -891,7 +891,7 @@ async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
         io::Result::Ok((stream, first))
     };
     let Ok(Ok((stream, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else { return };
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.split();
     let Some(theirs) = hello.check(&first, role) else { return };
     if token.is_some_and(|token| !same(theirs.token(), &token)) {
         let mut refusal = Vec::new();

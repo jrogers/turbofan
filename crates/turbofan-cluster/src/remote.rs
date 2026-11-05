@@ -252,7 +252,7 @@ struct Connection {
 
 impl Connection {
     fn new(stream: Conn) -> Self {
-        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (mut reader, mut writer) = stream.split();
         let (frames_tx, frames) = mpsc::channel(256);
         let read = tokio::spawn(async move {
             while let Ok(frame) = read_frame(&mut reader).await {
