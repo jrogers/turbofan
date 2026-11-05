@@ -206,6 +206,14 @@ fn finish(dir: &Path, temp: &Path, mut file: File, snapshot: &Snapshot, durable:
     Ok(())
 }
 
+/// The checksum of the snapshot of `index` and `term`, with `members`, whose bytes are `body`:
+/// what [`save`] writes in its header, for one kept in memory (`crate::testing`).
+#[cfg_attr(not(any(test, feature = "testing")), expect(dead_code, reason = "only a cluster in memory needs it"))]
+pub(crate) fn checksum(index: u64, term: u64, members: &[Member], body: &[u8]) -> u64 {
+    let sum = checksum_on(checksum_on(CHECKSUM_START, body), &encode_members(members));
+    seal(sum, index, term, crate::widen(body.len()))
+}
+
 fn encode_members(members: &[Member]) -> Vec<u8> {
     let member: Vec<wire::SnapshotMembersMember<'_>> = members
         .iter()
@@ -336,6 +344,15 @@ mod tests {
         assert_eq!(list(dir.path()).unwrap(), [10, 20], "kept until the node moves on");
         remove_older(dir.path(), 20, 1).unwrap();
         assert_eq!(list(dir.path()).unwrap(), [20]);
+    }
+
+    /// A snapshot kept in memory has the checksum its file would.
+    #[test]
+    fn a_snapshot_in_memory_is_checksummed_as_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = save(dir.path(), 10, 2, members(), writer(b"state"), true).unwrap();
+        assert_eq!(checksum(10, 2, &members(), b"state"), saved.checksum);
+        assert_ne!(checksum(10, 3, &members(), b"state"), saved.checksum, "its term counts");
     }
 
     /// Kept: the newest so many, the one moved on to among them; never one it may still read.

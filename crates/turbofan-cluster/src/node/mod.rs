@@ -545,7 +545,10 @@ impl<S: Service> Node<S> {
         deadline
     }
 
-    fn is_ready(&self) -> bool {
+    /// Whether it leads, and has applied an entry of its own term: then its state is current, and
+    /// it takes clients and operators. Before, it redirects them, to no leader.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
         self.local.ready && self.raft.role() == Role::Leader
     }
 

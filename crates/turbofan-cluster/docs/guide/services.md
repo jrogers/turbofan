@@ -207,7 +207,73 @@ an upgrade.
 
 The framework's own simulation tests a cluster under failures; it doesn't know your service. A
 test of your own that kills and restarts nodes under load, and checks nothing is lost or doubled,
-is worth having for any service: `tests/cluster.rs` does it for an echo service.
+is worth having for any service.
+
+### A cluster in memory
+
+`turbofan_cluster::testing`, with the `testing` feature (in your dev-dependencies), runs a whole
+cluster of your service in one thread: the nodes' logs and snapshots in memory, the network a
+queue, and the clock yours to move. A failover takes milliseconds, and a run is the same every
+time. Its clients are the same as a gateway's, so they resend after a failover as a gateway does:
+
+```toml
+[dev-dependencies]
+turbofan-cluster = { version = "0.6", features = ["testing"] }
+```
+
+```rust
+# #[cfg(feature = "testing")]
+# fn main() {
+use std::time::Duration;
+use turbofan_cluster::client::Event;
+use turbofan_cluster::testing::Cluster;
+use turbofan_cluster::{Ctx, Service, SessionId};
+# use std::io::{self, Read};
+# use turbofan_cluster::SnapshotWriter;
+
+/// Counts the messages it's sent, and answers each with the count.
+#[derive(Debug, Default)]
+struct Counter(u64);
+
+impl Service for Counter {
+    fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, _payload: &[u8]) {
+        self.0 += 1;
+        ctx.send(session, self.0.to_string()).ok();
+    }
+#     fn snapshot(&self) -> SnapshotWriter { let n = self.0; Box::new(move |out| out.write_all(&n.to_le_bytes())) }
+#     fn restore(&mut self, from: &mut dyn Read) -> io::Result<()> {
+#         let mut n = [0; 8];
+#         from.read_exact(&mut n)?;
+#         self.0 = u64::from_le_bytes(n);
+#         Ok(())
+#     }
+}
+
+let mut cluster = Cluster::new(3, |_| Counter::default());
+let alice = cluster.connect(b"alice").unwrap();
+cluster.send(alice, b"one".to_vec()).unwrap();
+cluster.run_for(Duration::from_millis(10));
+
+// The leader crashes; another is elected, and the client resends on its session.
+cluster.crash(cluster.leader().unwrap());
+cluster.send(alice, b"two".to_vec()).unwrap();
+assert!(cluster.run_until(Duration::from_secs(2), |c| c.client(alice).unacked() == 0));
+
+let answers: Vec<Event> = cluster.events(alice).into_iter().filter(|e| matches!(e, Event::Message(_))).collect();
+assert_eq!(answers, [Event::Message(b"1".to_vec()), Event::Message(b"2".to_vec())]);
+# }
+# #[cfg(not(feature = "testing"))]
+# fn main() {}
+```
+
+`Cluster::crash` and `restart` stop and start a node from what it had written, `isolate` and
+`heal` cut it off from the others, and `transfer_leadership` and `take_snapshot` ask what an
+operator would. `Cluster::service` is a node's service, to check every node applied the same
+state. `testing::Builder` sets the seed, the latencies and the nodes' configuration (snapshot
+often, say, to test `restore`). It doesn't model damaged disks, changes of members or upgrades;
+its API may change before 1.0. The edges that reach a cluster over the network, with
+`ClusterClient`, are still tested against nodes over TCP: `tests/cluster.rs` does that for an
+echo service.
 
 [clients]: clients.md
 [first-service]: first-service.md

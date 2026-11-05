@@ -6,6 +6,13 @@ a patch version (0.1.1) doesn't.
 
 ## Unreleased
 
+### Added
+
+- A cluster in memory, for a service's tests: `turbofan_cluster::testing`, with the `testing`
+  feature. Its nodes run in one thread, their logs and snapshots in memory, on a clock the test
+  moves, with the same clients a gateway has: a failover takes milliseconds, and a run is the
+  same every time. Its API may change before 1.0. See the guide's services chapter.
+
 ### Fixed
 
 - A client whose session was still being opened when the leader stepped down is redirected to

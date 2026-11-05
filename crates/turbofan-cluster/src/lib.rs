@@ -4,7 +4,8 @@
 //!
 //! A service implements [`Service`] and runs with [`run`], or with [`driver::serve`] for control
 //! over its [`driver::Config`]. Gateways connect with [`ClusterClient`], or [`client::Client`]
-//! to do their own IO.
+//! to do their own IO. A service's tests can run a whole cluster of it in memory, on their own
+//! clock, with `testing` (the `testing` feature).
 //!
 //! The [`guide`] goes from a first service to running a cluster in production:
 //! clients, members, operations, upgrades and performance.
@@ -38,6 +39,8 @@ pub mod codec;
 pub mod driver;
 pub mod metrics;
 mod remote;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod tls;
 
 // The core and its storage: public for the simulation, the fuzz targets and the benchmark, but not

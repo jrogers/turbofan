@@ -28,6 +28,9 @@ turbofan-sbe.workspace = true
 # a service that doesn't use it needn't take on. Without it, plain TCP, and TLS configuration is
 # refused when it's loaded.
 tls = ["dep:tokio-rustls"]
+# A cluster in memory, for a service's tests (`testing`): its nodes in one process, deterministic,
+# on a clock the test moves. For a service's dev-dependencies; its API may change before 1.0.
+testing = []
 
 [build-dependencies]
 turbofan-sbe.workspace = true

@@ -24,13 +24,12 @@ down when they show.
 
 - **A stable API.** Freeze `Service`, `Ctx`, `ClusterClient` and `driver::Config`. The crates are
   on crates.io from 0.1.0, but until 1.0 a minor version may break the API (CHANGELOG.md says how).
-- **A cluster in memory, for a service's tests.** A service is tested on real nodes: the OMS's
-  tests start them over TCP, in temporary directories, on ports picked so they don't collide
-  (`../oms/tests/common/mod.rs`). A `testing` module could run one to three nodes in one process,
-  the log in memory, the network channels and the clock the test's: quick, the same every run, and
-  a failover or a killed node one call, with no sockets to wait on. The simulation (`tests/sim.rs`)
-  drives the node and the pipeline this way already; what's left is making it public, an API to
-  freeze with the rest.
+- **A cluster in memory, for a service's tests.** `turbofan_cluster::testing` (the `testing`
+  feature) runs a service's nodes in one thread, in memory, on the test's clock. What's left: the
+  OMS's failover tests moved onto it (`../oms/tests/failover.rs` starts real nodes over TCP);
+  changes of members and upgrades in it, which it doesn't do yet; and its API settled, to freeze
+  with the rest. It hands out `Node`, which isn't part of the API: a test should need only what
+  `Cluster` says of a node.
 - **Faults the simulation doesn't reach.** The simulation (`tests/sim.rs`) runs the node and the
   pipeline, not the driver, the client or TLS, which only the cluster tests and the soak
   (`tests/soak.rs`) run, over real TCP. The soak kills nodes; nothing yet partitions them, or
