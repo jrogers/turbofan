@@ -422,6 +422,33 @@ fn sends_queued_across_a_change_of_leader_go() {
     assert!(node.is_ready());
 }
 
+/// A client whose session is still being opened when the leader steps down is redirected, as
+/// one attached is: otherwise it waits on a session that never opens, until its keepalives go
+/// unanswered.
+#[test]
+fn a_connection_opening_a_session_is_redirected_when_the_leader_steps_down() {
+    let mut node = leader();
+    let mut connect = Vec::new();
+    codec::encode_frame(&wire::Connect { credentials: b"" }, &mut connect).unwrap();
+    node.on_client(1, &codec::decode_frame(&connect).unwrap().unwrap().0, 1);
+    let mut frame = Vec::new();
+    let append = wire::AppendEntries {
+        term: 2,
+        leader: 2,
+        prev_index: 0,
+        prev_term: 0,
+        commit: 0,
+        count: 0,
+        entries: &[],
+        last_index: 0,
+    };
+    codec::encode_frame(&append, &mut frame).unwrap();
+    node.on_peer(NodeId(2), &codec::decode_frame(&frame).unwrap().unwrap().0, 2);
+    let sent = drive(&mut node);
+    assert!(sent.iter().any(|s| s.starts_with("1: ") && s.contains("Redirect")), "{sent:?}");
+    assert!(!sent.iter().any(|s| s.contains("Opened")), "{sent:?}");
+}
+
 /// An operator switches the cluster to versions every member has, at a point in the log;
 /// not to ones a member lacks, or back.
 #[test]

@@ -14,8 +14,11 @@ impl<S: Service> Node<S> {
     }
 
     pub(super) fn open(&mut self, conn: ConnId, credentials: &[u8]) {
-        // A connection takes one session: one it had is left for its client to reattach to.
+        // A connection takes one session: one it had is left for its client to reattach to. It
+        // stays known, with none, while its session opens: a leader stepping down meanwhile
+        // redirects it.
         self.detach(conn);
+        self.local.conns.insert(conn, None);
         if self.state.sessions.len() + self.local.opening.len() >= MAX_SESSIONS {
             self.send_client(conn, &wire::Closed { session: 0, reason: CloseReason::NoSession });
             return;

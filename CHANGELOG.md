@@ -8,6 +8,10 @@ a patch version (0.1.1) doesn't.
 
 ### Fixed
 
+- A client whose session was still being opened when the leader stepped down is redirected to
+  the new one. It was left waiting on a session that never opened, until its keepalives went
+  unanswered, some seconds.
+
 - A member being added votes once it has some of the log, though it doesn't yet have the entry
   that adds it, and so knows no members. It refused, and with voters in doubt, which take every
   member's vote, no election could be won: the cluster had no leader until a node was restarted
