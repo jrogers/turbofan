@@ -12,6 +12,19 @@ pub(super) struct Session {
     pub(super) ring: VecDeque<(u64, Vec<u8>)>,
     /// Who opened it: only it may reattach.
     pub(super) principal: Vec<u8>,
+    /// Carried over into the epoch from an earlier one: its last `client_seq` applied and its last
+    /// `egress_seq` as the epoch began ([`Session::carried_over`]).
+    pub(super) carried: Option<(u64, u64)>,
+}
+
+impl Session {
+    /// Marks it carried over into a new epoch as it stands. A client of the earlier epoch is
+    /// judged against this, not what the session has since: a promoted standby, or a cluster
+    /// restored from a snapshot, may lack responses that client saw (the lost cluster's last),
+    /// and send others since that make up their number, so counting alone can't tell.
+    pub(super) fn carried_over(&mut self) {
+        self.carried = Some((self.last_seq, self.next_egress - 1));
+    }
 }
 
 /// Replicated: the same on every node at the same applied index.
@@ -75,7 +88,13 @@ pub(super) fn encode_state(state: &State) -> Vec<u8> {
     for (&session, s) in &state.sessions {
         let ring = u32::try_from(s.ring.len()).expect("at most MAX_EGRESS_RING");
         let (last_seq, next_egress) = (s.last_seq, s.next_egress);
-        put(&mut out, &wire::SessionState { session: session.0, last_seq, next_egress, ring, principal: &s.principal });
+        let (carried_seq, carried_egress) = s.carried.unwrap_or((u64::MAX, u64::MAX));
+        let principal = &s.principal;
+        let session = session.0;
+        put(
+            &mut out,
+            &wire::SessionState { session, last_seq, next_egress, ring, carried_seq, carried_egress, principal },
+        );
         for (egress_seq, payload) in &s.ring {
             put(&mut out, &wire::EgressState { egress_seq: *egress_seq, payload });
         }
@@ -119,11 +138,13 @@ pub(super) fn decode_state(from: &mut dyn Read) -> io::Result<State> {
         if usize::try_from(s.ring()).map_or(true, |n| n > MAX_EGRESS_RING) {
             return Err(bad("too long a ring"));
         }
+        let carried = s.carried_seq().zip(s.carried_egress()).filter(|&marks| marks != (u64::MAX, u64::MAX));
         let mut session = Session {
             last_seq: s.last_seq(),
             next_egress: s.next_egress(),
             ring: VecDeque::new(),
             principal: s.principal().to_vec(),
+            carried,
         };
         for _ in 0..s.ring() {
             let frame = read_message(from)?;
@@ -146,32 +167,21 @@ pub(super) fn decode_state(from: &mut dyn Read) -> io::Result<State> {
     Ok(state)
 }
 
-/// The `NodeState` that starts a snapshot's bytes, read from `from`, written again with
-/// `epoch`, begun after the snapshot: for a cluster restored from the snapshot, which mustn't be
-/// taken for the one it was taken from. `from` is left after it, at the rest of the state, which is the same.
+/// The node's state that starts a snapshot's bytes, read from `from`, written again of `epoch`,
+/// begun after the snapshot, its sessions carried over into it: for a cluster restored from the
+/// snapshot, which mustn't be taken for the one it was taken from. `from` is left after it, at
+/// the service's state, which is the same.
 ///
 /// # Errors
 ///
-/// If reading fails, or what's read isn't a `NodeState`.
+/// If reading fails, or what's read isn't a node's state ([`decode_state`]).
 pub(crate) fn with_epoch(from: &mut dyn Read, epoch: u64) -> io::Result<Vec<u8>> {
-    let frame = read_message(from)?;
-    let wire::Decoded::NodeState(n) = decoded(&frame)? else { return Err(bad("no NodeState")) };
-    let node = wire::NodeState {
-        applied: n.applied(),
-        time: n.time(),
-        next_proposal: n.next_proposal(),
-        sessions: n.sessions(),
-        timers: n.timers(),
-        proposals: n.proposals(),
-        protocol: n.protocol(),
-        service_version: n.service_version(),
-        epoch,
-        epoch_since: n.applied() + 1,
-        egress_ring: n.egress_ring().unwrap_or(0),
-    };
-    let mut out = Vec::new();
-    codec::encode_frame(&node, &mut out).expect("a NodeState is within its limits");
-    Ok(out)
+    let mut state = decode_state(from)?;
+    (state.epoch, state.epoch_since) = (epoch, state.applied + 1);
+    for session in state.sessions.values_mut() {
+        session.carried_over();
+    }
+    Ok(encode_state(&state))
 }
 
 /// The next framed message of a snapshot, read no further.

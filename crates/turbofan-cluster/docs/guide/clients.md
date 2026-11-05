@@ -119,7 +119,8 @@ A session is the unit of the guarantee. It ends when:
   opened in).
 - **The client reattaches to a cluster that has less of the session than it saw**: messages it
   knew applied, or responses, that a standby promoted without all of it lost (see
-  [Members][membership]). It can't resend messages it had let go of, nor the cluster the
+  [Members][membership]). It's judged by what the session had as the new cluster began, not by
+  what it has since, which may make up the number with responses of the new cluster's own. It can't resend messages it had let go of, nor the cluster the
   responses again, so it closes the session, with `CloseReason::Diverged`; `unapplied` counts
   the messages the new cluster never applied.
 

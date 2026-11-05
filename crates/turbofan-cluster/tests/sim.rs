@@ -733,6 +733,8 @@ struct SimClient {
     proposals: BTreeSet<u64>,
     /// What the node had of the session as it sent the last `Opened` the client read.
     opened_with: (u64, u64),
+    /// Its session is the lost cluster's, and it hasn't opened it on the recovered one yet.
+    of_lost: bool,
 }
 
 /// A client connection: in order each way, like TCP.
@@ -819,6 +821,9 @@ struct Disaster {
     /// The copy of a snapshot, to restore from.
     backup: Option<(tempfile::TempDir, std::path::PathBuf)>,
     recovered: bool,
+    /// What each session had as the recovered cluster began, by the lost one's log: what a
+    /// client of the lost one is judged against, as it opens its session on the new one.
+    began: BTreeMap<SessionId, (u64, u64)>,
     /// A client that stops sending, and when: shortly before the backup or the standby's cut, so
     /// the new cluster has its messages, but perhaps not the responses others' messages cause it.
     idle: (usize, u64),
@@ -839,6 +844,7 @@ fn new_client(c: usize, again: bool) -> SimClient {
         timers: BTreeSet::new(),
         proposals: BTreeSet::new(),
         opened_with: (0, 0),
+        of_lost: false,
     }
 }
 
@@ -1164,10 +1170,16 @@ impl Sim {
             if let turbofan_cluster::wire::Decoded::Opened(m) = codec::decode_frame(&frame).unwrap().unwrap().0 {
                 let service = self.nodes[&id].node.as_ref().unwrap().service();
                 let session = SessionId(m.session());
-                let had = (
+                let mut had = (
                     service.last.get(&session).copied().unwrap_or(0),
                     service.responses.get(&session).copied().unwrap_or(0),
                 );
+                // A client of the lost cluster: what the new one had of its session as it began.
+                let c = self.conns[&conn].client;
+                if c != ADMIN && self.clients[c].of_lost {
+                    let began = self.disaster.as_ref().and_then(|d| d.began.get(&session));
+                    had = began.copied().unwrap_or(had);
+                }
                 self.conns.get_mut(&conn).unwrap().opened.push_back(had);
             }
             self.send_conn(conn, frame, false);
@@ -1572,6 +1584,7 @@ impl Sim {
         if !self.disaster.as_ref().is_some_and(|d| d.recovered) {
             return;
         }
+        self.clients[c].of_lost = false;
         let (seed, client) = (self.seed, &self.clients[c]);
         let (applied, responses) = client.opened_with;
         assert!(
@@ -1973,7 +1986,8 @@ impl Sim {
         let recover_after = lose_after + 500 * MS;
         self.schedule(recover_after, Event::Recover);
         let idle = (idle_client, idle_at);
-        self.disaster = Some(Disaster { restore, standby, old_epoch, backup: None, recovered: false, idle });
+        let began = BTreeMap::new();
+        self.disaster = Some(Disaster { restore, standby, old_epoch, backup: None, recovered: false, began, idle });
         self.send_until = self.now + recover_after + 1500 * MS;
         // Their sends stopped with the run: they start again.
         for c in 0..CLIENTS {
@@ -2050,6 +2064,7 @@ impl Sim {
             let node = node::Config::new(id, vec![member(id)]);
             let config = driver::Config::new(node, 1, restored.path(), vec![(id, unused)], unused, unused);
             let (index, _) = driver::restore(backup, &config).unwrap();
+            self.begin_at(index);
             let sim_node = self.nodes.get_mut(&id).unwrap();
             sim_node.disk = Disk::restored(restored, self.segment_bytes);
             (sim_node.lost, sim_node.broken, sim_node.wiped, sim_node.upgraded) = (false, false, false, true);
@@ -2062,6 +2077,8 @@ impl Sim {
             let learner = node.raft().members().iter().any(|m| m.id == id && m.learner);
             assert!(learner, "seed {seed}: the standby, {id}, isn't a learner");
             let commit = usize::try_from(node.raft().commit_index()).unwrap();
+            // It cuts its log to what it knew committed as it takes over, then begins the new epoch.
+            self.begin_at(node.raft().commit_index());
             self.committed.truncate(commit);
             self.commit_terms.truncate(commit);
             self.covered.promotions += 1;
@@ -2076,6 +2093,30 @@ impl Sim {
             let node = self.nodes.get_mut(&id).unwrap().node.as_mut().unwrap();
             node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, self.now);
             self.flush(id);
+        }
+    }
+
+    /// The recovered cluster begins after `index`, which the lost one committed: what each session
+    /// had then, by the lost cluster's log replayed to there, and every client is the lost one's
+    /// until it opens its session again.
+    fn begin_at(&mut self, index: u64) {
+        let to = usize::try_from(index).unwrap();
+        assert!(to <= self.committed.len(), "seed {}: the recovered cluster begins at what was committed", self.seed);
+        let config = node::Config::new(NodeId(1), Vec::new());
+        let echo = Echo { version: 1, ..Echo::default() };
+        let mut replayed = Node::new(config, echo, Meta::default(), None, Entries::default(), 0);
+        for (i, payload) in self.committed[..to].iter().enumerate() {
+            replayed.replay(u64::try_from(i).unwrap() + 1, payload).expect("the lost cluster's log replays");
+        }
+        let echo = replayed.service();
+        let sessions: BTreeSet<SessionId> = echo.last.keys().chain(echo.responses.keys()).copied().collect();
+        let began = sessions
+            .into_iter()
+            .map(|s| (s, (echo.last.get(&s).copied().unwrap_or(0), echo.responses.get(&s).copied().unwrap_or(0))))
+            .collect();
+        self.disaster.as_mut().unwrap().began = began;
+        for client in &mut self.clients {
+            client.of_lost = true;
         }
     }
 

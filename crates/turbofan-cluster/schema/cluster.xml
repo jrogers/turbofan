@@ -3,7 +3,7 @@
      Every frame is a u32 length and one of these messages. Services' own payloads are opaque
      `payload` bytes here; each service has a schema of its own. Change it only as WIRE.md says:
      old and new nodes run side by side. -->
-<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="5"
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="6"
                    byteOrder="littleEndian">
     <types>
         <composite name="messageHeader">
@@ -427,6 +427,12 @@
         <field name="lastSeq" id="2" type="uint64"/>
         <field name="nextEgress" id="3" type="uint64"/>
         <field name="ring" id="4" type="uint32"/>
+        <!-- A session carried over into the epoch from an earlier one (promoted or restored from):
+             its last `clientSeq` applied and its last `egressSeq` as the epoch began, against
+             which a client of the earlier epoch reattaching is judged. `u64::MAX` for one opened
+             in this epoch; absent from an older node, which didn't keep them. -->
+        <field name="carriedSeq" id="6" type="uint64" sinceVersion="6"/>
+        <field name="carriedEgress" id="7" type="uint64" sinceVersion="6"/>
         <data name="principal" id="5" type="addrData"/>
     </sbe:message>
     <sbe:message name="EgressState" id="62">

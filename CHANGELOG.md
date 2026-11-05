@@ -23,6 +23,14 @@ a patch version (0.1.1) doesn't.
 
 ### Fixed
 
+- A client of a lost cluster reattaching to a standby promoted, or to a cluster restored from a
+  snapshot, is told what its session had as the new cluster began, and closes it as diverged if
+  it saw more. It was told what the session had by the time it reattached, and the new cluster
+  may have sent it responses of its own meanwhile (a timer, another session's notice) that made
+  up the number of one it lost: the client carried on, missing a response and seeing another
+  twice. Each session carried over into the new epoch is marked as it stood, in the snapshot's
+  `SessionState` (schema version 6). And a learner promoted drops its log past its commit index,
+  which the lost cluster may not have committed: it began from it as it was.
 - A client whose session was still being opened when the leader stepped down is redirected to
   the new one. It was left waiting on a session that never opened, until its keepalives went
   unanswered, some seconds.

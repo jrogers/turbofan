@@ -89,7 +89,7 @@ delete its `doubt` file, and restart it.
 
 A learner in another region is a standby for the whole cluster: it has the state, and the
 cluster's commits never wait for it. If the main cluster is lost, `promote` makes it the one
-member of a new cluster, from its log as it is:
+member of a new cluster, from its log as far as it knew it committed:
 
 ```sh
 my-service promote --admin <the learner's admin address>
@@ -103,10 +103,14 @@ clients), then promote.
 The new cluster has a new epoch, which every hello carries: the old cluster's nodes, if they come
 back, can't talk to it. It grows with `add-member` as any cluster does. Sessions are replicated,
 so clients reattach to it and resend what it hasn't applied. What the old cluster committed past
-what the learner had is lost: count it from the old leader's commit index and the learner's last
-index, from `status` before the loss, or the metrics. A client whose messages or responses were among it
-closes its session, `CloseReason::Diverged` (see [Clients][clients]), to open another and ask the
-service what it has. Keep the learner close: watch its lag.
+what the learner knew committed is lost: the learner drops any of its log past its commit index,
+which the old cluster may not have committed, or may have committed other entries in place of.
+Count it from the old leader's commit index and the learner's, from `status` before the loss,
+or the metrics. A client whose messages or responses were among it closes its session,
+`CloseReason::Diverged` (see [Clients][clients]), to open another and ask the service what it
+has: judged by what its session had as the new cluster began, so a response the new cluster
+sends since, before the client reattaches, doesn't make up for one it lost. Keep the learner
+close: watch its lag.
 
 [clients]: clients.md
 [operations]: operations.md

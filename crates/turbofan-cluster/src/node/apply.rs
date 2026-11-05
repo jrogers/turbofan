@@ -124,8 +124,14 @@ impl<S: Service> Node<S> {
     pub(super) fn apply_epoch(&mut self, index: u64, epoch: u64, promoted: bool) {
         if self.state.epoch == 0 || promoted {
             self.state.epoch = epoch;
-            // The first epoch has every session; a promoted standby's, those from here on.
+            // The first epoch has every session; a promoted standby's, those from here on, and
+            // those before, carried over as they stand.
             self.state.epoch_since = if promoted { index } else { 0 };
+            if promoted {
+                for session in self.state.sessions.values_mut() {
+                    session.carried_over();
+                }
+            }
         }
         if let Some((conn, request_id, at)) = self.promoting
             && at == epoch
@@ -158,7 +164,13 @@ impl<S: Service> Node<S> {
     }
 
     pub(super) fn apply_open(&mut self, session: SessionId, principal: &[u8]) {
-        let opened = Session { last_seq: 0, next_egress: 1, ring: VecDeque::new(), principal: principal.to_vec() };
+        let opened = Session {
+            last_seq: 0,
+            next_egress: 1,
+            ring: VecDeque::new(),
+            principal: principal.to_vec(),
+            carried: None,
+        };
         self.state.sessions.insert(session, opened);
         if let Some(conn) = self.local.opening.remove(&session) {
             self.local.conns.insert(conn, Some(session));

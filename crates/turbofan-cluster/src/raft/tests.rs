@@ -977,8 +977,9 @@ fn a_learner_takes_the_log_but_has_no_say() {
 }
 
 /// A learner promoted, its leader silent an election timeout, leads a cluster of its own:
-/// itself, a voter, its log kept, the tail its old cluster hadn't committed committed now.
-/// Not a voter, nor a learner that hears its leader.
+/// itself, a voter, its log cut to its commit index. The tail past it, which its old cluster may
+/// never have committed (and may have committed other entries in place of), is dropped, not
+/// committed. Not a voter, nor a learner that hears its leader.
 #[test]
 fn a_promoted_learner_leads_a_cluster_of_its_own() {
     let mut rafts = with_learner();
@@ -996,10 +997,12 @@ fn a_promoted_learner_leads_a_cluster_of_its_own() {
     assert_eq!((learner.role(), learner.term()), (Role::Leader, 2));
     let me: Vec<_> = learner.members().iter().map(|m| (m.id.0, m.learner)).collect();
     assert_eq!(me, [(3, false)]);
-    flush(learner);
+    let out = learner.take_outputs();
+    assert_eq!(out.persist[0], Persist::TruncateFrom(committed + 1), "{:?}", out.persist);
+    learner.on_persisted(learner.log_end(), learner.now);
     assert_eq!(learner.commit_index(), learner.last_index(), "alone, it commits on its own");
-    assert!(learner.last_index() > tail);
-    assert_eq!(learner.entry(tail), Some(&b"x"[..]), "its log as it was");
+    assert_eq!(learner.last_index(), committed + 1, "its members, after what it had committed");
+    assert_ne!(learner.entry(tail), Some(&b"x"[..]), "not the tail");
 }
 
 /// A learner just started hasn't heard its leader yet, which may well be alive: it isn't

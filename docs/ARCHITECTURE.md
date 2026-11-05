@@ -241,7 +241,10 @@ later term, or the whole log of the leader it follows.
   carries it as the node has applied it (0 for none yet). Peers that know different epochs don't
   talk, checked on every frame, so a connection outlives no change of epoch. **Promotion**
   (`promote`, to a learner whose leader is silent) makes the learner the one member of a new
-  cluster, of a new epoch, from its log as it is, for a standby to take over a lost cluster.
+  cluster, of a new epoch, from its log cut to its commit index, for a standby to take over a
+  lost cluster. Each session carried over is marked with what it had as the epoch began, and a
+  client of the old epoch reattaching is judged against that, so a lost response can't be made
+  up for by one sent since.
 - **Leadership transfer**: the leader sends the target no more of its log than it had when the
   transfer began, then `TimeoutNow` once the target has it all, so a rolling restart costs a
   quick election.

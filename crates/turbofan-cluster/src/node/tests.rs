@@ -281,7 +281,16 @@ fn a_snapshots_counts_are_checked_at_their_limits() {
     let ring = |ring: usize| {
         let mut bytes = node_state(1);
         let ring = u32::try_from(ring).unwrap();
-        let session = wire::SessionState { session: 1, last_seq: 0, next_egress: 1, ring, principal: b"" };
+        let (carried_seq, carried_egress) = (u64::MAX, u64::MAX);
+        let session = wire::SessionState {
+            session: 1,
+            last_seq: 0,
+            next_egress: 1,
+            ring,
+            carried_seq,
+            carried_egress,
+            principal: b"",
+        };
         codec::encode_frame(&session, &mut bytes).unwrap();
         bytes
     };
@@ -567,6 +576,46 @@ fn a_session_of_another_epoch_is_not_reattached_to() {
     restored.extend_from_slice(rest);
     let restored = decode_state(&mut &restored[..]).unwrap();
     assert_eq!((restored.epoch, restored.epoch_since), (9, node.applied() + 1), "restored, from after the snapshot");
+}
+
+/// A client of an earlier epoch is told what its session had as the new epoch began, not what it
+/// has since: a promoted standby may lack the lost cluster's last response, and send one of its
+/// own since that makes up the number. A client that saw that lost one is told less than it saw,
+/// and closes the session as diverged; one that didn't carries on, and is sent the new one. A
+/// client of this epoch, or naming none, is told what the session has. The marks are kept in
+/// snapshots, and a cluster restored from one marks every session it carries over.
+#[test]
+fn a_client_of_an_earlier_epoch_is_judged_by_what_its_session_had_as_the_epoch_began() {
+    let mut node = leader();
+    let old = node.epoch();
+    let session = open(&mut node, 1, 0);
+    let message = |client_seq, payload| wire::Message { session: session.0, client_seq, payload };
+    client(&mut node, 1, &message(1, b"one"), 0);
+    client(&mut node, 1, &message(2, b"two"), 0);
+    node.propose(&wire::Epoch { timestamp: 1, epoch: old + 1, promoted: 1 });
+    drive(&mut node);
+    assert_eq!(node.state.sessions[&session].carried, Some((2, 2)), "as it stood");
+    // The new epoch's own third response.
+    assert!(client(&mut node, 1, &message(3, b"three"), 0).join(" ").contains("egress_seq: 3"));
+
+    let reattach =
+        |last_egress_seq, epoch| wire::Reattach { session: session.0, last_egress_seq, epoch, credentials: b"" };
+    let opened = |sent: &[String]| sent.iter().find(|s| s.contains("Opened")).cloned().unwrap();
+    let sent = client(&mut node, 2, &reattach(3, old), 0);
+    assert!(opened(&sent).contains("applied_seq: 2, last_egress_seq: Some(2)"), "it saw a third this lacks: {sent:?}");
+    let sent = client(&mut node, 3, &reattach(2, old), 0);
+    assert!(opened(&sent).contains("last_egress_seq: Some(2)"), "{sent:?}");
+    assert!(sent.iter().any(|s| s.contains("egress_seq: 3")), "and the new third, replayed: {sent:?}");
+    for epoch in [old + 1, 0] {
+        let sent = client(&mut node, 4, &reattach(3, epoch), 0);
+        assert!(opened(&sent).contains("applied_seq: 3, last_egress_seq: Some(3)"), "epoch {epoch}: {sent:?}");
+    }
+
+    let bytes = encode_state(&node.state);
+    assert_eq!(decode_state(&mut &bytes[..]).unwrap().sessions[&session].carried, Some((2, 2)), "kept");
+    let mut rest = &bytes[..];
+    let restored = decode_state(&mut &with_epoch(&mut rest, 9).unwrap()[..]).unwrap();
+    assert_eq!(restored.sessions[&session].carried, Some((3, 3)), "restored, carried over as it stood");
 }
 
 /// A learner promoted leads alone, of a new epoch that replaces its cluster's, and says so

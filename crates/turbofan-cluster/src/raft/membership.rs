@@ -93,18 +93,25 @@ impl Raft {
 
     /// Makes this learner the one member of a new cluster, with its cluster lost: it leads a new
     /// term, without an election, and proposes the members as itself, a voter, which take effect
-    /// as they're appended. Its log stays as it is: what follows its commit index commits beneath
-    /// that. Refused (false) unless it's a learner that hasn't heard a leader for an election
-    /// timeout: never automatic, since a lost cluster and a cut link look alike from here.
+    /// as they're appended. Its log is cut to its commit index first: what follows may never have
+    /// been committed, and the lost cluster may have committed other entries in its place, so the
+    /// new cluster's history begins as a prefix of the lost one's, which is what a client of the
+    /// lost one is judged against as it reattaches. Refused (false) unless it's a learner, as of
+    /// that index, that hasn't heard a leader for an election timeout: never automatic, since a
+    /// lost cluster and a cut link look alike from here.
     pub fn promote(&mut self, now: u64) -> bool {
         self.now = now;
         let timeout = nanos(self.config.election_timeout);
         let leader_alive = self.leader_seen_at.is_some_and(|at| at + timeout > self.now);
-        if self.role != Role::Follower || !self.is_learner(self.config.id) || leader_alive || self.stop.is_some() {
+        let committed = self.members_at(self.commit);
+        let me = committed.iter().find(|m| m.id == self.config.id && m.learner);
+        if self.role != Role::Follower || me.is_none() || leader_alive || self.stop.is_some() {
             return false;
         }
-        let me = self.members().iter().find(|m| m.id == self.config.id).expect("a learner is a member");
-        let me = Member { learner: false, ..me.clone() };
+        let me = Member { learner: false, ..me.expect("checked").clone() };
+        if self.last_index() > self.commit {
+            self.truncate_from(self.commit + 1);
+        }
         self.meta = Meta { term: self.meta.term + 1, vote: Some(self.config.id) };
         self.out.persist.push(Persist::Meta(self.meta));
         self.become_leader(self.now);

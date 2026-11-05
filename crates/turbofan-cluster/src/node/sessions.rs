@@ -63,7 +63,11 @@ impl<S: Service> Node<S> {
         }
         self.local.conns.insert(conn, Some(session));
         self.local.activity.insert(session, self.now);
-        let (applied_seq, last) = (s.last_seq, s.next_egress - 1);
+        // A client of an earlier epoch is told what the session had as this one began: if it saw
+        // more, this cluster lacks some of it, and the client closes the session as diverged.
+        // One naming no epoch (an older client) may have reattached in this one since: as before.
+        let earlier = epoch != 0 && epoch != self.state.epoch;
+        let (applied_seq, last) = s.carried.filter(|_| earlier).unwrap_or((s.last_seq, s.next_egress - 1));
         let replay: Vec<(u64, Vec<u8>)> = s.ring.iter().filter(|(seq, _)| *seq > last_egress_seq).cloned().collect();
         let epoch = self.state.epoch;
         self.send_client(conn, &wire::Opened { session: session.0, applied_seq, last_egress_seq: last, epoch });
