@@ -1,7 +1,9 @@
 name: Simulate
 
 # Runs the simulation (crates/turbofan-cluster/tests/sim.rs) on fresh seeds each night, beyond the
-# fixed seeds every push runs. Run it by hand for more or fewer.
+# fixed seeds every push runs, and the cluster test of busy clients through failovers for ten
+# minutes, beyond the seconds every push runs: the simulation doesn't drive the driver, the client
+# or TLS, which that test does over real TCP. Run it by hand for more or fewer.
 on:
   schedule:
     - cron: "37 3 * * *"
@@ -10,6 +12,9 @@ on:
       seeds:
         description: Seeds to run
         default: "1000"
+      soak_secs:
+        description: Seconds to soak for
+        default: "600"
 
 permissions:
   contents: read
@@ -39,10 +44,33 @@ jobs:
           name: simulation-log
           path: sim.log
 
+  # Eight busy clients while a node is killed and restarted about every second (see
+  # busy_clients_lose_nothing_through_failovers in tests/cluster.rs). A failure is a message lost,
+  # repeated or out of order, or one left unanswered; there's no seed: run it again as long.
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Soak
+        shell: bash
+        run: >-
+          cargo test -p turbofan-cluster --release --test cluster busy_clients_lose_nothing_through_failovers
+          -- --nocapture 2>&1 | tee soak.log
+        env:
+          SOAK_SECS: ${{ inputs.soak_secs || 600 }}
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: soak-log
+          path: soak.log
+
   # Opens an issue when a scheduled run fails (or comments on the open one), and closes it when one
   # passes, so a failure doesn't go unnoticed for days. Manual runs are watched by whoever ran them.
   report:
-    needs: simulate
+    needs: [simulate, soak]
     if: always() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
@@ -50,7 +78,12 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v7
-      - run: scripts/nightly-report.sh "${{ github.workflow }}" "${{ needs.simulate.result }}" "$URL"
+      # Failed if either job did; passed only if both did.
+      - run: scripts/nightly-report.sh "${{ github.workflow }}" "$RESULT" "$URL"
         env:
           GH_TOKEN: ${{ github.token }}
+          RESULT: >-
+            ${{ contains(needs.*.result, 'failure') && 'failure'
+            || (needs.simulate.result == 'success' && needs.soak.result == 'success') && 'success'
+            || 'cancelled' }}
           URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

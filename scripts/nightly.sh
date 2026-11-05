@@ -31,11 +31,18 @@ replay() {
     Simulate)
         # The test prints `simulation failed: SIM_SEED=<n>` for the seed it stopped at.
         local log=$dir/simulation-log/sim.log seed
-        seed=$(grep -oE 'SIM_SEED=[0-9]+' "$log" 2>/dev/null | head -1 | cut -d= -f2 || true)
-        if [ -n "$seed" ]; then
-            echo "    SIM_SEED=$seed cargo test -p turbofan-cluster --release --test sim -- --nocapture"
-        else
-            echo "    no failing seed in $log"
+        if [ -f "$log" ]; then
+            seed=$(grep -oE 'SIM_SEED=[0-9]+' "$log" | head -1 | cut -d= -f2 || true)
+            if [ -n "$seed" ]; then
+                echo "    SIM_SEED=$seed cargo test -p turbofan-cluster --release --test sim -- --nocapture"
+            else
+                echo "    no failing seed in $log"
+            fi
+        fi
+        # The soak has no seed: its log says what went wrong, and it runs again as long.
+        if [ -f "$dir/soak-log/soak.log" ]; then
+            echo "    soak failed: see $dir/soak-log/soak.log, and run it again:"
+            echo "    SOAK_SECS=600 cargo test -p turbofan-cluster --release --test cluster busy_clients -- --nocapture"
         fi
         ;;
     esac
