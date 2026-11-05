@@ -17,6 +17,7 @@
 //! slow) is dropped, and Raft sends it again.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -217,15 +218,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     let (tls, reloading) = tls::start(config.tls.clone())?;
     let peer_ids = tls.borrow().as_ref().is_some_and(|t| t.peer_ids);
     let id = config.node.raft.id;
-    let (mut storage, meta, snapshot, log) =
-        Storage::open(&config.data_dir, config.log_fsync, config.node.raft.log_window_bytes)?;
-    storage.snapshots_kept = config.node.snapshots_kept;
-    let mut clock = Clock::new();
-    let mut node =
-        Node::new(config.node.clone(), service, meta, snapshot.as_ref().map(|s| s.0.clone()), log, clock.now());
-    if let Some((_, mut bytes)) = snapshot {
-        node.restore(&mut bytes)?;
-    }
+    let (node, storage, lock, clock) = open_node(&config, service)?;
     let snapshots = storage.snapshots.clone();
 
     let own = config.peer_addrs.iter().find(|(m, _)| *m == id).map(|&(_, a)| a);
@@ -267,6 +260,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
         pipeline: Pipeline::default(),
         writing: None,
         snapshots,
+        lock,
         inputs,
         clock,
         published: Instant::now(),
@@ -302,6 +296,10 @@ struct Core<S> {
     written_inline: Option<Written>,
     /// Where snapshots are saved, apart from the batches, reporting back on `inputs`.
     snapshots: PathBuf,
+    /// The node's directory lock ([`Log::lock`]), for a snapshot being saved to hold: else, the
+    /// node's task stopped, it goes with the storage, and a node started again in this process
+    /// saves its own beside it.
+    lock: Arc<File>,
     inputs: mpsc::Sender<Input>,
     clock: Clock,
     /// When the gauges were last published.
@@ -417,8 +415,10 @@ impl<S: Service + 'static> Core<S> {
             self.dial(peers);
         }
         if let Some(save) = taken.save {
-            let (dir, inputs) = (self.snapshots.clone(), self.inputs.clone());
+            let (dir, inputs, lock) = (self.snapshots.clone(), self.inputs.clone(), self.lock.clone());
             tokio::task::spawn_blocking(move || {
+                // Held to the end: stopped, a node's task goes, but not this thread.
+                let _lock = lock;
                 let saved = snapshot::save(&dir, save.index, save.term, save.members, save.writer, true);
                 // Gone only if the node stopped.
                 let _ = inputs.blocking_send(Input::SnapshotSaved(saved));
@@ -1014,6 +1014,22 @@ async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
     }
     write.abort();
     let _ = inputs.send(Input::Closed(conn)).await;
+}
+
+/// The node `config` describes, from what's in its data directory: with its storage, a handle on
+/// the directory's lock ([`Log::lock`]), and the clock it started at.
+fn open_node<S: Service>(config: &Config, service: S) -> io::Result<(Node<S>, Storage, Arc<File>, Clock)> {
+    let (mut storage, meta, snapshot, log) =
+        Storage::open(&config.data_dir, config.log_fsync, config.node.raft.log_window_bytes)?;
+    storage.snapshots_kept = config.node.snapshots_kept;
+    let mut clock = Clock::new();
+    let mut node =
+        Node::new(config.node.clone(), service, meta, snapshot.as_ref().map(|s| s.0.clone()), log, clock.now());
+    if let Some((_, mut bytes)) = snapshot {
+        node.restore(&mut bytes)?;
+    }
+    let lock = Arc::new(storage.log.lock()?);
+    Ok((node, storage, lock, clock))
 }
 
 /// The wait before dialling again after one of `redial` failed.

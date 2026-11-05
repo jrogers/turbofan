@@ -69,7 +69,9 @@ pub struct Log {
     /// and how much has been written since the last.
     flush_behind: Option<mpsc::SyncSender<File>>,
     unflushed: u64,
-    _lock: File,
+    /// Held while the log is open, and while any handle [`Log::lock`] made is: one node's files,
+    /// one node's at a time.
+    lock: File,
 }
 
 impl Log {
@@ -157,7 +159,7 @@ impl Log {
             cursor: None,
             flush_behind: None,
             unflushed: 0,
-            _lock: lock,
+            lock,
         };
         log.file.seek(SeekFrom::End(0))?;
         Ok(log)
@@ -211,6 +213,18 @@ impl Log {
             entries.doubt();
         }
         Ok(reset.is_some())
+    }
+
+    /// A handle on the directory's lock, which keeps it locked while it's open, though the log is
+    /// dropped: for work on the node's files that may outlive it, a snapshot still being saved by
+    /// a node whose task was stopped, so that a node started again in the same process waits for
+    /// it rather than writing beside it.
+    ///
+    /// # Errors
+    ///
+    /// If the lock's file can't be opened again.
+    pub(crate) fn lock(&self) -> io::Result<File> {
+        self.lock.try_clone()
     }
 
     /// The index the next record must have.
@@ -682,6 +696,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _log = open(dir.path());
         assert_eq!(Log::open(dir.path(), Fsync::EachBatch, |_| {}).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// A handle on the lock keeps the directory locked after the log is dropped, until it's
+    /// dropped too.
+    #[test]
+    fn a_handle_on_the_lock_outlives_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, _) = open(dir.path());
+        let lock = log.lock().unwrap();
+        drop(log);
+        assert_eq!(Log::open(dir.path(), Fsync::EachBatch, |_| {}).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        drop(lock);
+        assert!(Log::open(dir.path(), Fsync::EachBatch, |_| {}).is_ok(), "free once it's dropped");
     }
 
     /// Power lost mid-write leaves any prefix of the last record: it's dropped, and the log goes

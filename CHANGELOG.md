@@ -4,6 +4,15 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Fixed
+
+- A snapshot being saved holds the node's data directory locked until it's written. `serve`
+  stopped (its task aborted, say) left the thread saving it running, but let go of the lock: a
+  node started again in the same process could then save its own beside it, one of them failing
+  with `NotFound` and stopping its node. A process stopped can't, its threads going with it.
+
 ## 0.6.0 (2026-11-04)
 
 ### Added
