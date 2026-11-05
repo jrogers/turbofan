@@ -215,3 +215,9 @@ running cluster can take it one node at a time.
 
 Without the `tls` feature the API is the same, but loading any TLS configuration is an error, and
 the flags are refused: there's never TLS to run, nor a TLS dependency to license.
+
+[first-service]: first-service.md
+[membership]: membership.md
+[operations]: operations.md
+[performance]: performance.md
+[upgrades]: upgrades.md

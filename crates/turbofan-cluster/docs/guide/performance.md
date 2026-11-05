@@ -89,3 +89,7 @@ buffered as plain TCP's are. With fsync, the disk is what limits it: on macOS a 
 throughput with fsync is still over 100,000 a second: each sync covers every message that arrived
 during the one before. A Linux server's NVMe drive, with power-loss protection, syncs much faster;
 measure yours.
+
+[clients]: clients.md
+[operations]: operations.md
+[running]: running.md

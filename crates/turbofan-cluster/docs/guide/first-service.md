@@ -226,3 +226,6 @@ network, and replay any failure exactly.
 - `driver` runs a node on tokio, with TCP and files; `ClusterClient` runs a client.
 
 [ARCHITECTURE.md](https://github.com/jrogers/turbofan/blob/main/docs/ARCHITECTURE.md) goes through it in full.
+
+[running]: running.md
+[services]: services.md

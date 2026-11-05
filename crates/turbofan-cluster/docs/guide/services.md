@@ -208,3 +208,7 @@ an upgrade.
 The framework's own simulation tests a cluster under failures; it doesn't know your service. A
 test of your own that kills and restarts nodes under load, and checks nothing is lost or doubled,
 is worth having for any service: `tests/cluster.rs` does it for an echo service.
+
+[clients]: clients.md
+[first-service]: first-service.md
+[upgrades]: upgrades.md

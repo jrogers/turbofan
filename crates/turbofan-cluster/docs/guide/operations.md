@@ -171,3 +171,7 @@ nowhere. The main ones:
 
 Every node reports the same applied state, from when it started; scrape them all, and read the
 leader's for the latencies.
+
+[clients]: clients.md
+[membership]: membership.md
+[upgrades]: upgrades.md

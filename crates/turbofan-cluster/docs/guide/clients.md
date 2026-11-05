@@ -176,3 +176,6 @@ another runtime, or one that polls its sockets itself. The caller:
 
 `send`, `applied` and `close` are as on `ClusterClient`. The task behind `ClusterClient`, `run`
 in `src/remote.rs`, is this loop on tokio, and the place to start.
+
+[membership]: membership.md
+[running]: running.md

@@ -107,3 +107,6 @@ what the learner had is lost: count it from the old leader's commit index and th
 index, from `status` before the loss, or the metrics. A client whose messages or responses were among it
 closes its session, `CloseReason::Diverged` (see [Clients][clients]), to open another and ask the
 service what it has. Keep the learner close: watch its lag.
+
+[clients]: clients.md
+[operations]: operations.md

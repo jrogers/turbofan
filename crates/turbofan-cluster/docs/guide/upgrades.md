@@ -90,3 +90,5 @@ leader's `status` says what's active.
 Protocol 1 makes the responses each session keeps (`egress_ring_entries`) the cluster's: every
 `activate` logs the leader's, for every node. To change it, restart the nodes with the new value,
 then `activate` again.
+
+[operations]: operations.md
