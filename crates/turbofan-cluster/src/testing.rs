@@ -298,6 +298,12 @@ impl<S: Service> Cluster<S> {
         self.clients[client.0].events.drain(..).collect()
     }
 
+    /// What [`Cluster::events`] would take, left for it: for a [`Cluster::run_until`] to wait on
+    /// what a client is told, `|c| c.peek_events(venue).any(..)`.
+    pub fn peek_events(&self, client: ClientId) -> impl Iterator<Item = &Event> {
+        self.clients[client.0].events.iter()
+    }
+
     /// `client`'s session, once one is open.
     #[must_use]
     pub fn session(&self, client: ClientId) -> Option<SessionId> {

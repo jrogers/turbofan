@@ -269,7 +269,8 @@ assert_eq!(answers, [Event::Message(b"1".to_vec()), Event::Message(b"2".to_vec()
 `Cluster::crash` and `restart` stop and start a node from what it had written, `isolate` and
 `heal` cut it off from the others, and `transfer_leadership` and `take_snapshot` ask what an
 operator would. `Cluster::service` is a node's service, to check every node applied the same
-state. `testing::Builder` sets the seed, the latencies and the nodes' configuration (snapshot
+state, and `peek_events` what a client has been told without taking it, for `run_until` to wait
+on. `testing::Builder` sets the seed, the latencies and the nodes' configuration (snapshot
 often, say, to test `restore`). It doesn't model damaged disks, changes of members or upgrades;
 its API may change before 1.0. The edges that reach a cluster over the network, with
 `ClusterClient`, are still tested against nodes over TCP: `tests/cluster.rs` does that for an

@@ -82,7 +82,9 @@ fn messages_are_applied_on_every_node_and_answered() {
     let alice = cluster.connect(b"alice").unwrap();
     cluster.send_batch(alice, numbered(0, 3)).unwrap();
     assert!(cluster.run_until(Duration::from_secs(1), |c| applied_everywhere(c, 3) && c.client(alice).unacked() == 0));
-    cluster.run_for(10 * MS);
+    let answered = |c: &Cluster<Tally>| c.peek_events(alice).filter(|e| matches!(e, Event::Message(_))).count() == 3;
+    assert!(cluster.run_until(Duration::from_secs(1), answered));
+    assert_eq!(cluster.peek_events(alice).count(), 4, "peeked, not taken");
     let events = cluster.events(alice);
     assert!(matches!(events[0], Event::Opened(_)), "{events:?}");
     assert_eq!(answers(&events), ["1", "2", "3"]);
