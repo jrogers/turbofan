@@ -4,12 +4,14 @@ use super::*;
 
 impl Raft {
     pub(super) fn on_request_vote(&mut self, from: NodeId, m: &wire::RequestVoteRef<'_>, now: u64) {
-        // A node that knows no members yet, joining (perhaps wiped, and started again under its old
-        // ID), doesn't vote: with nothing in its log, its vote could elect a removed node, standing
-        // in members the cluster has left. One that has learned members votes, even before it's
-        // among them, as Raft has a new member do; its log then turns a stale candidate down.
-        let up_to_date =
-            (m.last_term(), m.last_index()) >= (self.last_term(), self.last_index()) && !self.members().is_empty();
+        // A node joining with nothing (perhaps wiped, and started again under its old ID) doesn't
+        // vote: with no log, its vote could elect a removed node, standing in members the cluster
+        // has left. One with members or a log votes, even before it's among them, as Raft has a
+        // new member do; its log then turns a stale candidate down. A member being added may have
+        // the log before the entry that adds it, and so no members: its vote may be one an
+        // election needs, the voters in doubt taking every member's.
+        let knows = !self.members().is_empty() || self.last_index() > 0;
+        let up_to_date = (m.last_term(), m.last_index()) >= (self.last_term(), self.last_index()) && knows;
         let pre_vote = m.pre_vote() == 1;
         let granted = if pre_vote {
             let leader_alive = self.role == Role::Leader

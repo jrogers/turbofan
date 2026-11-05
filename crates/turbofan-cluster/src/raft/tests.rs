@@ -218,7 +218,7 @@ fn a_vote_is_persisted_in_the_batch_that_grants_it() {
     assert_eq!(vote.granted(), 0);
 }
 
-/// A node that knows no members yet, as one wiped and joining again under its old ID does,
+/// A node with no members and no log yet, as one wiped and joining again under its old ID has,
 /// votes for no one: not even a candidate whose log is ahead of its own, which may be a removed
 /// node standing in members the cluster has left.
 #[test]
@@ -309,6 +309,34 @@ fn each_voter_in_doubt_takes_one_more_vote() {
     codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt: 0, round }, &mut frame).unwrap();
     raft.on_message(NodeId(5), &decode(&frame), 0);
     assert_eq!(raft.role(), Role::Candidate, "every member");
+}
+
+/// A member being added has the log before the entry that adds it, so it knows no members, but
+/// it votes: when the voters in doubt take every member's vote, an election needs its, and
+/// without it none is ever won (a nightly simulation's seed 420189338040480).
+#[test]
+fn a_member_that_has_the_log_but_not_its_members_votes() {
+    let mut adding = Vec::new();
+    let four: Vec<wire::MembersMember<'_>> =
+        [1, 2, 3, 4].map(|id| wire::MembersMember { id, learner: 0, peer: b"p", client: b"c", admin: b"a" }).to_vec();
+    wire::Members { timestamp: 0, member: &four }.encode_into(&mut adding).unwrap();
+    let mut records = log(&[1]);
+    Record { term: 1, index: 2, payload: &adding }.encode_into(&mut records);
+    let mut leader_log = Entries::from_records(&records, usize::MAX);
+    leader_log.doubt();
+    let mut follower_log = entries(&[1]);
+    follower_log.doubt();
+    let meta = Meta { term: 1, vote: None };
+    let mut rafts = vec![
+        Raft::new(config(1, &[1, 2, 3]), meta, None, leader_log, 0),
+        Raft::new(config(2, &[1, 2, 3]), meta, None, follower_log, 0),
+        Raft::new(config(3, &[1, 2, 3]), meta, None, entries(&[1]), 0),
+        Raft::new(config(4, &[]), meta, None, entries(&[1]), 0),
+    ];
+    assert_eq!(ids(rafts[0].members()), [1, 2, 3, 4]);
+    assert!(rafts[3].members().is_empty());
+    // Four voters, two in doubt: a majority of three and two more, so all four.
+    elect(&mut rafts, &[1, 2, 3, 4], 1, 0);
 }
 
 /// A pre-vote delayed past its round doesn't count in the next: granted while no leader was

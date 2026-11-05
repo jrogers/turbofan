@@ -4,6 +4,15 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Fixed
+
+- A member being added votes once it has some of the log, though it doesn't yet have the entry
+  that adds it, and so knows no members. It refused, and with voters in doubt, which take every
+  member's vote, no election could be won: the cluster had no leader until a node was restarted
+  with its `doubt` file deleted. A node with no members and no log still votes for no one.
+
 ## 0.6.1 (2026-11-04)
 
 ### Fixed
