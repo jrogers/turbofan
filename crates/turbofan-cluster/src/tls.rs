@@ -160,8 +160,9 @@ pub(crate) enum Conn {
     Tls(Box<dyn Stream>),
 }
 
-/// The half of a [`Conn`] read from, and the half written to, apart.
-pub(crate) type ReadHalf = Box<dyn AsyncRead + Unpin + Send>;
+/// The half of a [`Conn`] read from, and the half written to, apart. The one read from is
+/// buffered here, for a reader to see what's arrived whole ([`BufReader::buffer`]).
+pub(crate) type ReadHalf = BufReader<Box<dyn AsyncRead + Unpin + Send>>;
 pub(crate) type WriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
 
 impl Conn {
@@ -179,11 +180,11 @@ impl Conn {
                 let stream = stream.into_inner();
                 assert!(stream.buffer().is_empty(), "a connection is split flushed");
                 let (read, write) = stream.into_inner().into_split();
-                (Box::new(BufReader::new(Cursor::new(read_ahead).chain(read))), Box::new(BufWriter::new(write)))
+                (BufReader::new(Box::new(Cursor::new(read_ahead).chain(read))), Box::new(BufWriter::new(write)))
             }
             Self::Tls(stream) => {
                 let (read, write) = tokio::io::split(stream);
-                (Box::new(BufReader::new(read)), Box::new(BufWriter::new(write)))
+                (BufReader::new(Box::new(read)), Box::new(BufWriter::new(write)))
             }
         }
     }

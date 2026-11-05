@@ -36,6 +36,10 @@ a patch version (0.1.1) doesn't.
 - Without fsync, a node writes a few appends on its own task rather than handing them to a
   blocking thread, whose handing over and back took three times as long as the write: the
   benchmark's latency, 66 µs at p50 and 105 µs at p99, is 56 µs and about 85 µs.
+- A client's connection hands the node the frames it has read whole together, up to 256, not one
+  at a time: a busy node's connections queued for it, and many clients went slower than a few.
+  The benchmark's throughput run, 8 clients of 256 in flight, goes from 940,000 messages a second
+  to 1,045,000; 64 clients of 256, from 555,000 to 1,100,000.
 
 ### Breaking
 

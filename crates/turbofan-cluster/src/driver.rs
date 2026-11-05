@@ -44,8 +44,11 @@ use crate::{snapshot, wire};
 /// Inputs waiting for the node, from clients and from the rest: past this, connections wait to
 /// hand theirs over.
 const MAX_QUEUED_INPUTS: usize = 4096;
-/// Inputs taken into one batch before persisting it.
+/// Inputs taken into one batch before persisting it, a client's or an operator's counted by its
+/// frames.
 const MAX_BATCH_INPUTS: usize = 1024;
+/// The most frames a connection hands the node at once: those it has read whole, together.
+const MAX_FRAMES_AN_INPUT: usize = 256;
 /// The most a write made on the node's own task appends (see [`writes_inline`]).
 const MAX_INLINE_WRITE_BYTES: usize = 4096;
 /// Frames waiting to go to one peer or connection. Past this a peer's are dropped (Raft resends)
@@ -193,8 +196,9 @@ pub fn restore(from: &Path, config: &Config) -> io::Result<(u64, u64)> {
 
 enum Input {
     Peer(NodeId, Vec<u8>),
-    Client(ConnId, Vec<u8>),
-    Admin(ConnId, Vec<u8>),
+    /// Frames a connection read together: up to [`MAX_FRAMES_AN_INPUT`].
+    Client(ConnId, Vec<Vec<u8>>),
+    Admin(ConnId, Vec<Vec<u8>>),
     Open(ConnId, mpsc::Sender<Vec<u8>>),
     Closed(ConnId),
     /// A snapshot from [`node::Outputs::save`] is written, or writing it failed.
@@ -343,23 +347,23 @@ impl<S: Service + 'static> Core<S> {
                 }
                 input = rx.recv(), if take_inputs => {
                     let Some(input) = input else { return Ok(()) };
-                    self.handle(input)?;
-                    for _ in 1..MAX_BATCH_INPUTS {
+                    let mut taken = self.handle(input)?;
+                    while taken < MAX_BATCH_INPUTS {
                         let Ok(input) = rx.try_recv() else { break };
-                        self.handle(input)?;
+                        taken += self.handle(input)?;
                     }
                 }
                 // A backlogged leader leaves clients waiting, so TCP holds them back, until what
                 // it has proposed commits.
                 input = client_rx.recv(), if take_inputs && !self.node.raft().backlogged() => {
                     let Some(input) = input else { return Ok(()) };
-                    self.handle(input)?;
-                    for _ in 1..MAX_BATCH_INPUTS {
+                    let mut taken = self.handle(input)?;
+                    while taken < MAX_BATCH_INPUTS {
                         if self.node.raft().backlogged() {
                             break;
                         }
                         let Ok(input) = client_rx.try_recv() else { break };
-                        self.handle(input)?;
+                        taken += self.handle(input)?;
                     }
                 }
                 () = tokio::time::sleep_until(wake.into()), if take_inputs => self.node.on_tick(self.clock.now()),
@@ -367,12 +371,24 @@ impl<S: Service + 'static> Core<S> {
         }
     }
 
-    fn handle(&mut self, input: Input) -> io::Result<()> {
+    /// Hands `input` to the node, returning how many inputs it counts as: a client's or an
+    /// operator's, its frames.
+    fn handle(&mut self, input: Input) -> io::Result<usize> {
         let now = self.clock.now();
         match input {
             Input::Peer(from, frame) => self.node.on_peer(from, &decode(&frame), now),
-            Input::Client(conn, frame) => self.node.on_client(conn, &decode(&frame), now),
-            Input::Admin(conn, frame) => self.node.on_admin(conn, &decode(&frame), now),
+            Input::Client(conn, frames) => {
+                for frame in &frames {
+                    self.node.on_client(conn, &decode(frame), now);
+                }
+                return Ok(frames.len());
+            }
+            Input::Admin(conn, frames) => {
+                for frame in &frames {
+                    self.node.on_admin(conn, &decode(frame), now);
+                }
+                return Ok(frames.len());
+            }
             Input::Open(conn, tx) => {
                 self.conns.insert(conn, tx);
             }
@@ -382,7 +398,7 @@ impl<S: Service + 'static> Core<S> {
             }
             Input::SnapshotSaved(saved) => self.node.on_snapshot_saved(saved?),
         }
-        Ok(())
+        Ok(1)
     }
 
     /// Takes the node's outputs, and carries out what goes at once (see [`crate::pipeline`]),
@@ -806,6 +822,28 @@ impl Idle {
     }
 }
 
+/// Reads into `frames` those of `reader`'s that have arrived whole, waiting for none, until there
+/// are [`MAX_FRAMES_AN_INPUT`]; skipping any of a type this node doesn't know, as
+/// [`read_valid_frame`] does. A malformed one fails, after the frames before it.
+async fn read_buffered(reader: &mut tls::ReadHalf, frames: &mut Vec<Vec<u8>>) -> io::Result<()> {
+    while frames.len() < MAX_FRAMES_AN_INPUT && whole_frame(reader.buffer()) {
+        // In the buffer: read without waiting on the connection.
+        let frame = read_frame(reader).await?;
+        match codec::decode_frame(&frame) {
+            Ok(Some(_)) => frames.push(frame),
+            Err(e) if e.is_unknown_message() => {}
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed frame")),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `buffered` starts with a whole frame, its length and all.
+fn whole_frame(buffered: &[u8]) -> bool {
+    let Some(len) = buffered.first_chunk::<4>().map(|len| u32::from_le_bytes(*len)) else { return false };
+    usize::try_from(len).is_ok_and(|len| buffered.len() - 4 >= len)
+}
+
 /// [`read_valid_frame`], failing if none comes within `idle`'s limit of the last. The read lives
 /// through the timer firing early: a frame half read isn't lost.
 async fn read_within(reader: &mut (impl AsyncRead + Unpin), idle: Option<&mut Idle>) -> io::Result<Vec<u8>> {
@@ -961,8 +999,12 @@ async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
         tokio::select! {
             frame = read_within(&mut reader, idle.as_mut()) => {
                 let Ok(frame) = frame else { break };
-                let input = if role == wire::Role::Admin { Input::Admin(conn, frame) } else { Input::Client(conn, frame) };
-                if inputs.send(input).await.is_err() {
+                // With the rest read whole meanwhile: one input for them all, not one a frame, which
+                // a busy node's connections queued for.
+                let mut frames = vec![frame];
+                let rest = read_buffered(&mut reader, &mut frames).await;
+                let input = if role == wire::Role::Admin { Input::Admin(conn, frames) } else { Input::Client(conn, frames) };
+                if inputs.send(input).await.is_err() || rest.is_err() {
                     break;
                 }
             }
@@ -1120,6 +1162,43 @@ mod tests {
         assert!(ours.same_cluster(theirs));
         ours.epoch.store(7, Ordering::Relaxed);
         assert!(!ours.same_cluster(theirs), "once this node learns its epoch");
+    }
+
+    /// What has arrived whole is read without waiting: the frames after the first, an unknown
+    /// one skipped, up to one only half arrived, which waits; at most `MAX_FRAMES_AN_INPUT`; and
+    /// a malformed one fails after those before it.
+    #[tokio::test]
+    async fn frames_read_whole_are_taken_together() {
+        let keepalive = |session| {
+            let mut frame = Vec::new();
+            codec::encode_frame(&wire::KeepAlive { session }, &mut frame).unwrap();
+            frame
+        };
+        let mut unknown = keepalive(9);
+        unknown[6..8].copy_from_slice(&999_u16.to_le_bytes());
+        let half = keepalive(4);
+        let bytes = [keepalive(1), keepalive(2), unknown, keepalive(3), half[..half.len() - 1].to_vec()].concat();
+        let reader =
+            |bytes: Vec<u8>| -> tls::ReadHalf { tokio::io::BufReader::new(Box::new(std::io::Cursor::new(bytes))) };
+        let mut ours = reader(bytes);
+        let mut frames = vec![read_frame(&mut ours).await.unwrap()];
+        read_buffered(&mut ours, &mut frames).await.unwrap();
+        assert_eq!(frames, [keepalive(1), keepalive(2), keepalive(3)]);
+        assert!(!whole_frame(ours.buffer()), "the half arrived waits");
+
+        // A buffer is filled by the read of a connection's first frame.
+        let mut ours = reader(vec![keepalive(1); MAX_FRAMES_AN_INPUT + 1].concat());
+        let mut frames = vec![read_frame(&mut ours).await.unwrap()];
+        read_buffered(&mut ours, &mut frames).await.unwrap();
+        assert_eq!(frames.len(), MAX_FRAMES_AN_INPUT, "though more had arrived");
+        assert!(whole_frame(ours.buffer()));
+
+        let mut malformed = keepalive(2);
+        malformed[8..10].copy_from_slice(&7_u16.to_le_bytes());
+        let mut ours = reader([keepalive(1), malformed, keepalive(3)].concat());
+        let mut frames = vec![read_frame(&mut ours).await.unwrap()];
+        assert!(read_buffered(&mut ours, &mut frames).await.is_err());
+        assert_eq!(frames, [keepalive(1)], "those before it");
     }
 
     /// A connection from a newer node isn't dropped for a message this one doesn't know: it's
