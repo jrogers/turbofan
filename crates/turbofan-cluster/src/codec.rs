@@ -16,6 +16,9 @@ use crate::wire;
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
 /// The most a service payload can be, in a client message or a log entry (`payloadData`).
 pub const MAX_PAYLOAD_BYTES: usize = 65536;
+/// Room made for a frame before it's encoded: enough for a client's message or a response with a
+/// payload of 64 bytes, in one allocation.
+const SMALL_FRAME_BYTES: usize = 128;
 /// The most records one `AppendEntries` carries, which bounds a follower's work per message.
 pub const MAX_ENTRIES_PER_APPEND: usize = 1024;
 /// `Hello.magic`.
@@ -85,6 +88,9 @@ impl From<SbeError> for CodecError {
 /// If a data field is longer than its encoding allows, or the frame would be over
 /// [`MAX_FRAME_BYTES`]. `out` is then as it was.
 pub fn encode_frame(message: &impl Encode, out: &mut Vec<u8>) -> Result<(), CodecError> {
+    // A message is encoded in pieces, each growing `out`: from empty, a Vec doubled four times
+    // or five for a small frame, a tenth of the time a node spent on clients' messages.
+    out.reserve(SMALL_FRAME_BYTES);
     let start = out.len();
     out.extend_from_slice(&[0; 4]);
     if let Err(error) = message.encode_into(out) {

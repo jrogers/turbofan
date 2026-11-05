@@ -40,6 +40,8 @@ a patch version (0.1.1) doesn't.
   at a time: a busy node's connections queued for it, and many clients went slower than a few.
   The benchmark's throughput run, 8 clients of 256 in flight, goes from 940,000 messages a second
   to 1,045,000; 64 clients of 256, from 555,000 to 1,100,000.
+- A frame is encoded into room made for it, not a buffer grown from empty four or five times:
+  the benchmark's throughput goes from 1,040,000 messages a second to 1,110,000.
 
 ### Breaking
 
