@@ -32,6 +32,26 @@ down when they show.
   faults between clients and nodes, which the proxy doesn't stand between; the soak over TLS,
   where the proxy can't read a hello to tell one link from another; and the driver's IO in the
   simulation, the thorough way.
+- **Linearizability, checked across clients.** The simulation checks each session on its own:
+  every message and response once, in order, and every node with the same state. Nothing checks
+  real-time order between clients: a message answered before another was sent, from any client,
+  must come before it in the log, or a stale leader answering, or a response ahead of its
+  commit, goes unseen. The simulation knows the log's order and owns the clock, so it's an
+  assertion on what it already has, with none of the search Jepsen's checkers (Knossos, Elle)
+  need to find an order.
+- **Clock skew.** Every node in the simulation reads the same clock. The cluster's time is the
+  leader's, as it logged it, held still when a new leader's is behind, and the driver slews its
+  clock toward the wall clock; timers and session timeouts ride on that through failovers. Give
+  each simulated node an offset and a drift of its own, and jumps, as NTP and a VM resuming make.
+- **A node paused, then resumed.** A long garbage collection or a VM stalled freezes a whole
+  node, which then resumes with a stale view of the cluster: a leader that doesn't know it's
+  been replaced, its clock jumped. The simulation stalls disks and delays messages, but never
+  freezes a node and lets it resume. Model it there, and in the soak by holding a node's task.
+- **Jepsen, once, before 1.0.** The production binaries as processes on machines of their own,
+  faulted at the operating system (iptables, tc, `SIGKILL`, `SIGSTOP`) and checked black-box:
+  what in-process tests can't reach, the driver, the command line and a real fsync among it, and
+  the check trading systems' developers trust. An audit at 1.0 rather than CI, which a cluster
+  of VMs and a Clojure harness would make costly to keep.
 
 ## 3. Docs and outreach
 
