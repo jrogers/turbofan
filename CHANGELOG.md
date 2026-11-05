@@ -6,6 +6,14 @@ a patch version (0.1.1) doesn't.
 
 ## Unreleased
 
+### Changed
+
+- Every write is made on a thread again, as before 0.6.0, which wrote a few appends on the node's
+  own task when the log didn't sync. A write the kernel held up there (Linux throttles writers
+  when too much is waiting to be written back) held the node's heartbeats up with it, and one
+  held past the election timeout was an election. A quiet cluster's message takes about 10 µs
+  longer for it (p50 55 µs to 65 µs on the benchmark); a busy one's throughput is the same.
+
 ### Added
 
 - A cluster in memory, for a service's tests: `turbofan_cluster::testing`, with the `testing`

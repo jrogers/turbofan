@@ -14,11 +14,6 @@ down when they show.
   majority losing power together may lose committed entries. Spread the nodes over power
   domains, and cover a whole site with a standby (a learner in another region, to `promote`) or
   `serve --fsync`.
-- **A slow write.** Without fsync, a node writes a few appends on its own task, a copy to the page
-  cache (`writes_inline`, `src/driver.rs`), which is quicker than handing them to a thread. But a
-  write the kernel holds up (Linux throttles writers when too much is dirty) holds up the node's
-  heartbeats with it: one past the election timeout is an election. Hand writes to a thread for
-  a while after one is slow, or make writing on the task a setting.
 
 ## 2. Toward 1.0
 
@@ -56,7 +51,8 @@ down when they show.
   reads would be faster but add a second path through the service; add them if a service needs
   read throughput the log can't give.
 - **Several services per cluster.** Run one cluster per service.
-- **Fewer hops between a client and the leader.** Of a quiet cluster's 56 µs a message, about 25
+- **Fewer hops between a client and the leader.** Of a quiet cluster's 65 µs a message, about 25
   are tasks waking each other: a connection's reader and writer are tasks of their own, at both
-  ends, so a peer slow to read never stops one writing, nor one slow to write one reading. Fewer
-  would cost that.
+  ends, so a peer slow to read never stops one writing, nor one slow to write one reading. About
+  10 more are a write handed to a thread and back, on the leader and on the follower whose ack
+  commits it, so a write the disk holds up never holds up the node. Fewer would cost those.

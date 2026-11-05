@@ -28,7 +28,9 @@ commit. The busier the cluster, the bigger the batches.
 - **fsync.** Without `--fsync` (the default), a write is the page cache's, and the follower's
   copy is the redundancy (see [Running a cluster][running]). With it, every batch waits for the
   disk: on a fast NVMe drive a little, on network storage a lot. Choose with the benchmark on your
-  hardware.
+  hardware. Either way, a write is made on a thread of its own, the node going on meanwhile, so
+  a write the disk holds up (Linux throttles writers when too much is waiting to be written back)
+  never holds up the node's heartbeats, and with them the cluster's leader.
 - **The service.** Every message is applied on every node, one at a time, on the node's one task.
   A slow callback holds up everything after it. Keep callbacks to the state change and the
   responses; work that can wait goes in a proposal of its own, and work outside the state machine
@@ -64,24 +66,24 @@ CI runs it on every push, and its summary has each run's table.
 ## Results
 
 On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2, Rust 1.98.1, at
-commit `1d63233` (after 0.5.0), November 2026. Each figure is the median of three runs of 10 s,
+commit `cf027a9` (after 0.6.1), November 2026. Each figure is the median of three runs of 10 s,
 `--features tls`.
 
 | run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
 |---|---|---:|---:|---:|---:|
-| latency | 1 × 1 | 17,372 | 56 µs | 82 µs | 140 µs |
-| throughput | 8 × 256 | 1,097,041 | 1.05 ms | 7.43 ms | 10.32 ms |
-| latency, fsync | 1 × 1 | 120 | 7.99 ms | 14.07 ms | 16.03 ms |
-| throughput, fsync | 8 × 256 | 116,590 | 17.23 ms | 29.49 ms | 40.40 ms |
-| latency, TLS | 1 × 1 | 16,325 | 59 µs | 88 µs | 150 µs |
-| throughput, TLS | 8 × 256 | 1,098,952 | 1.05 ms | 8.04 ms | 11.14 ms |
-| latency, TLS, fsync | 1 × 1 | 127 | 7.95 ms | 13.78 ms | 14.97 ms |
-| throughput, TLS, fsync | 8 × 256 | 113,910 | 17.84 ms | 29.13 ms | 39.36 ms |
+| latency | 1 × 1 | 14,792 | 65 µs | 102 µs | 133 µs |
+| throughput | 8 × 256 | 1,113,781 | 1.03 ms | 7.14 ms | 10.24 ms |
+| latency, fsync | 1 × 1 | 139 | 6.94 ms | 11.97 ms | 14.90 ms |
+| throughput, fsync | 8 × 256 | 126,891 | 16.03 ms | 27.63 ms | 31.72 ms |
+| latency, TLS | 1 × 1 | 14,245 | 68 µs | 106 µs | 139 µs |
+| throughput, TLS | 8 × 256 | 1,095,030 | 1.06 ms | 7.89 ms | 10.66 ms |
+| latency, TLS, fsync | 1 × 1 | 122 | 8.01 ms | 14.09 ms | 16.12 ms |
+| throughput, TLS, fsync | 8 × 256 | 112,290 | 18.09 ms | 30.68 ms | 37.97 ms |
 
 Without fsync, a message is committed in tens of microseconds, and no one task is busy: the
 throughput run is bound by its own window, 2,048 messages in flight over a round trip of about a
-millisecond. More in flight goes faster: 1,350,000 a second with 8 clients of 1,024
-(`BENCH_THROUGHPUT=8x1024`), and 1,130,000 with 64 of 256. TLS costs little, its connections
+millisecond. More in flight goes faster: 1,375,000 a second with 8 clients of 1,024
+(`BENCH_THROUGHPUT=8x1024`), and 1,145,000 with 64 of 256. TLS costs little, its connections
 buffered as plain TCP's are. With fsync, the disk is what limits it: on macOS a sync is
 `F_FULLFSYNC`, which empties the drive's own cache, some milliseconds each. Group commit is why
 throughput with fsync is still over 100,000 a second: each sync covers every message that arrived
