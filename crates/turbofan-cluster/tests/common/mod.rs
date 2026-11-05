@@ -1,0 +1,170 @@
+//! What the tests of a cluster over real TCP and files share: a cluster of three, and a fourth to
+//! add, running a service that echoes and checks each session's messages come once each, in order.
+
+use std::collections::BTreeMap;
+use std::io::{self, Read};
+use std::net::{SocketAddr, TcpListener};
+use std::path::Path;
+use std::time::Duration;
+
+use tokio::task::JoinHandle;
+use turbofan_cluster::client::Event;
+use turbofan_cluster::driver::{self, serve};
+use turbofan_cluster::raft::{self, NodeId};
+use turbofan_cluster::tls::NodeTls;
+use turbofan_cluster::{ClusterClient, Ctx, Service, SessionId, SnapshotWriter, node};
+
+pub const SERVICE_ID: u32 = 7;
+/// The operators' token.
+pub const TOKEN: &[u8] = b"let me in";
+/// The nodes' token, to each other.
+pub const PEER_TOKEN: &[u8] = b"one of us";
+
+/// Answers each message with its own text, and checks they come once each, in order.
+#[derive(Debug, Default)]
+pub struct Echo {
+    pub last: BTreeMap<SessionId, u64>,
+}
+
+impl Service for Echo {
+    /// Only clients that say `ok`.
+    fn authenticate(&self, credentials: &[u8]) -> Option<Vec<u8>> {
+        (credentials == b"ok").then(Vec::new)
+    }
+
+    fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
+        let k: u64 = std::str::from_utf8(payload).unwrap().parse().unwrap();
+        let last = self.last.entry(session).or_default();
+        assert_eq!(k, *last + 1, "applied out of order");
+        *last = k;
+        ctx.send(session, payload).expect("echoes a client payload");
+    }
+
+    fn snapshot(&self) -> SnapshotWriter {
+        let last = self.last.clone();
+        Box::new(move |out| {
+            for (session, last) in &last {
+                out.write_all(&session.0.to_le_bytes())?;
+                out.write_all(&last.to_le_bytes())?;
+            }
+            Ok(())
+        })
+    }
+
+    fn restore(&mut self, from: &mut dyn Read) -> io::Result<()> {
+        let mut bytes = Vec::new();
+        from.read_to_end(&mut bytes)?;
+        let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
+        self.last = words.as_chunks::<2>().0.iter().map(|&[session, last]| (SessionId(session), last)).collect();
+        Ok(())
+    }
+}
+
+/// Free local ports: bound, read and released, so there's a small race with other processes.
+pub fn ports(n: usize) -> Vec<SocketAddr> {
+    let listeners: Vec<TcpListener> = (0..n).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+}
+
+pub struct Cluster {
+    /// Peers', then clients', then operators' addresses, four of each.
+    pub addrs: Vec<SocketAddr>,
+    pub configs: Vec<driver::Config>,
+    pub nodes: Vec<Option<JoinHandle<std::io::Result<()>>>>,
+}
+
+impl Cluster {
+    /// Three members started, and a fourth that can join.
+    pub fn new(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>) -> Self {
+        let addrs = ports(12);
+        let ids: Vec<NodeId> = [1, 2, 3, 4].map(NodeId).into();
+        let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
+        let members: Vec<raft::Member> = ids[..3].iter().map(|&id| member(&addrs, id)).collect();
+        let configs = ids
+            .iter()
+            .map(|&id| {
+                let mut node = node::Config::new(id, if id == NodeId(4) { Vec::new() } else { members.clone() });
+                node.snapshot_every_entries = 50;
+                node.egress_ring_entries = 1024;
+                // The first three know nothing of the fourth until it's added.
+                let peers = ids.iter().filter(|&&m| m <= id.max(NodeId(3))).map(|&m| (m, addr(0, m))).collect();
+                let mut config =
+                    driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(4, id), addr(8, id));
+                config.admin_token = Some(TOKEN.to_vec());
+                config.peer_token = Some(PEER_TOKEN.to_vec());
+                config.tls = tls(id);
+                config
+            })
+            .collect();
+        let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None] };
+        for i in 0..3 {
+            cluster.start(i);
+        }
+        cluster
+    }
+
+    pub fn start(&mut self, i: usize) {
+        let config = self.configs[i].clone();
+        self.nodes[i] = Some(tokio::spawn(async move {
+            // A killed node's blocking write may still hold the directory's lock for a moment.
+            for _ in 0..100 {
+                match serve(config.clone(), Echo::default()).await {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(20)).await
+                    }
+                    other => return other,
+                }
+            }
+            serve(config, Echo::default()).await
+        }));
+    }
+
+    pub async fn kill(&mut self, i: usize) {
+        let node = self.nodes[i].take().unwrap();
+        node.abort();
+        assert!(node.await.unwrap_err().is_cancelled(), "node {} stopped on its own", i + 1);
+    }
+
+    /// The nodes that stopped on their own, and why: for a test that timed out to say.
+    pub async fn stopped(&mut self) -> Vec<String> {
+        let mut stopped = Vec::new();
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            if node.as_ref().is_some_and(JoinHandle::is_finished) {
+                stopped.push(format!("node {}: {:?}", i + 1, node.take().unwrap().await));
+            }
+        }
+        stopped
+    }
+
+    pub fn client_addrs(&self) -> Vec<String> {
+        self.configs.iter().map(|c| c.client_listen.to_string()).collect()
+    }
+}
+
+/// Member `id` of a cluster on `addrs`: peers, then clients, then operators, four of each.
+pub fn member(addrs: &[SocketAddr], id: NodeId) -> raft::Member {
+    let addr = |offset: usize| addrs[offset + usize::from(id) - 1].to_string();
+    raft::Member { id, peer: addr(0), client: addr(4), admin: addr(8), learner: false }
+}
+
+/// Sends `from..=to`, and waits for each to come back, once and in order. Not in time, it names
+/// any node of `cluster` that stopped on its own, which is likelier the cause than the wait.
+pub async fn exchange(cluster: &mut Cluster, client: &mut ClusterClient, from: u64, to: u64) {
+    for k in from..=to {
+        client.send(k.to_string().into_bytes()).await.unwrap();
+    }
+    let mut expected = from;
+    while expected <= to {
+        let Ok(event) = tokio::time::timeout(Duration::from_secs(20), client.recv()).await else {
+            panic!("{expected} not answered in time; stopped on their own: {:?}", cluster.stopped().await);
+        };
+        match event.expect("session open") {
+            Event::Opened(_) => {}
+            Event::Message(payload) => {
+                assert_eq!(String::from_utf8(payload).unwrap(), expected.to_string(), "answered out of order");
+                expected += 1;
+            }
+            event => panic!("{event:?}"),
+        }
+    }
+}

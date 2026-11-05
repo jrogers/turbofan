@@ -42,7 +42,7 @@ replay() {
         # The soak has no seed: its log says what went wrong, and it runs again as long.
         if [ -f "$dir/soak-log/soak.log" ]; then
             echo "    soak failed: see $dir/soak-log/soak.log, and run it again:"
-            echo "    SOAK_SECS=600 cargo test -p turbofan-cluster --release --test cluster busy_clients -- --nocapture"
+            echo "    SOAK_SECS=600 cargo test -p turbofan-cluster --release --test soak -- --nocapture"
         fi
         ;;
     esac

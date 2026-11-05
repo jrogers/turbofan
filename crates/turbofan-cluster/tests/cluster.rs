@@ -1,181 +1,22 @@
 //! Three nodes over real TCP and real files, with a gateway client: messages answered once and in
 //! order while every node in turn, the leader among them, is killed and restarted from disk, and
-//! while a fourth joins and the first leaves; many clients, busy, through the same, a node killed
-//! about every second for `SOAK_SECS`; a fourth, a learner, promoted to a cluster of its
+//! while a fourth joins and the first leaves; a fourth, a learner, promoted to a cluster of its
 //! own once the three are lost, that they can't take back; the three, lost, restored from a
 //! copy of a snapshot; and a node's capture of its log replayed offline.
 
-use std::collections::BTreeMap;
-use std::io::{self, Read};
-use std::net::{SocketAddr, TcpListener};
+use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use tokio::task::JoinHandle;
 use turbofan_cluster::client::Event;
-use turbofan_cluster::driver::{self, serve};
+use turbofan_cluster::driver;
 use turbofan_cluster::raft::{self, NodeId};
 #[cfg(feature = "tls")]
-use turbofan_cluster::tls::ClientTls;
-use turbofan_cluster::tls::NodeTls;
-use turbofan_cluster::{
-    Admin, AdminError, CloseReason, ClusterClient, Ctx, Effect, Service, SessionId, SnapshotWriter, capture, node,
-};
+use turbofan_cluster::tls::{ClientTls, NodeTls};
+use turbofan_cluster::{Admin, AdminError, CloseReason, ClusterClient, Effect, capture};
 
-const SERVICE_ID: u32 = 7;
-/// The operators' token.
-const TOKEN: &[u8] = b"let me in";
-/// The nodes' token, to each other.
-const PEER_TOKEN: &[u8] = b"one of us";
-
-/// Answers each message with its own text, and checks they come once each, in order.
-#[derive(Debug, Default)]
-struct Echo {
-    last: BTreeMap<SessionId, u64>,
-}
-
-impl Service for Echo {
-    /// Only clients that say `ok`.
-    fn authenticate(&self, credentials: &[u8]) -> Option<Vec<u8>> {
-        (credentials == b"ok").then(Vec::new)
-    }
-
-    fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
-        let k: u64 = std::str::from_utf8(payload).unwrap().parse().unwrap();
-        let last = self.last.entry(session).or_default();
-        assert_eq!(k, *last + 1, "applied out of order");
-        *last = k;
-        ctx.send(session, payload).expect("echoes a client payload");
-    }
-
-    fn snapshot(&self) -> SnapshotWriter {
-        let last = self.last.clone();
-        Box::new(move |out| {
-            for (session, last) in &last {
-                out.write_all(&session.0.to_le_bytes())?;
-                out.write_all(&last.to_le_bytes())?;
-            }
-            Ok(())
-        })
-    }
-
-    fn restore(&mut self, from: &mut dyn Read) -> io::Result<()> {
-        let mut bytes = Vec::new();
-        from.read_to_end(&mut bytes)?;
-        let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
-        self.last = words.as_chunks::<2>().0.iter().map(|&[session, last]| (SessionId(session), last)).collect();
-        Ok(())
-    }
-}
-
-/// Free local ports: bound, read and released, so there's a small race with other processes.
-fn ports(n: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<TcpListener> = (0..n).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-}
-
-struct Cluster {
-    /// Peers', then clients', then operators' addresses, four of each.
-    addrs: Vec<SocketAddr>,
-    configs: Vec<driver::Config>,
-    nodes: Vec<Option<JoinHandle<std::io::Result<()>>>>,
-}
-
-impl Cluster {
-    /// Three members started, and a fourth that can join.
-    fn new(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>) -> Self {
-        let addrs = ports(12);
-        let ids: Vec<NodeId> = [1, 2, 3, 4].map(NodeId).into();
-        let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
-        let members: Vec<raft::Member> = ids[..3].iter().map(|&id| member(&addrs, id)).collect();
-        let configs = ids
-            .iter()
-            .map(|&id| {
-                let mut node = node::Config::new(id, if id == NodeId(4) { Vec::new() } else { members.clone() });
-                node.snapshot_every_entries = 50;
-                node.egress_ring_entries = 1024;
-                // The first three know nothing of the fourth until it's added.
-                let peers = ids.iter().filter(|&&m| m <= id.max(NodeId(3))).map(|&m| (m, addr(0, m))).collect();
-                let mut config =
-                    driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(4, id), addr(8, id));
-                config.admin_token = Some(TOKEN.to_vec());
-                config.peer_token = Some(PEER_TOKEN.to_vec());
-                config.tls = tls(id);
-                config
-            })
-            .collect();
-        let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None] };
-        for i in 0..3 {
-            cluster.start(i);
-        }
-        cluster
-    }
-
-    fn start(&mut self, i: usize) {
-        let config = self.configs[i].clone();
-        self.nodes[i] = Some(tokio::spawn(async move {
-            // A killed node's blocking write may still hold the directory's lock for a moment.
-            for _ in 0..100 {
-                match serve(config.clone(), Echo::default()).await {
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        tokio::time::sleep(Duration::from_millis(20)).await
-                    }
-                    other => return other,
-                }
-            }
-            serve(config, Echo::default()).await
-        }));
-    }
-
-    async fn kill(&mut self, i: usize) {
-        let node = self.nodes[i].take().unwrap();
-        node.abort();
-        assert!(node.await.unwrap_err().is_cancelled(), "node {} stopped on its own", i + 1);
-    }
-
-    /// The nodes that stopped on their own, and why: for a test that timed out to say.
-    async fn stopped(&mut self) -> Vec<String> {
-        let mut stopped = Vec::new();
-        for (i, node) in self.nodes.iter_mut().enumerate() {
-            if node.as_ref().is_some_and(JoinHandle::is_finished) {
-                stopped.push(format!("node {}: {:?}", i + 1, node.take().unwrap().await));
-            }
-        }
-        stopped
-    }
-
-    fn client_addrs(&self) -> Vec<String> {
-        self.configs.iter().map(|c| c.client_listen.to_string()).collect()
-    }
-}
-
-/// Member `id` of a cluster on `addrs`: peers, then clients, then operators, four of each.
-fn member(addrs: &[SocketAddr], id: NodeId) -> raft::Member {
-    let addr = |offset: usize| addrs[offset + usize::from(id) - 1].to_string();
-    raft::Member { id, peer: addr(0), client: addr(4), admin: addr(8), learner: false }
-}
-
-/// Sends `from..=to`, and waits for each to come back, once and in order. Not in time, it names
-/// any node of `cluster` that stopped on its own, which is likelier the cause than the wait.
-async fn exchange(cluster: &mut Cluster, client: &mut ClusterClient, from: u64, to: u64) {
-    for k in from..=to {
-        client.send(k.to_string().into_bytes()).await.unwrap();
-    }
-    let mut expected = from;
-    while expected <= to {
-        let Ok(event) = tokio::time::timeout(Duration::from_secs(20), client.recv()).await else {
-            panic!("{expected} not answered in time; stopped on their own: {:?}", cluster.stopped().await);
-        };
-        match event.expect("session open") {
-            Event::Opened(_) => {}
-            Event::Message(payload) => {
-                assert_eq!(String::from_utf8(payload).unwrap(), expected.to_string(), "answered out of order");
-                expected += 1;
-            }
-            event => panic!("{event:?}"),
-        }
-    }
-}
+mod common;
+use common::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cluster_answers_every_message_once_through_failovers() {
@@ -236,78 +77,6 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
         cluster.start(i);
     }
     exchange(&mut cluster, &mut client, next + 100, next + 199).await;
-}
-
-/// Many clients, each keeping many messages in flight in batches, have every one answered once
-/// and in order while every node in turn, the leader among them, is killed and restarted from disk,
-/// about once a second, for `SOAK_SECS` (6 by default): a failover, or dropped connections and a
-/// reattach, mid-batch. The service checks each session's messages are applied once each, in
-/// order; the clients that their responses come so, none lost, and none left unanswered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn busy_clients_lose_nothing_through_failovers() {
-    const CLIENTS: usize = 8;
-    const IN_FLIGHT: u64 = 64;
-    let secs = std::env::var("SOAK_SECS").map_or(6, |s| s.parse().expect("SOAK_SECS is a number"));
-    let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::new(dir.path(), |_| None);
-    let until = tokio::time::Instant::now() + Duration::from_secs(secs);
-    let clients: Vec<_> = (0..CLIENTS)
-        .map(|_| {
-            let addrs = cluster.client_addrs();
-            let client = ClusterClient::connect(addrs, SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
-            tokio::spawn(keep_busy(client, IN_FLIGHT, until))
-        })
-        .collect();
-    let mut kills = 0;
-    while tokio::time::Instant::now() < until {
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        let i = kills % 3;
-        cluster.kill(i).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        cluster.start(i);
-        kills += 1;
-    }
-    let mut answered = 0;
-    for client in clients {
-        let Ok(done) = tokio::time::timeout(Duration::from_secs(30), client).await else {
-            panic!("a client not done in time; stopped on their own: {:?}", cluster.stopped().await);
-        };
-        let (sent, reattached) = done.expect("answered once each, in order");
-        assert!(sent > IN_FLIGHT, "it went on sending: {sent}");
-        answered += sent;
-        eprintln!("a client: {sent} answered, reattached {reattached} times");
-    }
-    assert!(kills >= 3, "every node killed: {kills}");
-    eprintln!("{answered} answered through {kills} kills");
-}
-
-/// Keeps `in_flight` messages in flight on `client` in batches, as each is answered, until
-/// `until`, then waits for the last to be: how many it sent, every one answered once and in order
-/// (else it panics), and how many times it reattached.
-async fn keep_busy(mut client: ClusterClient, in_flight: u64, until: tokio::time::Instant) -> (u64, usize) {
-    let batch = |from: u64, to: u64| (from..to).map(|k| k.to_string().into_bytes());
-    client.send_batch(batch(1, in_flight + 1)).await.unwrap();
-    let (mut sent, mut answered, mut opened, mut events) = (in_flight, 0, 0, Vec::new());
-    while answered < sent {
-        let read = tokio::time::timeout(Duration::from_secs(20), client.recv_many(&mut events, 256)).await;
-        assert!(read.expect("answered in time") > 0, "the session lasts");
-        for event in events.drain(..) {
-            match event {
-                Event::Opened(_) => opened += 1,
-                Event::Message(payload) => {
-                    answered += 1;
-                    assert_eq!(String::from_utf8(payload).unwrap(), answered.to_string(), "once each, in order");
-                }
-                event => panic!("{event:?}"),
-            }
-        }
-        if tokio::time::Instant::now() < until {
-            let more = in_flight - (sent - answered);
-            client.send_batch(batch(sent + 1, sent + 1 + more)).await.unwrap();
-            sent += more;
-        }
-    }
-    (sent, opened - 1)
 }
 
 /// A batch is applied and answered in order, read back a batch at a time, its `client_seq`s the
@@ -488,17 +257,17 @@ async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
     let admin = |i: usize| Admin::new(&addrs[i], SERVICE_ID).with_token(TOKEN).with_timeout(Duration::from_secs(20));
     let asked = admin(0).request_snapshot().await.unwrap();
     // The newest snapshot in its directory, once it's the one asked for or later, as an operator
-    // checks by its name: a quorum has it, this node perhaps only in a moment.
+    // checks by its name: a quorum has it, this node perhaps only in a moment, and perhaps none
+    // before it.
     let snapshots = cluster.configs[0].data_dir.join("snapshots");
     let newest = loop {
         let newest = std::fs::read_dir(&snapshots)
             .unwrap()
             .map(|e| e.unwrap().path())
             .filter(|p| p.extension().is_some_and(|e| e == "snapshot"))
-            .max()
-            .unwrap();
-        let index: u64 = newest.file_stem().unwrap().to_str().unwrap().parse().unwrap();
-        if index >= asked {
+            .max();
+        let index = |p: &Path| -> u64 { p.file_stem().unwrap().to_str().unwrap().parse().unwrap() };
+        if let Some(newest) = newest.filter(|p| index(p) >= asked) {
             break newest;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
