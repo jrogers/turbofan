@@ -238,6 +238,31 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
 }
 
 /// A fourth node joins, and the first leaves, while a client's messages are answered once each.
+/// A batch is applied and answered in order, read back a batch at a time, its `client_seq`s the
+/// next ones: then a message sent alone follows on from it (the service checks each follows the
+/// last).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_is_answered_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new(dir.path(), |_| None);
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 10).await;
+    let seqs = client.send_batch((11..=1000_u64).map(|k| k.to_string().into_bytes())).await.unwrap();
+    assert_eq!(seqs, 11..1001);
+    let (mut events, mut expected) = (Vec::new(), 11);
+    while expected <= 1000 {
+        let read = tokio::time::timeout(Duration::from_secs(20), client.recv_many(&mut events, 256)).await;
+        assert!(read.expect("answered in time") > 0, "session open");
+        for event in events.drain(..) {
+            let Event::Message(payload) = event else { panic!("{event:?}") };
+            assert_eq!(String::from_utf8(payload).unwrap(), expected.to_string(), "answered out of order");
+            expected += 1;
+        }
+    }
+    exchange(&mut cluster, &mut client, 1001, 1010).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_member_joins_and_another_leaves() {
     let dir = tempfile::tempdir().unwrap();

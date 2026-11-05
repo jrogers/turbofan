@@ -20,6 +20,10 @@ a patch version (0.1.1) doesn't.
   (`--tls-reload <secs>`, `NodeTls::reload_every`), and when they've changed and load, uses them
   for the connections after. Files that don't load are left until they do, counted in
   `turbofan_tls_reloads`.
+- `ClusterClient::send_batch` (and `Client::send_batch`) sends many messages in one call, in
+  order, all or none, returning their `client_seq`s; `ClusterClient::recv_many` takes the
+  responses that have arrived, up to a limit. The benchmark's clients use them: its throughput
+  run goes from about 870,000 messages a second to 970,000.
 
 ### Changed
 

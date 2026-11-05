@@ -73,6 +73,33 @@ applied.wait_for(|&done| done >= seq).await?;
 # }
 ```
 
+## Many at once
+
+A gateway with many to send hands them over together: `send_batch` sends each, in order, and
+returns their `client_seq`s, a range. It's one call to the client's task, not one a message, and
+they're written to the connection together. It sends all of them or none: refused as `send`
+would refuse any one of them, it sends nothing, so a batch is never half sent. And `recv_many`
+takes the responses that have arrived, up to a limit, waiting for one if there are none: a
+gateway answering as they come reads them, then sends what they call for in a batch.
+
+```rust,no_run
+# use turbofan_cluster::ClusterClient;
+# use turbofan_cluster::client::Event;
+# async fn gateway(session: &mut ClusterClient) -> Result<(), Box<dyn std::error::Error>> {
+let mut events = Vec::new();
+while session.recv_many(&mut events, 256).await > 0 {
+    let mut orders = Vec::new();
+    for event in events.drain(..) {
+        if let Event::Message(response) = event {
+            orders.push(response); // Whatever the responses call for.
+        }
+    }
+    session.send_batch(orders).await?;
+}
+# Ok(())
+# }
+```
+
 ## When it doesn't hold
 
 A session is the unit of the guarantee. It ends when:
@@ -105,7 +132,8 @@ service answer a request for what was missed (an order's state, say) if it matte
 ## Backpressure
 
 - `send` refuses past `client::MAX_UNACKED` (4096) messages held but not yet applied:
-  `SendError::Full`. Read responses and try again.
+  `SendError::Full`. Read responses and try again. `send_batch` refuses a batch that doesn't fit
+  whole, so one of more than 4096 is always refused.
 - The client queues 4096 events for `recv`; past that, it stops reading the connection until
   they're taken. Keep reading.
 - A leader with 64 MiB of proposals not yet committed (`max_uncommitted_bytes`) takes nothing

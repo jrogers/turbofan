@@ -3,7 +3,8 @@
 //! table, which CI puts in its summary.
 //!
 //! Two runs a mode. One client with one message in flight: the latency of a commit when nothing
-//! queues. Then several clients each keeping many in flight: throughput, the latency then mostly
+//! queues. Then several clients each keeping many in flight, as a gateway does, answering the
+//! responses that have arrived with a batch of as many: throughput, the latency then mostly
 //! waiting in line. Messages are 64 bytes, answered with 8. Each run measures for `BENCH_SECS`
 //! (10 by default) after a second's warm-up.
 //!
@@ -322,34 +323,39 @@ fn per_mille(sorted: &[u64], q: usize) -> String {
     sorted.get(sorted.len().saturating_sub(1) * q / 1000).map_or("-".into(), |&ns| micros(ns))
 }
 
-/// Keeps `window` messages in flight until `end`, sending the next as each is answered. Returns
-/// their latencies, and how many times the client reattached: its session goes on, each response
-/// still once and in order, so the timings hold.
+/// Keeps `window` messages in flight until `end`, sending as many as were answered, together,
+/// once the responses that have arrived are read. Returns their latencies, and how many times the
+/// client reattached: its session goes on, each response still once and in order, so the timings
+/// hold.
 async fn keep_sending(mut client: ClusterClient, window: usize, warm: Instant, end: Instant) -> (Vec<u64>, usize) {
     let payload = vec![7; PAYLOAD_BYTES];
-    let mut in_flight = VecDeque::new();
-    for _ in 0..window {
-        in_flight.push_back(Instant::now());
-        client.send(payload.clone()).await.unwrap();
-    }
-    let (mut latencies, mut reattached) = (Vec::new(), 0);
+    let mut in_flight: VecDeque<Instant> = std::iter::repeat_n(Instant::now(), window).collect();
+    client.send_batch(std::iter::repeat_n(payload.clone(), window)).await.unwrap();
+    let (mut latencies, mut reattached, mut events) = (Vec::new(), 0, Vec::new());
     loop {
-        let event = client.recv().await.expect("the session lasts");
-        if let Event::Opened(session) = event {
-            eprintln!("session {session:?} reattached {:.1?} after the warm-up", Instant::now().duration_since(warm));
-            reattached += 1;
-            continue;
+        assert!(client.recv_many(&mut events, window).await > 0, "the session lasts");
+        let mut answered = 0;
+        for event in events.drain(..) {
+            if let Event::Opened(session) = event {
+                eprintln!(
+                    "session {session:?} reattached {:.1?} after the warm-up",
+                    Instant::now().duration_since(warm)
+                );
+                reattached += 1;
+                continue;
+            }
+            let Event::Message(_) = event else { panic!("unexpected {event:?}") };
+            let (sent, now) = (in_flight.pop_front().unwrap(), Instant::now());
+            if now >= end {
+                return (latencies, reattached);
+            }
+            if sent >= warm {
+                latencies.push(u64::try_from((now - sent).as_nanos()).unwrap());
+            }
+            answered += 1;
         }
-        let Event::Message(_) = event else { panic!("unexpected {event:?}") };
-        let (sent, now) = (in_flight.pop_front().unwrap(), Instant::now());
-        if now >= end {
-            return (latencies, reattached);
-        }
-        if sent >= warm {
-            latencies.push(u64::try_from((now - sent).as_nanos()).unwrap());
-        }
-        in_flight.push_back(Instant::now());
-        client.send(payload.clone()).await.unwrap();
+        in_flight.extend(std::iter::repeat_n(Instant::now(), answered));
+        client.send_batch(std::iter::repeat_n(payload.clone(), answered)).await.unwrap();
     }
 }
 

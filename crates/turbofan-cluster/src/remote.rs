@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ const MAX_QUEUED_EVENTS: usize = 4096;
 
 enum Command {
     Send(Vec<u8>, oneshot::Sender<Result<u64, SendError>>),
+    SendBatch(Vec<Vec<u8>>, oneshot::Sender<Result<Range<u64>, SendError>>),
     Close,
 }
 
@@ -131,6 +133,25 @@ impl ClusterClient {
         rx.await.map_err(|_| SendError::Closed)?
     }
 
+    /// Sends each of `payloads`, in order, returning their `client_seq`s, as [`Client::send_batch`]:
+    /// all or none. Handed to the client's task once, and written together: for a gateway with
+    /// many to send, far less than a [`ClusterClient::send`] each.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::send_batch`]: if there isn't room for them all under
+    /// [`crate::client::MAX_UNACKED`] (read responses, then try again), the session closed, or any
+    /// payload is too long.
+    pub async fn send_batch(
+        &self,
+        payloads: impl IntoIterator<Item = impl Into<Vec<u8>>>,
+    ) -> Result<Range<u64>, SendError> {
+        let payloads = payloads.into_iter().map(Into::into).collect();
+        let (reply, rx) = oneshot::channel();
+        self.commands.send(Command::SendBatch(payloads, reply)).await.map_err(|_| SendError::Closed)?;
+        rx.await.map_err(|_| SendError::Closed)?
+    }
+
     /// The highest `client_seq` (as [`ClusterClient::send`] returned) the cluster has applied,
     /// as [`Client::applied`]: watch it to know when what was sent is in the cluster, to let go
     /// of a message a gateway is forwarding, say.
@@ -142,6 +163,14 @@ impl ClusterClient {
     /// The next thing the cluster said, or `None` once the session is over.
     pub async fn recv(&mut self) -> Option<Event> {
         self.events.recv().await
+    }
+
+    /// What the cluster said next, waiting for something, as [`ClusterClient::recv`]: up to
+    /// `limit` events, appended to `events`, and how many. Zero once the session is over (or for
+    /// a `limit` of zero). For a gateway that answers what arrives with a
+    /// [`ClusterClient::send_batch`], a batch at a time.
+    pub async fn recv_many(&mut self, events: &mut Vec<Event>, limit: usize) -> usize {
+        self.events.recv_many(events, limit).await
     }
 
     /// Closes the session.
@@ -186,6 +215,7 @@ async fn run(
                 command = commands.recv() => match command {
                     None => return,
                     Some(Command::Send(payload, reply)) => { let _ = reply.send(client.send(payload)); }
+                    Some(Command::SendBatch(payloads, reply)) => { let _ = reply.send(client.send_batch(payloads)); }
                     Some(Command::Close) => client.close(),
                 },
                 frame = conn.frames.recv() => {

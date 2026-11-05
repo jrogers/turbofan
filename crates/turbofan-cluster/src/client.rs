@@ -8,6 +8,7 @@
 //! order, while the session lasts.
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::time::Duration;
 
 use crate::codec::{self, MAX_PAYLOAD_BYTES};
@@ -305,13 +306,49 @@ impl Client {
         if self.unacked.len() >= MAX_UNACKED {
             return Err(SendError::Full);
         }
+        Ok(self.push(payload))
+    }
+
+    /// Sends each of `payloads`, in order, returning their `client_seq`s: all of them, or none
+    /// if any would be refused, so a batch is never half sent. One call, for a gateway with many
+    /// to send: what a [`ClusterClient`](crate::ClusterClient) hands its task once, not a time a
+    /// message.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::send`]: if the session closed, any of them is too long, or there isn't room
+    /// for them all under [`MAX_UNACKED`], so a batch of more is always refused.
+    pub fn send_batch(
+        &mut self,
+        payloads: impl IntoIterator<Item = impl Into<Vec<u8>>>,
+    ) -> Result<Range<u64>, SendError> {
+        let payloads: Vec<Vec<u8>> = payloads.into_iter().map(Into::into).collect();
+        if self.closed {
+            return Err(SendError::Closed);
+        }
+        if payloads.iter().any(|payload| payload.len() > MAX_PAYLOAD_BYTES) {
+            return Err(SendError::TooLong);
+        }
+        if self.unacked.len() + payloads.len() > MAX_UNACKED {
+            return Err(SendError::Full);
+        }
+        let first = self.next_seq;
+        for payload in payloads {
+            self.push(payload);
+        }
+        Ok(first..self.next_seq)
+    }
+
+    /// Holds `payload`, sent, as the next message, and frames it if the session is open here.
+    fn push(&mut self, payload: Vec<u8>) -> u64 {
+        assert!(self.unacked.len() < MAX_UNACKED, "room checked");
         let client_seq = self.next_seq;
         self.next_seq += 1;
         if let (true, Some(session)) = (self.open, self.session) {
             self.frame(&wire::Message { session: session.0, client_seq, payload: &payload });
         }
         self.unacked.push_back((client_seq, payload));
-        Ok(client_seq)
+        client_seq
     }
 
     /// The highest `client_seq` (as [`Client::send`] returned) the cluster has applied: every
@@ -532,6 +569,45 @@ mod tests {
         deliver(&mut client, &frame(&wire::Closed { session: 8, reason: CloseReason::Client }));
         assert_eq!(client.poll_event(), None);
         assert!(client.send(b"order".to_vec()).is_ok(), "still open");
+    }
+
+    /// A batch is sent in order, framed together, its `client_seq`s the next ones; an empty one
+    /// sends nothing.
+    #[test]
+    fn a_batch_is_sent_in_order() {
+        let mut client = open();
+        assert_eq!(client.send(b"first".to_vec()), Ok(1));
+        assert_eq!(client.send_batch([b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]), Ok(2..5));
+        let frames = decoded(&client.take_frames());
+        assert_eq!(frames.len(), 4);
+        for (frame, client_seq) in frames[1..].iter().zip(2..) {
+            assert!(frame.contains(&format!("client_seq: {client_seq},")), "{frame}");
+        }
+        assert_eq!(client.unacked(), 4);
+        assert_eq!(client.send_batch(Vec::<Vec<u8>>::new()), Ok(5..5));
+        assert!(client.take_frames().is_empty());
+        assert_eq!(client.send(b"next".to_vec()), Ok(5));
+    }
+
+    /// A batch any of which would be refused sends none: one too long, one that doesn't fit under
+    /// `MAX_UNACKED` though some of it would, and one after the session closed.
+    #[test]
+    fn a_batch_is_sent_whole_or_not_at_all() {
+        let mut client = open();
+        let too_long = [vec![0; 1], vec![0; MAX_PAYLOAD_BYTES + 1]];
+        assert_eq!(client.send_batch(too_long), Err(SendError::TooLong));
+        client.send_batch(vec![vec![0]; MAX_UNACKED - 1]).unwrap();
+        client.take_frames();
+        assert_eq!(client.send_batch([vec![0], vec![0]]), Err(SendError::Full));
+        assert!(client.take_frames().is_empty(), "none of it");
+        assert_eq!(client.unacked(), MAX_UNACKED - 1);
+        assert_eq!(
+            client.send_batch([vec![0]]),
+            Ok(crate::widen(MAX_UNACKED)..crate::widen(MAX_UNACKED) + 1),
+            "it fits"
+        );
+        deliver(&mut client, &frame(&wire::Closed { session: 9, reason: CloseReason::Client }));
+        assert_eq!(client.send_batch([vec![0]]), Err(SendError::Closed));
     }
 
     /// A payload of the most a payload can be is sent; one byte more is refused.

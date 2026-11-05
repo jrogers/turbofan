@@ -38,7 +38,8 @@ commit. The busier the cluster, the bigger the batches.
   share most of their memory with the live state, avoid it.
 - **Clients in flight.** One client with one message in flight measures latency, not throughput.
   A gateway sends without waiting for each response, up to `client::MAX_UNACKED`, and several
-  gateways keep the leader's batches full.
+  gateways keep the leader's batches full. With many to send at once, `send_batch` hands them to
+  the client's task in one call, written together, rather than one each (see [Clients][clients]).
 - **TLS** costs encryption on every connection, including the followers'. The benchmark measures
   it too.
 
