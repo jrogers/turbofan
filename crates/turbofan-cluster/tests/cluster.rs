@@ -287,7 +287,8 @@ async fn a_capture_replays_what_the_cluster_applied() {
     let asked = admin(0).request_snapshot().await.unwrap();
     exchange(&mut cluster, &mut client, 101, 200).await;
 
-    // Any member: the one asked answers, of what it knows committed, which may lag the leader's.
+    // Any member: the one asked answers, of what it knows committed, which may lag the leader's,
+    // from its latest snapshot, which may not yet be the one asked for (a quorum took that).
     let mut sent = 200;
     let (captured, echoed, echo) = loop {
         let captured = admin(1).capture().await.unwrap();
@@ -299,7 +300,7 @@ async fn a_capture_replays_what_the_cluster_applied() {
             }
         })
         .unwrap();
-        if replayed.last.values().any(|&k| k == sent) {
+        if captured.snapshot_index >= asked && replayed.last.values().any(|&k| k == sent) {
             if !echoed.is_empty() {
                 break (captured, echoed, replayed);
             }
@@ -310,16 +311,16 @@ async fn a_capture_replays_what_the_cluster_applied() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert!(captured.snapshot_index >= asked, "from its latest snapshot");
     // From whichever snapshot is the node's latest (it takes its own every 50 entries): Echo
     // checks each message follows on from the state it restored.
     let first = echoed[0];
     assert_eq!(echoed, (first..=sent).collect::<Vec<_>>(), "echoed once each, in order");
-    assert_eq!(echo.last.len(), 1, "one session");
+    assert_eq!(echo.last.len(), 1, "one session: {:?}", echo.last);
 
-    // Stopped short, at an entry before the last; past what's committed, refused.
+    // Stopped short, at an entry before the last; past what's committed, refused. The entry
+    // before the last may be the snapshot's own, leaving nothing to replay.
     let to = captured.to - 1;
-    let mut last = 0;
+    let mut last = captured.snapshot_index;
     capture::replay(Path::new(&captured.dir), Echo::default(), Some(to), |index, _| last = index).unwrap();
     assert_eq!(last, to);
     let past = capture::replay(Path::new(&captured.dir), Echo::default(), Some(captured.to + 1), |_, _| {});
