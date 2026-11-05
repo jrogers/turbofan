@@ -7,6 +7,10 @@
 // definition of a name is the one used.
 
 #[doc = guide_links!()]
+#[doc = include_str!("../docs/guide/use-cases.md")]
+pub mod use_cases {}
+
+#[doc = guide_links!()]
 #[doc = include_str!("../docs/guide/first-service.md")]
 pub mod first_service {}
 

@@ -7,6 +7,12 @@ losing or repeating a message.
 
 The framework never looks inside the service's messages: to it, they're opaque bytes.
 
+It suits systems whose state fits in memory, where every change must happen exactly once, in one
+order every machine agrees on, and quickly: a service in place of a stack of coordination
+service, log and database; sequencers, matching engines and order management; ledgers,
+reservations and quotas. [What it's for](docs/guide/use-cases.md) goes into each, and when it
+isn't the right tool.
+
 ## A service
 
 ```rust
@@ -77,7 +83,8 @@ exactly once and in order, and responses arrive exactly once and in order.
 ## The guide
 
 [`docs/guide`](docs/guide/README.md), also in the crate docs as `turbofan_cluster::guide`, goes
-from a first service to running a cluster in production: [services](docs/guide/services.md),
+from [what it's for](docs/guide/use-cases.md) and a first service to running a cluster in
+production: [services](docs/guide/services.md),
 [clients](docs/guide/clients.md), [the command line, configuration, durability, tokens and
 TLS](docs/guide/running.md), [members, learners and standbys](docs/guide/membership.md),
 [operations and metrics](docs/guide/operations.md), [upgrades](docs/guide/upgrades.md) and

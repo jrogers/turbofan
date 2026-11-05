@@ -18,6 +18,7 @@
 macro_rules! guide_links {
     () => {
         "[guide]: crate::guide\n\
+         [use-cases]: crate::guide::use_cases\n\
          [first-service]: crate::guide::first_service\n\
          [services]: crate::guide::services\n\
          [clients]: crate::guide::clients\n\

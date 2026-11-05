@@ -181,6 +181,35 @@
   </div>
 
   <section>
+    <h2>What it's for</h2>
+    <p class="sub">Systems whose state fits in memory, where every change must happen once, in one
+    order every machine agrees on, and quickly. The <a href="guide/use-cases.html">guide's first
+    chapter</a> goes into each, and when Turbofan isn't the right tool.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg></div>
+        <h3>Replacing a consensus stack</h3>
+        <p>Not application servers plus a coordination service for leases, a log to order inputs, a database and deduplication tables: the service is the replicated part, so there's no lease to check, no offset to commit beside a write, and no message applied twice.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg></div>
+        <h3>Sequencers and matching engines</h3>
+        <p>The log is a sequencer: every input from every gateway in one total order, stamped with the leader's time, applied the same on every node. Price-time priority holds through a failover, with no resting order or fill lost.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg></div>
+        <h3>Order management and risk</h3>
+        <p>Orders, venue acks and fills as messages, every execution report sent once, in order. A limit is checked and taken up in one step, in the same state machine as the order. A day replays offline, exactly, to debug or audit it.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/></svg></div>
+        <h3>Ledgers, reservations, quotas</h3>
+        <p>A balance checked and debited at once, the last seat or ticket won by one request, a rate limit counted in one place, a job or timer fired once though the node that set it fails.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <h2>Built so a failure loses nothing</h2>
     <p class="sub">Safe, thoroughly tested, then fast: a replicated service is only as good as its
     worst failover.</p>
@@ -223,7 +252,7 @@
     <p class="sub">Your code is a <code>Service</code>: every node applies the same log to it, so it
     must be deterministic, taking time from <code>Ctx::now</code> rather than a clock. This one
     answers each message with how many its session has sent; <code>run</code> gives it a command
-    line. The <a href="guide/first-service.html">guide's first chapter</a> builds it up.</p>
+    line. The guide's <a href="guide/first-service.html">first service</a> builds it up.</p>
     <div class="window" aria-label="A counter service in Turbofan">
       <div class="title"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span>counter.rs</span></div>
       <pre><code>{{counter}}</code></pre>

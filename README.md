@@ -22,6 +22,23 @@
 **Turbofan** is a set of Rust components for building fault-tolerant systems. It has the aims of being safe,
 thoroughly tested, and fast.
 
+## What it's for
+
+Systems whose state fits in memory, where every change must happen exactly once, in one order
+every machine agrees on, and quickly:
+
+- **Replacing a consensus stack**: application servers with a coordination service for leases, a
+  log to order their inputs, a database, and deduplication to stitch them together, become one
+  replicated service, with no lease to check and no message applied twice.
+- **Trading systems**: sequencers, matching engines, order management and pre-trade risk, where
+  the order of events is the system, every report goes out once, and a day replays offline,
+  exactly.
+- **Ledgers, reservations, quotas and schedulers**: a balance checked and debited in one step,
+  the last seat won by one request, a timer fired once though the node that set it fails.
+
+[What it's for](crates/turbofan-cluster/docs/guide/use-cases.md), the guide's first chapter,
+goes into each, and when it isn't the right tool.
+
 ## Crates
 
 | Crate | What it is |
