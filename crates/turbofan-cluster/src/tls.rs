@@ -168,7 +168,9 @@ impl Conn {
     /// Split to be read and written at once, by tasks of their own. Plain TCP splits in two
     /// sockets' worth of halves, each with a buffer of its own: [`tokio::io::split`] would put a
     /// lock between them, taken on every read and write, which the reader and writer of a busy
-    /// connection wait on. TLS can't: one session's state is both ways'.
+    /// connection wait on. TLS can't, one session's state being both ways', so it keeps the lock,
+    /// with a buffer either side of it: else every frame written is a TLS record of its own and a
+    /// system call, made holding the lock the reader waits on.
     pub(crate) fn split(self) -> (ReadHalf, WriteHalf) {
         match self {
             Self::Plain(stream) => {
@@ -181,7 +183,7 @@ impl Conn {
             }
             Self::Tls(stream) => {
                 let (read, write) = tokio::io::split(stream);
-                (Box::new(read), Box::new(write))
+                (Box::new(BufReader::new(read)), Box::new(BufWriter::new(write)))
             }
         }
     }

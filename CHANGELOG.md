@@ -26,6 +26,9 @@ a patch version (0.1.1) doesn't.
 - `ClusterClient` keeps one timer rather than making one a message, whose registering, under
   tokio's timer lock, held up several clients at once, and writes what queued together under one
   flush: the benchmark's throughput nearly doubles.
+- Client connections over TLS, both ends, buffer what they write and read: each frame was a TLS
+  record and a system call of its own, made holding the lock the connection's reader waited on.
+  The benchmark's throughput over TLS is four times what it was, as it is without TLS.
 
 ### Breaking
 
