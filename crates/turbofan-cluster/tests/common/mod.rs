@@ -2,9 +2,13 @@
 //! add, running a service that echoes and checks each session's messages come once each, in order.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::{self, Read};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -76,6 +80,43 @@ pub struct Cluster {
     pub nodes: Vec<Option<JoinHandle<std::io::Result<()>>>>,
     /// The proxy between the nodes, if there's one ([`Cluster::proxied`]).
     pub proxy: Option<proxy::Proxy>,
+    /// Each node's pause ([`Cluster::pause`]).
+    pub pauses: Vec<Arc<Pause>>,
+}
+
+/// Holds a node's task, as a long garbage collection or a stalled VM does: its main loop isn't
+/// polled, its timers included, while its connections' tasks go on reading what arrives into its
+/// queues, until they fill and TCP holds the rest back. Resumed, it finds all of it waiting, and
+/// its clock moved on.
+#[derive(Debug, Default)]
+pub struct Pause {
+    /// Paused, and the task to wake on resuming, once it's been polled.
+    state: Mutex<(bool, Option<Waker>)>,
+}
+
+impl Pause {
+    pub fn set(&self, paused: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = paused;
+        if !paused && let Some(waker) = state.1.take() {
+            waker.wake();
+        }
+    }
+
+    /// `task`, held while paused.
+    fn hold<F: Future + Send>(self: Arc<Self>, task: F) -> impl Future<Output = F::Output> + Send {
+        let mut task = Box::pin(task);
+        std::future::poll_fn(move |cx: &mut Context<'_>| {
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.0 {
+                    state.1 = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+            Pin::as_mut(&mut task).poll(cx)
+        })
+    }
 }
 
 impl Cluster {
@@ -115,7 +156,8 @@ impl Cluster {
             .collect();
         let proxy =
             proxied.then(|| proxy::Proxy::start(ids.iter().map(|&id| (id, addr(0, id), addr(12, id))).collect()));
-        let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None], proxy };
+        let pauses = (0..4).map(|_| Arc::default()).collect();
+        let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None], proxy, pauses };
         for i in 0..3 {
             cluster.start(i);
         }
@@ -124,7 +166,8 @@ impl Cluster {
 
     pub fn start(&mut self, i: usize) {
         let config = self.configs[i].clone();
-        self.nodes[i] = Some(tokio::spawn(async move {
+        self.pauses[i].set(false);
+        self.nodes[i] = Some(tokio::spawn(self.pauses[i].clone().hold(async move {
             // A killed node's blocking write may still hold the directory's lock for a moment.
             for _ in 0..100 {
                 match serve(config.clone(), Echo::default()).await {
@@ -135,7 +178,12 @@ impl Cluster {
                 }
             }
             serve(config, Echo::default()).await
-        }));
+        })));
+    }
+
+    /// Holds node `i`'s task, or lets it go on: see [`Pause`].
+    pub fn pause(&self, i: usize, paused: bool) {
+        self.pauses[i].set(paused);
     }
 
     pub async fn kill(&mut self, i: usize) {

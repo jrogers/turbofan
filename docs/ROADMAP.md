@@ -27,15 +27,11 @@ down when they show.
   `Cluster` says of a node.
 - **Faults the simulation doesn't reach.** The simulation (`tests/sim.rs`) runs the node and the
   pipeline, not the driver, the client or TLS, which only the cluster tests and the soak
-  (`tests/soak.rs`) run, over real TCP. The soak kills nodes, and through a proxy between them
+  (`tests/soak.rs`) run, over real TCP. The soak kills and pauses nodes, and through a proxy between them
   (`tests/common/proxy.rs`) cuts, stalls and slows the links between them under load. What's left:
   faults between clients and nodes, which the proxy doesn't stand between; the soak over TLS,
   where the proxy can't read a hello to tell one link from another; and the driver's IO in the
   simulation, the thorough way.
-- **A node paused, then resumed, in the soak.** The simulation pauses nodes, the leader often,
-  for up to two seconds, and resumes them to everything that arrived meanwhile, a leader by then
-  replaced without knowing it. The soak doesn't yet: hold a node's task, as a long garbage
-  collection or a stalled VM does.
 - **Jepsen, once, before 1.0.** The production binaries as processes on machines of their own,
   faulted at the operating system (iptables, tc, `SIGKILL`, `SIGSTOP`) and checked black-box:
   what in-process tests can't reach, the driver, the command line and a real fsync among it, and
