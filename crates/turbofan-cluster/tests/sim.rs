@@ -11,7 +11,9 @@
 //! handled meanwhile; slow disks, what waits for a write late; and log records and snapshot files
 //! rotting on disk; nodes paused, as a long garbage collection or a stalled VM pauses a process, the
 //! leader often, then resumed to everything that reached them meanwhile, a leader by then perhaps
-//! replaced without knowing it, its clock jumped; a crash tearing a record with the rest of its append whole after it, as a disk
+//! replaced without knowing it, its clock jumped; clocks of each node's own, the wall clock off by
+//! milliseconds or by half a second and stepped now and then, the monotonic clock fast or slow by
+//! up to 200 parts per million, and on them cluster time, as the driver keeps it; a crash tearing a record with the rest of its append whole after it, as a disk
 //! keeping a later page and losing an earlier does. A node that finds its disk damaged as it runs
 //! stops, as the driver does, and is replaced: removed from the members, wiped, and started again
 //! to join, as an operator would. On restart, a log is cut at a rotten or torn record, as the log
@@ -49,7 +51,7 @@
 //! timer fire once, and every message the service proposed applied once. And linearizably, across
 //! clients: each `a<k>` says where in the log's order its message was applied, and a message is
 //! applied after every message answered, any client's, before it was sent, each place in the order
-//! answered for one message only.
+//! answered for one message only. Cluster time never goes back, whichever leader logged an entry.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
@@ -58,6 +60,7 @@ use std::time::Duration;
 
 use turbofan_cluster::client::{self, Client};
 use turbofan_cluster::codec::{self, Record};
+use turbofan_cluster::driver::Slewed;
 use turbofan_cluster::log::{Log, MAX_SEGMENT_BYTES};
 use turbofan_cluster::meta::{Meta, MetaFile};
 use turbofan_cluster::node::{self, ConnId, Node, SaveSnapshot};
@@ -85,6 +88,8 @@ const TIMER_SPACE: u64 = 1_000_000;
 const NOTIFY_EVERY: u64 = 11;
 /// The admin's connection, which [`Sim::conns`] marks with this client index.
 const ADMIN: usize = usize::MAX;
+/// Wall time as the simulation begins, in nanoseconds: far enough from 0 for a clock behind.
+const WALL: u64 = 1_000_000 * MS;
 
 #[test]
 fn simulate() {
@@ -204,6 +209,8 @@ struct Echo {
     /// Messages applied, every session's: the last one's place in the log's order, which its
     /// `a<k>` response carries.
     applied: u64,
+    /// Cluster time as of the last entry applied, which never goes back.
+    now: u64,
     /// Messages applied as version 1, which only new code has.
     as_new: u64,
     /// The version this code has: 0 old, 1 new. Not state.
@@ -213,8 +220,8 @@ struct Echo {
 /// The state, not which version of the code holds it.
 impl PartialEq for Echo {
     fn eq(&self, other: &Self) -> bool {
-        (&self.last, &self.responses, self.fired, self.applied, self.as_new)
-            == (&other.last, &other.responses, other.fired, other.applied, other.as_new)
+        (&self.last, &self.responses, self.fired, self.applied, self.now, self.as_new)
+            == (&other.last, &other.responses, other.fired, other.applied, other.now, other.as_new)
     }
 }
 
@@ -233,6 +240,7 @@ impl Service for Echo {
     }
 
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
+        self.at(ctx);
         assert!(ctx.service_version() <= self.version, "old code run as version {}", ctx.service_version());
         self.as_new += u64::from(ctx.service_version() >= 1);
         let k: u64 = std::str::from_utf8(payload).unwrap().parse().unwrap();
@@ -256,19 +264,21 @@ impl Service for Echo {
     }
 
     fn on_proposal(&mut self, ctx: &mut Ctx, payload: &[u8]) {
+        self.at(ctx);
         let text = std::str::from_utf8(payload).unwrap();
         let (session, k) = text.split_once(' ').unwrap();
         self.send(ctx, SessionId(session.parse().unwrap()), format!("p{k}"));
     }
 
     fn on_timer(&mut self, ctx: &mut Ctx, id: u64) {
+        self.at(ctx);
         self.fired += 1;
         self.send(ctx, SessionId(id / TIMER_SPACE), format!("t{}", id % TIMER_SPACE));
     }
 
-    /// Each session's last message and responses, and the three counts, as words.
+    /// Each session's last message and responses, the three counts and the time, as words.
     fn snapshot(&self) -> SnapshotWriter {
-        let (fired, applied, as_new) = (self.fired, self.applied, self.as_new);
+        let (fired, applied, now, as_new) = (self.fired, self.applied, self.now, self.as_new);
         let sessions: BTreeSet<SessionId> = self.last.keys().chain(self.responses.keys()).copied().collect();
         let rows: Vec<[u64; 3]> = sessions
             .into_iter()
@@ -277,6 +287,7 @@ impl Service for Echo {
         Box::new(move |out| {
             out.write_all(&fired.to_le_bytes())?;
             out.write_all(&applied.to_le_bytes())?;
+            out.write_all(&now.to_le_bytes())?;
             out.write_all(&as_new.to_le_bytes())?;
             for word in rows.iter().flatten() {
                 out.write_all(&word.to_le_bytes())?;
@@ -289,8 +300,8 @@ impl Service for Echo {
         let mut bytes = Vec::new();
         from.read_to_end(&mut bytes)?;
         let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
-        (self.fired, self.applied, self.as_new) = (words[0], words[1], words[2]);
-        let rows = words[3..].as_chunks::<3>().0;
+        (self.fired, self.applied, self.now, self.as_new) = (words[0], words[1], words[2], words[3]);
+        let rows = words[4..].as_chunks::<3>().0;
         self.last = rows.iter().filter(|r| r[1] > 0).map(|&[session, last, _]| (SessionId(session), last)).collect();
         self.responses = rows.iter().filter(|r| r[2] > 0).map(|&[session, _, n]| (SessionId(session), n)).collect();
         Ok(())
@@ -298,6 +309,12 @@ impl Service for Echo {
 }
 
 impl Echo {
+    /// Cluster time never goes back, whichever leader logged the entry and however its clock is off.
+    fn at(&mut self, ctx: &Ctx) {
+        assert!(ctx.now() >= self.now, "cluster time went back from {} to {}", self.now, ctx.now());
+        self.now = ctx.now();
+    }
+
     fn send(&mut self, ctx: &mut Ctx, session: SessionId, text: String) {
         *self.responses.entry(session).or_default() += 1;
         ctx.send(session, text.into_bytes()).unwrap();
@@ -343,6 +360,8 @@ enum Event {
     /// A node is paused: it takes nothing, its writes done or not, until it resumes.
     Pause,
     Resume(NodeId),
+    /// A node's wall clock steps.
+    StepClock,
     ToNode {
         conn: ConnId,
         frame: Vec<u8>,
@@ -589,7 +608,7 @@ impl Disk {
         self.files = None;
         let mut torn = encode(records[whole]);
         let cut = 1 + usize::try_from(rng.below(torn.len() as u64 - 1)).unwrap();
-        let later = whole + 1 < records.len() && rng.one_in(3);
+        let later = whole + 1 < records.len() && rng.one_in(2);
         if later {
             torn[cut..].iter_mut().for_each(|b| *b ^= 0xa5);
             torn.extend(records[whole + 1..].iter().copied().flat_map(encode));
@@ -698,6 +717,8 @@ struct SimNode {
     /// It waits on its disk, a restore with what's being written, or it's paused: it takes no
     /// input until then, and what it sends goes no sooner.
     stalled_until: u64,
+    /// Paused until then: it isn't crashed meanwhile, so it resumes.
+    paused_until: u64,
     /// Its batches between taken and durable, by the driver's rules.
     pipeline: Pipeline,
     /// The batches being written, until `written_at`: not yet on disk.
@@ -711,6 +732,13 @@ struct SimNode {
     wiped: bool,
     /// Lost with its cluster: it never starts again.
     lost: bool,
+    /// Its clocks: the wall clock this far from the simulation's, which steps now and then as NTP
+    /// steps it; the monotonic clock this many parts per million fast, since `started`; and the
+    /// driver's cluster time on them.
+    offset: i64,
+    drift_ppm: i64,
+    started: u64,
+    clock: Slewed,
 }
 
 impl SimNode {
@@ -725,6 +753,7 @@ impl SimNode {
             incarnation,
             upgraded,
             stalled_until,
+            paused_until: 0,
             pipeline: Pipeline::default(),
             writing: Vec::new(),
             written_at: None,
@@ -732,6 +761,10 @@ impl SimNode {
             broken_at: 0,
             wiped,
             lost: false,
+            offset: 0,
+            drift_ppm: 0,
+            started: 0,
+            clock: Slewed::new(WALL),
         }
     }
 }
@@ -808,6 +841,7 @@ struct Sim {
     activated: Option<u64>,
     stalls: u64,
     pauses: u64,
+    steps: u64,
     rots: u64,
     broken: u64,
     /// Nodes whose doubt the operator ended.
@@ -913,6 +947,7 @@ impl Sim {
             activated: None,
             stalls: 0,
             pauses: 0,
+            steps: 0,
             rots: 0,
             broken: 0,
             overrides: 0,
@@ -930,7 +965,10 @@ impl Sim {
             disaster: None,
         };
         for id in members {
-            sim.nodes.insert(id, SimNode::new(Disk::new(segment_bytes)));
+            let mut sim_node = SimNode::new(Disk::new(segment_bytes));
+            sim_node.offset = sim.wall_error();
+            sim_node.drift_ppm = i64::try_from(sim.rng.below(401)).unwrap() - 200;
+            sim.nodes.insert(id, sim_node);
             sim.start(id);
         }
         for c in 0..CLIENTS {
@@ -945,6 +983,7 @@ impl Sim {
     fn schedule_operator(&mut self) {
         self.schedule(1000 * MS, Event::Partition);
         self.schedule(1500 * MS, Event::Pause);
+        self.schedule(1700 * MS, Event::StepClock);
         self.schedule(2000 * MS, Event::AdminRequest);
         self.schedule(1500 * MS, Event::ChangeMembers);
         self.schedule(1200 * MS, Event::TransferLeadership);
@@ -1001,21 +1040,12 @@ impl Sim {
     fn handle(&mut self, event: Event) {
         let Some(event) = self.unless_stalled(event) else { return };
         match event {
-            Event::Deliver { from, to, frame } => {
-                let Some(node) = self.nodes.get_mut(&to).unwrap().node.as_mut() else { return };
-                node.on_peer(from, &codec::decode_frame(&frame).unwrap().unwrap().0, self.now);
-                self.flush(to);
-            }
-            Event::Tick(id) => {
-                let sim_node = self.nodes.get_mut(&id).unwrap();
-                sim_node.tick_at = None;
-                let Some(node) = sim_node.node.as_mut() else { return };
-                node.on_tick(self.now);
-                self.flush(id);
-            }
+            Event::Deliver { from, to, frame } => self.deliver(from, to, &frame),
+            Event::Tick(id) => self.tick(id),
             Event::Restart(id) => self.start(id),
             Event::Partition => self.partition(),
             Event::Pause => self.pause(),
+            Event::StepClock => self.step_clock(),
             Event::Resume(id) => self.resume(id),
             Event::Heal => {
                 self.cut = [[false; 8]; 8];
@@ -1058,16 +1088,16 @@ impl Sim {
                 }
             }
         }
-        if self.faults && self.rng.one_in(300) {
+        if self.faults && self.rng.one_in(1000) {
             let id = self.rng.pick(&self.members);
-            self.crash(id);
+            self.crash_unless_paused(id);
         }
         // A leader dying with its appends in flight: some followers get them, some don't.
         if self.faults
             && self.rng.one_in(600)
             && let Some(leader) = self.leader()
         {
-            self.crash(leader);
+            self.crash_unless_paused(leader);
         }
     }
 
@@ -1141,8 +1171,9 @@ impl Sim {
             Conn { client: ADMIN, node: id, up: true, to_node_at: 0, to_client_at: 0, opened: VecDeque::new() },
         );
         self.admin_frames.insert(conn, frame.clone());
+        let now = self.clock(id);
         let node = self.nodes.get_mut(&id).unwrap().node.as_mut().unwrap();
-        node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, self.now);
+        node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, now);
         self.flush(id);
     }
 
@@ -1296,8 +1327,10 @@ impl Sim {
             snapshot = Some(bytes);
         }
         let from = snapshot.as_mut().map(|b| b as &mut dyn Read);
+        let now = self.clock(id);
+        let sim_node = self.nodes.get_mut(&id).unwrap();
         let node = sim_node.node.as_mut().unwrap();
-        let sends = sim_node.pipeline.written(node, &reads, &chunks, from, self.now).unwrap();
+        let sends = sim_node.pipeline.written(node, &reads, &chunks, from, now).unwrap();
         for (to, frame) in sends {
             self.send_peer(id, to, frame);
         }
@@ -1311,9 +1344,16 @@ impl Sim {
             self.stop(id);
             return;
         }
+        // When its monotonic clock reaches the deadline, at its rate.
+        let sim_node = &self.nodes[&id];
+        let due = sim_node.clock.mono_at(sim_node.node.as_ref().unwrap().next_deadline());
+        let after =
+            i128::from(due.saturating_sub(self.mono(id))) * 1_000_000 / i128::from(1_000_000 + sim_node.drift_ppm);
+        let deadline = self.now + u64::try_from(after).unwrap().max(1);
         let sim_node = self.nodes.get_mut(&id).unwrap();
-        let deadline = sim_node.node.as_ref().unwrap().next_deadline().max(self.now + 1);
-        if sim_node.tick_at.is_none_or(|at| deadline < at) {
+        // Rounding through the drift moves the same deadline a nanosecond either way: a tick
+        // already that close stands, or ticks pile up.
+        if sim_node.tick_at.is_none_or(|at| deadline + 1000 < at) {
             sim_node.tick_at = Some(deadline);
             self.schedule(deadline - self.now, Event::Tick(id));
         }
@@ -1415,8 +1455,9 @@ impl Sim {
         if !up {
             return;
         }
+        let now = self.clock(id);
         let node = self.nodes.get_mut(&id).unwrap().node.as_mut().expect("a crash resets its connections");
-        node.on_client(conn, &codec::decode_frame(frame).unwrap().unwrap().0, self.now);
+        node.on_client(conn, &codec::decode_frame(frame).unwrap().unwrap().0, now);
         self.flush(id);
     }
 
@@ -1714,19 +1755,85 @@ impl Sim {
         }
     }
 
+    /// Node `id`'s monotonic clock, since it started: fast or slow by its drift.
+    fn mono(&self, id: NodeId) -> u64 {
+        let sim_node = &self.nodes[&id];
+        let elapsed = i128::from(self.now - sim_node.started);
+        u64::try_from(elapsed * i128::from(1_000_000 + sim_node.drift_ppm) / 1_000_000).unwrap()
+    }
+
+    /// The time node `id` is given, as the driver gives it: cluster time, on its own clocks.
+    fn clock(&mut self, id: NodeId) -> u64 {
+        let mono = self.mono(id);
+        let sim_node = self.nodes.get_mut(&id).unwrap();
+        let wall = WALL.saturating_add_signed(i64::try_from(self.now).unwrap() + sim_node.offset);
+        sim_node.clock.advance(mono, wall)
+    }
+
+    /// How far a node's wall clock is from true time: mostly close, as NTP keeps it; now and then
+    /// far out, half a second either way.
+    fn wall_error(&mut self) -> i64 {
+        let off = if self.rng.one_in(4) { 500 * MS } else { 20 * MS };
+        i64::try_from(self.rng.below(2 * off)).unwrap() - i64::try_from(off).unwrap()
+    }
+
+    /// A node's wall clock steps, either way, to an error of its own: as NTP steps a clock it
+    /// finds far out, or a VM resuming does.
+    fn step_clock(&mut self) {
+        if !self.faults {
+            return;
+        }
+        let id = self.rng.pick(&self.members.clone());
+        let offset = self.wall_error();
+        self.nodes.get_mut(&id).unwrap().offset = offset;
+        self.steps += 1;
+        let after = 1000 * MS + self.rng.below(3000 * MS);
+        self.schedule(after, Event::StepClock);
+    }
+
+    fn deliver(&mut self, from: NodeId, to: NodeId, frame: &[u8]) {
+        if self.nodes[&to].node.is_none() {
+            return;
+        }
+        let now = self.clock(to);
+        let node = self.nodes.get_mut(&to).unwrap().node.as_mut().unwrap();
+        node.on_peer(from, &codec::decode_frame(frame).unwrap().unwrap().0, now);
+        self.flush(to);
+    }
+
+    fn tick(&mut self, id: NodeId) {
+        let now = self.clock(id);
+        let sim_node = self.nodes.get_mut(&id).unwrap();
+        sim_node.tick_at = None;
+        let Some(node) = sim_node.node.as_mut() else { return };
+        node.on_tick(now);
+        self.flush(id);
+    }
+
     /// Pauses a node, the leader half the time: mostly for longer than an election timeout.
     fn pause(&mut self) {
         if !self.faults {
             return;
         }
         let up: Vec<NodeId> = self.members.iter().copied().filter(|id| self.nodes[id].node.is_some()).collect();
-        if let Some(id) =
-            self.leader().filter(|_| self.rng.one_in(2)).or_else(|| (!up.is_empty()).then(|| self.rng.pick(&up)))
-        {
-            let length =
-                if self.rng.one_in(3) { self.rng.below(150 * MS) } else { 300 * MS + self.rng.below(2000 * MS) };
+        let pick_leader = self.rng.one_in(2);
+        let target = if pick_leader {
+            // The leader, once there is one: often there's none, between a crash and an election.
+            let Some(leader) = self.leader() else {
+                self.schedule(50 * MS, Event::Pause);
+                return;
+            };
+            Some(leader)
+        } else {
+            (!up.is_empty()).then(|| self.rng.pick(&up))
+        };
+        if let Some(id) = target {
+            // A leader's for longer than an election timeout, for another to be elected meanwhile.
+            let short = !pick_leader && self.rng.one_in(3);
+            let length = if short { self.rng.below(150 * MS) } else { 300 * MS + self.rng.below(2000 * MS) };
             let sim_node = self.nodes.get_mut(&id).unwrap();
             sim_node.stalled_until = sim_node.stalled_until.max(self.now + length);
+            sim_node.paused_until = self.now + length;
             self.pauses += 1;
             self.schedule(length, Event::Resume(id));
         }
@@ -1816,6 +1923,13 @@ impl Sim {
         let conns: Vec<ConnId> = self.conns.iter().filter(|(_, c)| c.up && c.node == id).map(|(&k, _)| k).collect();
         for conn in conns {
             self.reset(conn);
+        }
+    }
+
+    /// A paused node resumes, rather than crashing and restarting, which would end the pause.
+    fn crash_unless_paused(&mut self, id: NodeId) {
+        if self.nodes[&id].paused_until <= self.now {
+            self.crash(id);
         }
     }
 
@@ -2002,7 +2116,12 @@ impl Sim {
         let sim_node = self.nodes.get_mut(&id).unwrap();
         let snapshot = loaded.as_ref().map(|(s, _)| s.clone());
         let echo = Echo { version: u32::from(sim_node.upgraded), ..Echo::default() };
-        let mut node = Node::new(config, echo, sim_node.disk.meta, snapshot, log, self.now);
+        // A process of its own: its clocks start again, cluster time at the wall clock.
+        sim_node.started = self.now;
+        sim_node.clock = Slewed::new(WALL.saturating_add_signed(i64::try_from(self.now).unwrap() + sim_node.offset));
+        let now = self.clock(id);
+        let sim_node = self.nodes.get_mut(&id).unwrap();
+        let mut node = Node::new(config, echo, sim_node.disk.meta, snapshot, log, now);
         if let Some((_, mut bytes)) = loaded {
             node.restore(&mut bytes).unwrap();
         }
@@ -2182,8 +2301,9 @@ impl Sim {
             );
             let mut frame = Vec::new();
             codec::encode_frame(&turbofan_cluster::wire::Promote { request_id: self.rng.next() }, &mut frame).unwrap();
+            let now = self.clock(id);
             let node = self.nodes.get_mut(&id).unwrap().node.as_mut().unwrap();
-            node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, self.now);
+            node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, now);
             self.flush(id);
         }
     }
@@ -2320,7 +2440,7 @@ impl Sim {
         }
         let sent: u64 = self.clients.iter().map(|c| c.sent).sum();
         eprintln!(
-            "seed {seed}: members {members:?} after {} changes from {}, {} handovers, {} terms, {} crashes, {commit} committed, {sent} messages, {} snapshots, {} installed, {}/{} manual, {} reads (window {}, chunk {}), {} stalls, {} pauses, {} rots, {} broken, {} cut at rot, {} torn ({} mid-batch), {} overridden, {} segments compacted (of {} bytes)",
+            "seed {seed}: members {members:?} after {} changes from {}, {} handovers, {} terms, {} crashes, {commit} committed, {sent} messages, {} snapshots, {} installed, {}/{} manual, {} reads (window {}, chunk {}), {} stalls, {} pauses, {} clock steps, {} rots, {} broken, {} cut at rot, {} torn ({} mid-batch), {} overridden, {} segments compacted (of {} bytes)",
             self.member_changes,
             self.initial,
             self.transfers,
@@ -2335,6 +2455,7 @@ impl Sim {
             self.chunk,
             self.stalls,
             self.pauses,
+            self.steps,
             self.rots,
             self.broken,
             self.covered.rot_cut,

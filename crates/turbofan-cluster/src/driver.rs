@@ -634,23 +634,44 @@ const SLEW_PPM: u64 = 500;
 #[derive(Debug, Clone, Copy)]
 struct Clock {
     start: Instant,
-    /// The monotonic clock, since `start`, and cluster time, when last read.
-    mono: u64,
-    ns: u64,
+    slewed: Slewed,
 }
 
 impl Clock {
     fn new() -> Self {
-        Self { start: Instant::now(), mono: 0, ns: wall_ns() }
+        Self { start: Instant::now(), slewed: Slewed::new(wall_ns()) }
     }
 
     fn now(&mut self) -> u64 {
         let mono = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX / 2);
-        self.advance(mono, wall_ns())
+        self.slewed.advance(mono, wall_ns())
+    }
+
+    /// When the monotonic clock reaches cluster time `ns`.
+    fn instant(&self, ns: u64) -> Instant {
+        self.start + Duration::from_nanos(self.slewed.mono_at(ns))
+    }
+}
+
+/// [`Clock`]'s arithmetic, on readings of the monotonic and wall clocks it's given: public for the
+/// simulation, which gives each node clocks of its own, but not part of the API.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct Slewed {
+    /// The monotonic clock, since the node started, and cluster time, when last read.
+    mono: u64,
+    ns: u64,
+}
+
+impl Slewed {
+    /// Started at wall time `wall`.
+    #[must_use]
+    pub fn new(wall: u64) -> Self {
+        Self { mono: 0, ns: wall }
     }
 
     /// Cluster time at monotonic time `mono`, slewed toward wall time `wall`.
-    fn advance(&mut self, mono: u64, wall: u64) -> u64 {
+    pub fn advance(&mut self, mono: u64, wall: u64) -> u64 {
         let elapsed = mono.saturating_sub(self.mono);
         let slew = elapsed / (1_000_000 / SLEW_PPM);
         let free = self.ns + elapsed;
@@ -661,8 +682,9 @@ impl Clock {
 
     /// When the monotonic clock reaches cluster time `ns`, near enough: a tick that's early by
     /// the slew finds nothing due and waits again.
-    fn instant(&self, ns: u64) -> Instant {
-        self.start + Duration::from_nanos(self.mono + ns.saturating_sub(self.ns))
+    #[must_use]
+    pub fn mono_at(&self, ns: u64) -> u64 {
+        self.mono + ns.saturating_sub(self.ns)
     }
 }
 
@@ -1242,7 +1264,7 @@ mod tests {
     #[test]
     fn the_clock_slews_toward_the_wall_clock() {
         let base = 1_700_000_000 * SECOND;
-        let mut clock = Clock { start: Instant::now(), mono: 0, ns: base };
+        let mut clock = Slewed::new(base);
         // The wall clock is a millisecond ahead: closed over two seconds, half a millisecond each.
         assert_eq!(clock.advance(SECOND, base + SECOND + 1_000_000), base + SECOND + 500_000);
         assert_eq!(clock.advance(2 * SECOND, base + 2 * SECOND + 1_000_000), base + 2 * SECOND + 1_000_000);
