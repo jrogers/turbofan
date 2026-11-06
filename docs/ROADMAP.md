@@ -32,11 +32,6 @@ down when they show.
   faults between clients and nodes, which the proxy doesn't stand between; the soak over TLS,
   where the proxy can't read a hello to tell one link from another; and the driver's IO in the
   simulation, the thorough way.
-- **A leader through the simulation's faults.** Its fault phase has a leader a tenth of the
-  time or less: nodes crash by the event, thousands a second, and stay down for up to two
-  seconds, so two are often down at once and no quorum is left. What a leader does under faults
-  (paused, its clock off, answering when stale) is reached seldom. Crash by time, not by event,
-  and restart sooner, and check how much of the phase has a leader.
 - **A node paused, then resumed, in the soak.** The simulation pauses nodes, the leader often,
   for up to two seconds, and resumes them to everything that arrived meanwhile, a leader by then
   replaced without knowing it. The soak doesn't yet: hold a node's task, as a long garbage

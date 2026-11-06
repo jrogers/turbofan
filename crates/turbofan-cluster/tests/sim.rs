@@ -4,9 +4,11 @@
 //! more seeds, from `SIM_BASE`.
 //!
 //! Faults: peer messages delayed, reordered, dropped and duplicated; partitions; client connections
-//! reset; nodes crashing between events, as leader with appends in flight, or partway through
+//! reset; nodes crashing now and then, the leader too with appends in flight, mostly the process
+//! alone (each write it made reaching the disk whole) and sometimes the power, partway through
 //! persisting (a prefix of the operations being written, and of their records, reaching the disk,
-//! the next record torn), then restarting from what's on disk; nodes persisting as the driver
+//! the next record torn), then restarting from what's on disk; through it all, a leader a quarter
+//! of the time or more, for what one does under faults to be reached; nodes persisting as the driver
 //! does, batches taken while one is written queued behind it and written together, and inputs
 //! handled meanwhile; slow disks, what waits for a write late; and log records and snapshot files
 //! rotting on disk; nodes paused, as a long garbage collection or a stalled VM pauses a process, the
@@ -74,6 +76,10 @@ const MS: u64 = 1_000_000;
 /// Marks an admin request's ID as a `SetRole`'s, to count its answer.
 const ROLE_REQUEST: u64 = 1 << 63;
 const FAULT_PHASE: u64 = 20_000 * MS;
+/// A member crashes about this often, and the leader too: rarely enough that the cluster
+/// mostly has one.
+const CRASH_EVERY: u64 = 1000 * MS;
+const CRASH_LEADER_EVERY: u64 = 3000 * MS;
 const QUIET_PHASE: u64 = 10_000 * MS;
 /// After the cluster is recovered from its loss and the clients stop sending, for it to settle.
 const DISASTER_QUIET: u64 = 3000 * MS;
@@ -128,6 +134,9 @@ fn simulate() {
         assert!(covered.torn_resets > 0, "no crash interrupted a snapshot replacing the log");
         assert!(covered.segments_compacted > 0, "no log segment was compacted");
         assert!(covered.stale_leaders > 0, "no paused leader resumed after another was elected");
+        // A leader often enough, through the faults, for what one does under them to be reached.
+        let led = covered.led_ns * 100 / covered.fault_ns;
+        assert!(led >= 25, "the faults had a leader {led}% of the time");
         assert!(covered.promotions > 0, "a lost cluster was never recovered by promotion");
         assert!(covered.restores > 0, "a lost cluster was never restored from a snapshot");
         assert!(covered.diverged > 0, "no client's session diverged");
@@ -161,6 +170,9 @@ struct Coverage {
     segments_compacted: u64,
     /// Leaders that resumed from a pause after another was elected.
     stale_leaders: u64,
+    /// How long the fault phase ran, and had a leader.
+    fault_ns: u64,
+    led_ns: u64,
     /// Lost clusters recovered by promoting a learner, and by restoring a snapshot.
     promotions: u64,
     restores: u64,
@@ -188,6 +200,8 @@ impl Coverage {
         self.torn_resets += other.torn_resets;
         self.segments_compacted += other.segments_compacted;
         self.stale_leaders += other.stale_leaders;
+        self.fault_ns += other.fault_ns;
+        self.led_ns += other.led_ns;
         self.promotions += other.promotions;
         self.restores += other.restores;
         self.diverged += other.diverged;
@@ -360,6 +374,9 @@ enum Event {
     /// A node is paused: it takes nothing, its writes done or not, until it resumes.
     Pause,
     Resume(NodeId),
+    Crash {
+        leader: bool,
+    },
     /// A node's wall clock steps.
     StepClock,
     ToNode {
@@ -983,6 +1000,8 @@ impl Sim {
     fn schedule_operator(&mut self) {
         self.schedule(1000 * MS, Event::Partition);
         self.schedule(1500 * MS, Event::Pause);
+        self.schedule(CRASH_EVERY, Event::Crash { leader: false });
+        self.schedule(CRASH_LEADER_EVERY, Event::Crash { leader: true });
         self.schedule(1700 * MS, Event::StepClock);
         self.schedule(2000 * MS, Event::AdminRequest);
         self.schedule(1500 * MS, Event::ChangeMembers);
@@ -1030,6 +1049,10 @@ impl Sim {
             if self.faults && at > FAULT_PHASE {
                 self.end_faults();
             }
+            if self.faults {
+                self.covered.fault_ns += at - self.now;
+                self.covered.led_ns += if self.leader().is_some() { at - self.now } else { 0 };
+            }
             self.now = at;
             let event = self.events.remove(&seq).expect("each event is queued once");
             self.handle(event);
@@ -1045,6 +1068,7 @@ impl Sim {
             Event::Restart(id) => self.start(id),
             Event::Partition => self.partition(),
             Event::Pause => self.pause(),
+            Event::Crash { leader } => self.crash_some(leader),
             Event::StepClock => self.step_clock(),
             Event::Resume(id) => self.resume(id),
             Event::Heal => {
@@ -1088,17 +1112,21 @@ impl Sim {
                 }
             }
         }
-        if self.faults && self.rng.one_in(1000) {
-            let id = self.rng.pick(&self.members);
+    }
+
+    /// A node crashes, now and then, by the clock: any member, or the leader, with its appends in
+    /// flight, some followers getting them and some not.
+    fn crash_some(&mut self, leader: bool) {
+        if !self.faults {
+            return;
+        }
+        let id = if leader { self.leader() } else { Some(self.rng.pick(&self.members)) };
+        if let Some(id) = id {
             self.crash_unless_paused(id);
         }
-        // A leader dying with its appends in flight: some followers get them, some don't.
-        if self.faults
-            && self.rng.one_in(600)
-            && let Some(leader) = self.leader()
-        {
-            self.crash_unless_paused(leader);
-        }
+        let every = if leader { CRASH_LEADER_EVERY } else { CRASH_EVERY };
+        let after = every / 2 + self.rng.below(every);
+        self.schedule(after, Event::Crash { leader });
     }
 
     /// An operator asks the leader for a snapshot, on a connection of its own.
@@ -1292,10 +1320,10 @@ impl Sim {
             // most harm.
             let resets =
                 batches[i].persist.iter().any(|op| matches!(op, Persist::InstallSnapshot { replace_log: true, .. }));
-            if self.faults && !batches[i].persist.is_empty() && self.rng.one_in(if resets { 3 } else { 150 }) {
+            if self.faults && !batches[i].persist.is_empty() && self.rng.one_in(if resets { 3 } else { 500 }) {
                 // Power lost: what it hadn't written yet, it's writing as it crashes.
                 self.nodes.get_mut(&id).unwrap().writing = batches.split_off(i);
-                self.crash(id);
+                self.crash(id, true);
                 return;
             }
             for op in &batches[i].persist {
@@ -1902,7 +1930,7 @@ impl Sim {
         let id = self.rng.pick(&old);
         self.nodes.get_mut(&id).unwrap().upgraded = true;
         if self.nodes[&id].node.is_some() {
-            self.crash(id);
+            self.crash(id, false);
         }
         let after = 1000 * MS + self.rng.below(1500 * MS);
         self.schedule(after, Event::Upgrade);
@@ -1928,25 +1956,35 @@ impl Sim {
 
     /// A paused node resumes, rather than crashing and restarting, which would end the pause.
     fn crash_unless_paused(&mut self, id: NodeId) {
+        // Mostly the process alone; now and then the machine's power.
         if self.nodes[&id].paused_until <= self.now {
-            self.crash(id);
+            let power = self.rng.one_in(4);
+            self.crash(id, power);
         }
     }
 
-    fn crash(&mut self, id: NodeId) {
+    /// The process dies: with `power` lost, what it was writing is torn partway; else each write
+    /// it had made reaches the disk whole, as the kernel has it, and the rest never was.
+    fn crash(&mut self, id: NodeId, power: bool) {
         let sim_node = self.nodes.get_mut(&id).unwrap();
         if sim_node.node.take().is_none() {
             return;
         }
         let ops: Vec<Persist> = std::mem::take(&mut sim_node.writing).into_iter().flat_map(|b| b.persist).collect();
-        if !ops.is_empty() {
+        if !ops.is_empty() && power {
             self.tear_writes(id, &ops);
+        } else if !ops.is_empty() {
+            let made = usize::try_from(self.rng.below(ops.len() as u64 + 1)).unwrap();
+            let disk = &mut self.nodes.get_mut(&id).unwrap().disk;
+            for op in &ops[..made] {
+                disk.apply(op).expect("a disk that isn't damaged");
+            }
         }
         let sim_node = self.nodes.get_mut(&id).unwrap();
         self.crashes += 1;
         sim_node.incarnation += 1;
         // Sometimes straight back, in the same election.
-        let after = if self.rng.one_in(3) { MS + self.rng.below(20 * MS) } else { 50 * MS + self.rng.below(2000 * MS) };
+        let after = if self.rng.one_in(3) { MS + self.rng.below(20 * MS) } else { 50 * MS + self.rng.below(500 * MS) };
         self.schedule(after, Event::Restart(id));
         let conns: Vec<ConnId> = self.conns.iter().filter(|(_, c)| c.up && c.node == id).map(|(&k, _)| k).collect();
         for conn in conns {
@@ -2003,7 +2041,7 @@ impl Sim {
         for id in ids {
             std::fs::remove_file(self.nodes[&id].disk.dir.path().join("log/doubt")).unwrap();
             self.overrides += 1;
-            self.crash(id);
+            self.crash(id, false);
         }
     }
 
@@ -2057,9 +2095,9 @@ impl Sim {
         }
         let disk = &mut self.nodes.get_mut(&id).unwrap().disk;
         for op in &ops[..whole] {
-            // Crashing anyway.
+            // The disk is damaged, and nothing after reaches it: a restart finds that.
             if disk.apply(op).is_err() {
-                break;
+                return;
             }
         }
         match &ops[whole] {
@@ -2440,7 +2478,7 @@ impl Sim {
         }
         let sent: u64 = self.clients.iter().map(|c| c.sent).sum();
         eprintln!(
-            "seed {seed}: members {members:?} after {} changes from {}, {} handovers, {} terms, {} crashes, {commit} committed, {sent} messages, {} snapshots, {} installed, {}/{} manual, {} reads (window {}, chunk {}), {} stalls, {} pauses, {} clock steps, {} rots, {} broken, {} cut at rot, {} torn ({} mid-batch), {} overridden, {} segments compacted (of {} bytes)",
+            "seed {seed}: members {members:?} after {} changes from {}, {} handovers, {} terms, {} crashes, {commit} committed, {sent} messages, {} snapshots, {} installed, {}/{} manual, {} reads (window {}, chunk {}), {} stalls, {} pauses, {} clock steps, a leader {}% of the faults, {} rots, {} broken, {} cut at rot, {} torn ({} mid-batch), {} overridden, {} segments compacted (of {} bytes)",
             self.member_changes,
             self.initial,
             self.transfers,
@@ -2456,6 +2494,7 @@ impl Sim {
             self.stalls,
             self.pauses,
             self.steps,
+            self.covered.led_ns * 100 / self.covered.fault_ns.max(1),
             self.rots,
             self.broken,
             self.covered.rot_cut,
