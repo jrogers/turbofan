@@ -84,6 +84,9 @@ const QUIET_PHASE: u64 = 10_000 * MS;
 /// After the cluster is recovered from its loss and the clients stop sending, for it to settle.
 const DISASTER_QUIET: u64 = 3000 * MS;
 const CLIENTS: usize = 3;
+/// Far more events waiting than a run has: past it, messages multiply, each answered by more
+/// than one, and the run would take the machine's memory.
+const MAX_QUEUED_EVENTS: usize = 200_000;
 /// Every this many messages, the echo service sets a timer.
 const TIMER_EVERY: u64 = 7;
 /// Every this many messages, the echo service proposes one of its own, which sends `p<k>`.
@@ -2395,6 +2398,7 @@ impl Sim {
         self.next_event += 1;
         self.events.insert(seq, event);
         self.queue.push((Reverse(self.now + after), Reverse(seq)));
+        assert!(self.queue.len() <= MAX_QUEUED_EVENTS, "seed {}: messages multiplying", self.seed);
     }
 
     /// Election safety: at most one leader per term, ever. Leader completeness: a new leader's

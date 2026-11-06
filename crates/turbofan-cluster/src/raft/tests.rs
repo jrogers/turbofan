@@ -75,8 +75,13 @@ fn flush(raft: &mut Raft) -> Vec<(NodeId, Vec<u8>)> {
 
 /// Delivers `sends` from `from`, and everything they cause, between the nodes in `up`.
 fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Vec<u8>)>, now: u64) {
+    /// Far more than any exchange here takes: past it, messages go back and forth for ever.
+    const MAX_DELIVERED: usize = 100_000;
     let mut queue: Vec<_> = sends.into_iter().map(|(to, frame)| (NodeId(from), to, frame)).collect();
+    let mut delivered = 0;
     while let Some((from, to, frame)) = queue.pop() {
+        delivered += 1;
+        assert!(delivered <= MAX_DELIVERED, "messages going back and forth for ever: {} queued", queue.len());
         if !up.contains(&to.0) {
             continue;
         }
@@ -638,6 +643,8 @@ fn a_follower_behind_the_window_is_sent_records_read_back() {
     assert_eq!(rafts[0].take_outputs().reads, [1]);
     rafts[0].on_read(&disk);
     let sends = rafts[0].take_outputs().appends;
+    let again = rafts[0].take_outputs();
+    assert!(again.appends.is_empty() && again.reads.is_empty(), "sent once it's read, nor read again");
     deliver(&mut rafts, &[1, 3], 1, sends, now);
     assert_eq!((rafts[2].last_index(), rafts[2].entry(2)), (3, Some(&b"b"[..])));
     assert_eq!(rafts[0].entry(1), None, "read records are kept for one round");
@@ -1261,6 +1268,10 @@ fn refusals_of_appends_in_flight_are_answered_with_one_probe() {
         refusals.extend(flush(&mut rafts[1]));
     }
     for (_, refusal) in &refusals {
+        let wire::Decoded::AppendAck(ack) = decode(refusal) else { panic!() };
+        assert_eq!((ack.success(), ack.index()), (0, 1), "from its log's end, empty");
+    }
+    for (_, refusal) in &refusals {
         rafts[0].on_message(NodeId(2), &decode(refusal), 2 * MS);
     }
     let resent: Vec<_> = flush(&mut rafts[0]).into_iter().filter(|&(to, _)| to == NodeId(2)).collect();
@@ -1298,4 +1309,41 @@ fn an_older_followers_refusal_is_answered_from_where_it_says() {
     let resent: Vec<_> = flush(&mut rafts[0]).into_iter().filter(|&(to, _)| to == NodeId(2)).collect();
     deliver(&mut rafts, &[1, 2], 1, resent, 3 * MS);
     assert_eq!(rafts[1].last_index(), rafts[0].last_index());
+}
+
+/// A probe refused too, the follower's log diverging further back than its first refusal says,
+/// is answered: the leader goes back again, as far as it must.
+#[test]
+fn a_refused_probe_goes_back_again() {
+    let members = [1, 2, 3];
+    let leader = [1, 1, 4, 4, 4];
+    let mut rafts: Vec<Raft> = [&leader[..], &[1, 1, 2, 2, 3, 3, 3], &leader]
+        .iter()
+        .zip(1..)
+        .map(|(terms, id)| Raft::new(config(id, &members), Meta { term: 4, vote: None }, None, entries(terms), 0))
+        .collect();
+    elect(&mut rafts, &[1, 2, 3], 1, 0);
+    let mut now = rafts[0].now;
+    for _ in 0..5 {
+        now = rafts[0].next_deadline().max(now + MS);
+        rafts[0].on_tick(now);
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &[1, 2, 3], 1, sends, now);
+    }
+    let last = rafts[0].last_index();
+    assert_eq!(rafts[1].last_index(), last);
+    assert!((1..=last).all(|i| rafts[1].term_at(i) == rafts[0].term_at(i)), "the leader's log");
+}
+
+/// Proposals more than one append holds go out in one round, pipelined, not one append a round.
+#[test]
+fn appends_are_pipelined() {
+    let mut rafts = cluster(3);
+    elect(&mut rafts, &[1, 2, 3], 1, 0);
+    flush(&mut rafts[0]);
+    for _ in 0..2 * MAX_ENTRIES_PER_APPEND + 1 {
+        rafts[0].propose(b"x");
+    }
+    let to_2 = flush(&mut rafts[0]).into_iter().filter(|&(to, _)| to == NodeId(2)).count();
+    assert_eq!(to_2, 3, "three appends at once");
 }

@@ -796,19 +796,25 @@ impl Raft {
     pub fn take_outputs(&mut self) -> Outputs {
         if self.role == Role::Leader {
             for i in 0..self.peers.len() {
-                // A peer behind the snapshot moves on by its snapshot acks and heartbeats.
-                while self.peers[i].next >= self.log.first
-                    && self.peers[i].next <= self.replicate_to()
-                    && self.peers[i].next <= self.peers[i].matched + MAX_IN_FLIGHT
-                    && self.peers[i].probe.is_none()
-                {
+                // A peer behind the snapshot moves on by its snapshot acks and heartbeats. Each
+                // append moves `next` on, to `matched + MAX_IN_FLIGHT` at most, so that bounds the
+                // loop; a probe, which doesn't, isn't pipelined.
+                for _ in 0..=MAX_IN_FLIGHT {
+                    let p = &self.peers[i];
+                    let pipelined = p.next >= self.log.first
+                        && p.next <= self.replicate_to()
+                        && p.next <= p.matched + MAX_IN_FLIGHT
+                        && p.probe.is_none();
+                    if !pipelined {
+                        break;
+                    }
                     // Records on disk only: they're read, and sent in the next round.
                     if !self.send_append(i, false) {
                         break;
                     }
                 }
-                if self.peers[i].probe_read && self.send_append(i, false) {
-                    self.peers[i].probe_read = false;
+                if self.peers[i].probe_read {
+                    self.send_append(i, false);
                 }
                 if self.peers[i].chunk_wanted {
                     self.send_snapshot_chunks(i);

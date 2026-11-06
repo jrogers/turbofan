@@ -178,8 +178,9 @@ impl Raft {
     }
 
     /// Sends a peer the records from its `next`. If the first is on disk only, it's fetched and
-    /// this returns false, having sent nothing, or with `probe`, an append of no records: a
-    /// heartbeat, which also finds where the peer's log matches.
+    /// nothing is sent, or with `probe`, an append of no records: a heartbeat, which also finds
+    /// where the peer's log matches. Returns whether `next` moved on, so that more may follow: not
+    /// for a probe, nor a snapshot, nor records still to be read.
     pub(super) fn send_append(&mut self, peer: usize, probe: bool) -> bool {
         let (next, id) = (self.peers[peer].next, self.peers[peer].id);
         if self.held_back(peer) {
@@ -202,7 +203,7 @@ impl Raft {
         }
         if next < self.log.first {
             self.resume_snapshot(peer);
-            return true;
+            return false;
         }
         let prev_term = self.term_at(next - 1).expect("next is past the snapshot");
         let mut bytes = Vec::new();
@@ -238,11 +239,15 @@ impl Raft {
             last_index: self.last_index(),
         };
         self.send_append_frame(id, &append);
-        // A probe goes again from where it is, by heartbeat, until it's answered.
-        if self.peers[peer].probe.is_none() {
-            self.peers[peer].next = index;
+        let p = &mut self.peers[peer];
+        if p.probe.is_some() {
+            // It goes again from where it is, by heartbeat, until it's answered; its records
+            // went, unless they're still being read.
+            p.probe_read &= count == 0;
+            return false;
         }
-        true
+        p.next = index;
+        index > next
     }
 
     pub(super) fn send_append_frame(&mut self, to: NodeId, append: &wire::AppendEntries<'_>) {
