@@ -9,7 +9,9 @@
 //! the next record torn), then restarting from what's on disk; nodes persisting as the driver
 //! does, batches taken while one is written queued behind it and written together, and inputs
 //! handled meanwhile; slow disks, what waits for a write late; and log records and snapshot files
-//! rotting on disk; a crash tearing a record with the rest of its append whole after it, as a disk
+//! rotting on disk; nodes paused, as a long garbage collection or a stalled VM pauses a process, the
+//! leader often, then resumed to everything that reached them meanwhile, a leader by then perhaps
+//! replaced without knowing it, its clock jumped; a crash tearing a record with the rest of its append whole after it, as a disk
 //! keeping a later page and losing an earlier does. A node that finds its disk damaged as it runs
 //! stops, as the driver does, and is replaced: removed from the members, wiped, and started again
 //! to join, as an operator would. On restart, a log is cut at a rotten or torn record, as the log
@@ -120,6 +122,7 @@ fn simulate() {
         assert!(covered.rot_cut > 0, "no rotten record was cut from a log with records after it");
         assert!(covered.torn_resets > 0, "no crash interrupted a snapshot replacing the log");
         assert!(covered.segments_compacted > 0, "no log segment was compacted");
+        assert!(covered.stale_leaders > 0, "no paused leader resumed after another was elected");
         assert!(covered.promotions > 0, "a lost cluster was never recovered by promotion");
         assert!(covered.restores > 0, "a lost cluster was never restored from a snapshot");
         assert!(covered.diverged > 0, "no client's session diverged");
@@ -151,6 +154,8 @@ struct Coverage {
     torn_resets: u64,
     /// Times a log's first segment was removed.
     segments_compacted: u64,
+    /// Leaders that resumed from a pause after another was elected.
+    stale_leaders: u64,
     /// Lost clusters recovered by promoting a learner, and by restoring a snapshot.
     promotions: u64,
     restores: u64,
@@ -177,6 +182,7 @@ impl Coverage {
         self.rot_cut += other.rot_cut;
         self.torn_resets += other.torn_resets;
         self.segments_compacted += other.segments_compacted;
+        self.stale_leaders += other.stale_leaders;
         self.promotions += other.promotions;
         self.restores += other.restores;
         self.diverged += other.diverged;
@@ -334,6 +340,9 @@ enum Event {
     Restart(NodeId),
     Partition,
     Heal,
+    /// A node is paused: it takes nothing, its writes done or not, until it resumes.
+    Pause,
+    Resume(NodeId),
     ToNode {
         conn: ConnId,
         frame: Vec<u8>,
@@ -686,8 +695,8 @@ struct SimNode {
     incarnation: u64,
     /// Runs the new version.
     upgraded: bool,
-    /// It waits on its disk, a restore with what's being written: it takes no input until then,
-    /// and what it sends goes no sooner.
+    /// It waits on its disk, a restore with what's being written, or it's paused: it takes no
+    /// input until then, and what it sends goes no sooner.
     stalled_until: u64,
     /// Its batches between taken and durable, by the driver's rules.
     pipeline: Pipeline,
@@ -798,6 +807,7 @@ struct Sim {
     /// The index the new version was activated at.
     activated: Option<u64>,
     stalls: u64,
+    pauses: u64,
     rots: u64,
     broken: u64,
     /// Nodes whose doubt the operator ended.
@@ -902,6 +912,7 @@ impl Sim {
             transfers: 0,
             activated: None,
             stalls: 0,
+            pauses: 0,
             rots: 0,
             broken: 0,
             overrides: 0,
@@ -933,6 +944,7 @@ impl Sim {
     /// The faults and the operator's work, each of which goes on to schedule more.
     fn schedule_operator(&mut self) {
         self.schedule(1000 * MS, Event::Partition);
+        self.schedule(1500 * MS, Event::Pause);
         self.schedule(2000 * MS, Event::AdminRequest);
         self.schedule(1500 * MS, Event::ChangeMembers);
         self.schedule(1200 * MS, Event::TransferLeadership);
@@ -1003,6 +1015,8 @@ impl Sim {
             }
             Event::Restart(id) => self.start(id),
             Event::Partition => self.partition(),
+            Event::Pause => self.pause(),
+            Event::Resume(id) => self.resume(id),
             Event::Heal => {
                 self.cut = [[false; 8]; 8];
                 if self.faults {
@@ -1674,10 +1688,18 @@ impl Sim {
             } else {
                 assert_eq!(i, self.committed.len());
                 // Committed by a majority of the voters of some config from the entry's on: as of
-                // the entry, or as of now if they've changed since.
+                // the entry, or as of now if they've changed since. A voter whose log dropped a
+                // rotten last record counts, in doubt: the leader may count its ack from before,
+                // and elections, needing a vote more for each voter in doubt, keep the entry.
                 let majority = |members: &[Member]| {
                     let voters: Vec<&Member> = members.iter().filter(|m| !m.learner).collect();
-                    let durable = voters.iter().filter(|m| self.nodes[&m.id].disk.has(index, &payload)).count();
+                    let durable = voters
+                        .iter()
+                        .filter(|m| {
+                            let disk = &self.nodes[&m.id].disk;
+                            disk.has(index, &payload) || disk.rot_doubt
+                        })
+                        .count();
                     durable > voters.len() / 2
                 };
                 assert!(
@@ -1692,11 +1714,40 @@ impl Sim {
         }
     }
 
-    /// The event, unless it's for a node stalled on its disk: that takes it once it's done.
+    /// Pauses a node, the leader half the time: mostly for longer than an election timeout.
+    fn pause(&mut self) {
+        if !self.faults {
+            return;
+        }
+        let up: Vec<NodeId> = self.members.iter().copied().filter(|id| self.nodes[id].node.is_some()).collect();
+        if let Some(id) =
+            self.leader().filter(|_| self.rng.one_in(2)).or_else(|| (!up.is_empty()).then(|| self.rng.pick(&up)))
+        {
+            let length =
+                if self.rng.one_in(3) { self.rng.below(150 * MS) } else { 300 * MS + self.rng.below(2000 * MS) };
+            let sim_node = self.nodes.get_mut(&id).unwrap();
+            sim_node.stalled_until = sim_node.stalled_until.max(self.now + length);
+            self.pauses += 1;
+            self.schedule(length, Event::Resume(id));
+        }
+        let after = 1000 * MS + self.rng.below(3000 * MS);
+        self.schedule(after, Event::Pause);
+    }
+
+    /// A paused node resumes, before what waited for it: a leader, unless another has been elected.
+    fn resume(&mut self, id: NodeId) {
+        let Some(raft) = self.nodes[&id].node.as_ref().map(Node::raft) else { return };
+        let newest = self.nodes.values().filter_map(|n| n.node.as_ref()).map(|n| n.raft().term()).max().unwrap();
+        if raft.role() == Role::Leader && raft.term() < newest {
+            self.covered.stale_leaders += 1;
+        }
+    }
+
+    /// The event, unless it's for a node stalled on its disk or paused: it takes it after.
     fn unless_stalled(&mut self, event: Event) -> Option<Event> {
         let target = match &event {
             Event::Deliver { to, .. } => Some(*to),
-            Event::Tick(id) | Event::Saved { id, .. } => Some(*id),
+            Event::Tick(id) | Event::Saved { id, .. } | Event::Written { id, .. } => Some(*id),
             Event::ToNode { conn, .. } => Some(self.conns[conn].node),
             _ => None,
         };
@@ -2269,7 +2320,7 @@ impl Sim {
         }
         let sent: u64 = self.clients.iter().map(|c| c.sent).sum();
         eprintln!(
-            "seed {seed}: members {members:?} after {} changes from {}, {} handovers, {} terms, {} crashes, {commit} committed, {sent} messages, {} snapshots, {} installed, {}/{} manual, {} reads (window {}, chunk {}), {} stalls, {} rots, {} broken, {} cut at rot, {} torn ({} mid-batch), {} overridden, {} segments compacted (of {} bytes)",
+            "seed {seed}: members {members:?} after {} changes from {}, {} handovers, {} terms, {} crashes, {commit} committed, {sent} messages, {} snapshots, {} installed, {}/{} manual, {} reads (window {}, chunk {}), {} stalls, {} pauses, {} rots, {} broken, {} cut at rot, {} torn ({} mid-batch), {} overridden, {} segments compacted (of {} bytes)",
             self.member_changes,
             self.initial,
             self.transfers,
@@ -2283,6 +2334,7 @@ impl Sim {
             self.window,
             self.chunk,
             self.stalls,
+            self.pauses,
             self.rots,
             self.broken,
             self.covered.rot_cut,

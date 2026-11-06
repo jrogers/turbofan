@@ -274,7 +274,7 @@ later term, or the whole log of the leader it follows.
 | Test | Where | Finds |
 |---|---|---|
 | Unit tests | each module | Each rule, against the sans-IO `Raft`, `Node` and `Client`. |
-| Deterministic simulation | `tests/sim.rs` | Lost, repeated or reordered messages, responses and timers, and one client's message applied before another's answered ahead of it, under delays, drops, partitions, crashes mid-batch, slow disks, rot, membership changes, transfers and rolling upgrades; replayable from `SIM_SEED`. |
+| Deterministic simulation | `tests/sim.rs` | Lost, repeated or reordered messages, responses and timers, and one client's message applied before another's answered ahead of it, under delays, drops, partitions, crashes mid-batch, nodes paused, slow disks, rot, membership changes, transfers and rolling upgrades; replayable from `SIM_SEED`. |
 | A real cluster | `tests/cluster.rs` | Mistakes in the driver: three nodes over TCP and files, killed and restarted, joining and leaving, with tokens; and over TLS, refusing who has no certificate or the wrong one. |
 | Fuzzing | `fuzz/` (`scripts/fuzz.sh`) | Panics on what the network sends: frames and records (`decode`), and any sequence of client and admin steps against a node (`client`). |
 | Codecs | `turbofan-sbe/tests/sbe.rs` | Generated code that differs from what's checked in, or from real-logic's SBE codecs' bytes. |

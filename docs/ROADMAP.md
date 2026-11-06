@@ -36,10 +36,10 @@ down when they show.
   leader's, as it logged it, held still when a new leader's is behind, and the driver slews its
   clock toward the wall clock; timers and session timeouts ride on that through failovers. Give
   each simulated node an offset and a drift of its own, and jumps, as NTP and a VM resuming make.
-- **A node paused, then resumed.** A long garbage collection or a VM stalled freezes a whole
-  node, which then resumes with a stale view of the cluster: a leader that doesn't know it's
-  been replaced, its clock jumped. The simulation stalls disks and delays messages, but never
-  freezes a node and lets it resume. Model it there, and in the soak by holding a node's task.
+- **A node paused, then resumed, in the soak.** The simulation pauses nodes, the leader often,
+  for up to two seconds, and resumes them to everything that arrived meanwhile, a leader by then
+  replaced without knowing it. The soak doesn't yet: hold a node's task, as a long garbage
+  collection or a stalled VM does.
 - **Jepsen, once, before 1.0.** The production binaries as processes on machines of their own,
   faulted at the operating system (iptables, tc, `SIGKILL`, `SIGSTOP`) and checked black-box:
   what in-process tests can't reach, the driver, the command line and a real fsync among it, and
