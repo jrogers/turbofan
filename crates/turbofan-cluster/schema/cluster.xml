@@ -3,7 +3,7 @@
      Every frame is a u32 length and one of these messages. Services' own payloads are opaque
      `payload` bytes here; each service has a schema of its own. Change it only as WIRE.md says:
      old and new nodes run side by side. -->
-<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="6"
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="7"
                    byteOrder="littleEndian">
     <types>
         <composite name="messageHeader">
@@ -111,7 +111,9 @@
     </sbe:message>
     <!-- `index`: the durable last index on success, where to retry from on failure. -->
     <!-- `protocol` and `serviceVersion`: the highest this node's code supports, for the leader to
-         know the lowest among the members. -->
+         know the lowest among the members. `prevIndex`: the `prevIndex` of the append (or the
+         `lastIndex` of the snapshot) it answers, so a leader tells a refusal of the append it's
+         probing with from one of an older append. Absent from an older node. -->
     <sbe:message name="AppendAck" id="13">
         <field name="term" id="1" type="uint64"/>
         <field name="success" id="2" type="uint8"/>
@@ -119,6 +121,7 @@
         <field name="snapshotIndex" id="4" type="uint64"/>
         <field name="protocol" id="5" type="uint32"/>
         <field name="serviceVersion" id="6" type="uint32"/>
+        <field name="prevIndex" id="7" type="uint64" sinceVersion="7"/>
     </sbe:message>
     <sbe:message name="InstallSnapshot" id="14">
         <field name="term" id="1" type="uint64"/>

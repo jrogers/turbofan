@@ -50,7 +50,7 @@ impl Raft {
 
     pub(super) fn on_append_entries(&mut self, from: NodeId, m: &wire::AppendEntriesRef<'_>, now: u64) {
         if m.term() < self.meta.term {
-            self.ack(from, false, self.last_index() + 1);
+            self.ack(from, false, self.last_index() + 1, m.prev_index());
             return;
         }
         if m.term() > self.meta.term || self.role != Role::Follower {
@@ -62,12 +62,12 @@ impl Raft {
 
         let prev = m.prev_index();
         if prev > self.last_index() {
-            self.ack(from, false, self.last_index() + 1);
+            self.ack(from, false, self.last_index() + 1, prev);
             return;
         }
         if prev >= self.log.first - 1 && self.term_at(prev) != Some(m.prev_term()) {
             let hint = self.first_index_of_term_at(prev).max(self.commit + 1);
-            self.ack(from, false, hint);
+            self.ack(from, false, hint, prev);
             return;
         }
         let Some(matched) = self.accept_records(m) else { return };
@@ -75,7 +75,7 @@ impl Raft {
         // restarted, arriving late, says less than this node acknowledged before it did.
         // A reordered, older append can match less than is already known committed.
         self.commit = self.commit.max(m.commit().min(matched));
-        self.ack(from, true, matched);
+        self.ack(from, true, matched, prev);
     }
 
     /// Appends `m`'s records where they're new, truncating a conflicting suffix first. Returns
@@ -133,6 +133,7 @@ impl Raft {
         let p = &mut self.peers[peer];
         if m.success() == 1 {
             p.sending = None;
+            (p.probe, p.probe_read) = (None, false);
             p.chunk_wanted = false;
             debug_assert!(m.index() <= last, "a follower can't have more than this leader sent");
             p.matched = p.matched.max(m.index().min(last));
@@ -141,18 +142,28 @@ impl Raft {
             self.advance_commit();
             self.check_catch_up(id, matched);
             self.try_transfer();
-        } else {
+        } else if let Some(prev) = m.prev_index() {
+            // A refusal of an append other than the probe in flight is of an older one,
+            // overtaken: each pipelined append is refused, and answering each would send more
+            // than are answered, round after round.
+            if p.probe.is_some_and(|probe| probe != prev) {
+                return;
+            }
             // Refused from no further than it had matched: it lost entries it acknowledged, a
-            // damaged tail its log dropped on restart (it doubts), and is sent them again. Else
-            // it never catches up, and each refusal is answered with the same append, as fast
-            // as they travel. (An older refusal, reordered, costs only a resend.)
+            // damaged tail its log dropped on restart (it doubts), and is sent them again. (A
+            // refusal reordered past a later success costs a probe.)
             if m.index() <= p.matched {
                 p.matched = m.index().saturating_sub(1);
             }
-            // Back to where it refused, never on: a refusal further on is of an older append,
-            // overtaken. And sent again only then: each of the appends in flight is refused, and
-            // answering every refusal sends more than are answered, round after round. A resend
-            // that's lost, the next heartbeat makes again.
+            // Then one append at a time, till one is taken.
+            p.next = m.index().clamp(p.matched + 1, last + 1);
+            p.probe = Some(p.next - 1);
+            self.send_append(peer, true);
+        } else {
+            // From an older node, which doesn't say what it refuses: where it says.
+            if m.index() <= p.matched {
+                p.matched = m.index().saturating_sub(1);
+            }
             let next = m.index().clamp(p.matched + 1, last + 1);
             if next < p.next {
                 p.next = next;
@@ -211,6 +222,7 @@ impl Raft {
         }
         if count == 0 && next <= to {
             self.fetch(next);
+            self.peers[peer].probe_read = self.peers[peer].probe.is_some();
             if !probe {
                 return false;
             }
@@ -226,7 +238,10 @@ impl Raft {
             last_index: self.last_index(),
         };
         self.send_append_frame(id, &append);
-        self.peers[peer].next = index;
+        // A probe goes again from where it is, by heartbeat, until it's answered.
+        if self.peers[peer].probe.is_none() {
+            self.peers[peer].next = index;
+        }
         true
     }
 
@@ -293,7 +308,7 @@ impl Raft {
         self.out.persist.push(Persist::TruncateFrom(index));
     }
 
-    pub(super) fn ack(&mut self, to: NodeId, success: bool, index: u64) {
+    pub(super) fn ack(&mut self, to: NodeId, success: bool, index: u64, prev_index: u64) {
         let ack = wire::AppendAck {
             term: self.meta.term,
             success: u8::from(success),
@@ -301,6 +316,7 @@ impl Raft {
             snapshot_index: self.snapshot_index(),
             protocol: self.advertised.0,
             service_version: self.advertised.1,
+            prev_index,
         };
         self.send(to, &ack);
     }

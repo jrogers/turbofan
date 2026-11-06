@@ -23,6 +23,11 @@ a patch version (0.1.1) doesn't.
   than it had acknowledged: a leader could then count its earlier acknowledgement of entries it
   had lost, and commit an entry a majority didn't hold. It now trusts its log again only from an
   entry or snapshot of a later term.
+- A leader answered each refusal of the appends in flight to a follower behind it, sending more
+  than were answered, round after round, until it ran out of memory. A refusal now says which
+  append it refuses (`AppendAck`'s `prevIndex`, schema version 7), and after one the leader
+  probes with one append at a time, ignoring refusals of older ones. A refusal from an older
+  node, without it, is answered as before.
 
 ## 0.7.0 (2026-11-05)
 

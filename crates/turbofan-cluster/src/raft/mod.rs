@@ -362,6 +362,11 @@ struct Peer {
     chunk_wanted: bool,
     /// The protocol and service versions it supports, as it last said.
     versions: Option<(u32, u32)>,
+    /// After a refusal, probing where its log matches: the `prevIndex` of the one append to it,
+    /// sent from `next` (not moved on) until it's answered. Nothing is pipelined meanwhile.
+    probe: Option<u64>,
+    /// The probe went without its records, on disk only: it goes again once they're read.
+    probe_read: bool,
 }
 
 /// A leadership transfer under way.
@@ -795,11 +800,15 @@ impl Raft {
                 while self.peers[i].next >= self.log.first
                     && self.peers[i].next <= self.replicate_to()
                     && self.peers[i].next <= self.peers[i].matched + MAX_IN_FLIGHT
+                    && self.peers[i].probe.is_none()
                 {
                     // Records on disk only: they're read, and sent in the next round.
                     if !self.send_append(i, false) {
                         break;
                     }
+                }
+                if self.peers[i].probe_read && self.send_append(i, false) {
+                    self.peers[i].probe_read = false;
                 }
                 if self.peers[i].chunk_wanted {
                     self.send_snapshot_chunks(i);
@@ -837,6 +846,8 @@ impl Peer {
             sending: None,
             chunk_wanted: false,
             versions: None,
+            probe: None,
+            probe_read: false,
         }
     }
 }

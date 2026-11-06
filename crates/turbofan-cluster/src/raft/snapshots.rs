@@ -172,7 +172,7 @@ impl Raft {
     /// A chunk of the leader's snapshot. Once whole, it replaces this node's log and state.
     pub(super) fn on_install_snapshot(&mut self, from: NodeId, m: &wire::InstallSnapshotRef<'_>, now: u64) {
         if m.term() < self.meta.term {
-            self.ack(from, false, self.last_index() + 1);
+            self.ack(from, false, self.last_index() + 1, m.last_index());
             return;
         }
         if m.term() > self.meta.term || self.role != Role::Follower {
@@ -183,7 +183,7 @@ impl Raft {
         self.reset_election(now);
         if m.last_index() <= self.commit {
             // Already has all it covers.
-            self.ack(from, true, m.last_index());
+            self.ack(from, true, m.last_index(), m.last_index());
             return;
         }
         // A first chunk starts a snapshot, unless it's one already arriving: then it's a resend.
@@ -216,7 +216,7 @@ impl Raft {
                 return;
             }
             self.install(incoming);
-            self.ack(from, true, self.commit);
+            self.ack(from, true, self.commit, m.last_index());
         } else {
             let ack = wire::SnapshotAck { term: self.meta.term, offset: incoming.len, index: m.last_index() };
             self.send(from, &ack);

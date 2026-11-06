@@ -1235,3 +1235,67 @@ fn a_follower_that_lost_acknowledged_entries_is_sent_them_again() {
     assert!(queue.is_empty(), "still refusing and resending: {} in flight", queue.len());
     assert_eq!(rafts[1].last_index(), last + 1, "sent what it lost");
 }
+
+/// Each of the appends in flight to a follower that lost its log is refused: the leader answers
+/// the first with a probe, and the rest, refusals of older appends, not at all. Answering each
+/// sent more than were answered, round after round.
+#[test]
+fn refusals_of_appends_in_flight_are_answered_with_one_probe() {
+    let mut rafts = cluster(3);
+    elect(&mut rafts, &[1, 2, 3], 1, 0);
+    rafts[0].propose(b"a");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, MS);
+    // Node 2 restarts with nothing, and the leader pipelines three appends to it.
+    rafts[1] =
+        Raft::new(config(2, &[1, 2, 3]), Meta { term: rafts[0].term(), vote: None }, None, Entries::default(), MS);
+    let mut appends = Vec::new();
+    for payload in [b"b", b"c", b"d"] {
+        rafts[0].propose(payload);
+        appends.extend(flush(&mut rafts[0]).into_iter().filter(|&(to, _)| to == NodeId(2)));
+    }
+    assert_eq!(appends.len(), 3);
+    let mut refusals = Vec::new();
+    for (_, append) in appends {
+        rafts[1].on_message(NodeId(1), &decode(&append), 2 * MS);
+        refusals.extend(flush(&mut rafts[1]));
+    }
+    for (_, refusal) in &refusals {
+        rafts[0].on_message(NodeId(2), &decode(refusal), 2 * MS);
+    }
+    let resent: Vec<_> = flush(&mut rafts[0]).into_iter().filter(|&(to, _)| to == NodeId(2)).collect();
+    assert_eq!(resent.len(), 1, "one probe for {} refusals", refusals.len());
+    // Taken, it ends the probe: the follower has the whole log.
+    deliver(&mut rafts, &[1, 2], 1, resent, 3 * MS);
+    assert_eq!(rafts[1].last_index(), rafts[0].last_index());
+}
+
+/// A refusal from a node older than `prevIndex` (version 6) doesn't say what it refuses: it's
+/// answered from where it says, as before.
+#[test]
+fn an_older_followers_refusal_is_answered_from_where_it_says() {
+    let mut rafts = cluster(3);
+    elect(&mut rafts, &[1, 2, 3], 1, 0);
+    rafts[0].propose(b"a");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, MS);
+    rafts[1] =
+        Raft::new(config(2, &[1, 2, 3]), Meta { term: rafts[0].term(), vote: None }, None, Entries::default(), MS);
+    rafts[0].propose(b"b");
+    let (_, append) = flush(&mut rafts[0]).into_iter().find(|&(to, _)| to == NodeId(2)).unwrap();
+    rafts[1].on_message(NodeId(1), &decode(&append), 2 * MS);
+    let Ok([(_, mut refusal)]) = <[_; 1]>::try_from(flush(&mut rafts[1])) else { panic!() };
+    // Without `prevIndex`, the block 8 bytes shorter, and saying version 6.
+    refusal.truncate(refusal.len() - 8);
+    let len = u32::try_from(refusal.len() - 4).unwrap();
+    refusal[..4].copy_from_slice(&len.to_le_bytes());
+    let block = u16::from_le_bytes([refusal[4], refusal[5]]) - 8;
+    refusal[4..6].copy_from_slice(&block.to_le_bytes());
+    refusal[10..12].copy_from_slice(&6_u16.to_le_bytes());
+    let wire::Decoded::AppendAck(read) = decode(&refusal) else { panic!() };
+    assert_eq!((read.success(), read.prev_index()), (0, None));
+    rafts[0].on_message(NodeId(2), &decode(&refusal), 2 * MS);
+    let resent: Vec<_> = flush(&mut rafts[0]).into_iter().filter(|&(to, _)| to == NodeId(2)).collect();
+    deliver(&mut rafts, &[1, 2], 1, resent, 3 * MS);
+    assert_eq!(rafts[1].last_index(), rafts[0].last_index());
+}
