@@ -44,7 +44,10 @@
 //! The service is an echo with timers, which notifies the first session of some of the others'
 //! messages. Clients send numbered messages through failovers, and
 //! must see every message applied once and in order, every response once and in order, every
-//! timer fire once, and every message the service proposed applied once.
+//! timer fire once, and every message the service proposed applied once. And linearizably, across
+//! clients: each `a<k>` says where in the log's order its message was applied, and a message is
+//! applied after every message answered, any client's, before it was sent, each place in the order
+//! answered for one message only.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
@@ -192,6 +195,9 @@ struct Echo {
     /// Responses sent to each session: its last `egress_seq`, while it's open.
     responses: BTreeMap<SessionId, u64>,
     fired: u64,
+    /// Messages applied, every session's: the last one's place in the log's order, which its
+    /// `a<k>` response carries.
+    applied: u64,
     /// Messages applied as version 1, which only new code has.
     as_new: u64,
     /// The version this code has: 0 old, 1 new. Not state.
@@ -201,8 +207,8 @@ struct Echo {
 /// The state, not which version of the code holds it.
 impl PartialEq for Echo {
     fn eq(&self, other: &Self) -> bool {
-        (&self.last, &self.responses, self.fired, self.as_new)
-            == (&other.last, &other.responses, other.fired, other.as_new)
+        (&self.last, &self.responses, self.fired, self.applied, self.as_new)
+            == (&other.last, &other.responses, other.fired, other.applied, other.as_new)
     }
 }
 
@@ -227,7 +233,8 @@ impl Service for Echo {
         let last = self.last.entry(session).or_default();
         assert_eq!(k, *last + 1, "session {session}: message {k} applied after {last}");
         *last = k;
-        self.send(ctx, session, format!("a{k}"));
+        self.applied += 1;
+        self.send(ctx, session, format!("a{k} {}", self.applied));
         if k.is_multiple_of(PROPOSE_EVERY) {
             ctx.propose(format!("{session} {k}").as_bytes()).unwrap();
         }
@@ -253,9 +260,9 @@ impl Service for Echo {
         self.send(ctx, SessionId(id / TIMER_SPACE), format!("t{}", id % TIMER_SPACE));
     }
 
-    /// Each session's last message and responses, and the two counts, as words.
+    /// Each session's last message and responses, and the three counts, as words.
     fn snapshot(&self) -> SnapshotWriter {
-        let (fired, as_new) = (self.fired, self.as_new);
+        let (fired, applied, as_new) = (self.fired, self.applied, self.as_new);
         let sessions: BTreeSet<SessionId> = self.last.keys().chain(self.responses.keys()).copied().collect();
         let rows: Vec<[u64; 3]> = sessions
             .into_iter()
@@ -263,6 +270,7 @@ impl Service for Echo {
             .collect();
         Box::new(move |out| {
             out.write_all(&fired.to_le_bytes())?;
+            out.write_all(&applied.to_le_bytes())?;
             out.write_all(&as_new.to_le_bytes())?;
             for word in rows.iter().flatten() {
                 out.write_all(&word.to_le_bytes())?;
@@ -275,8 +283,8 @@ impl Service for Echo {
         let mut bytes = Vec::new();
         from.read_to_end(&mut bytes)?;
         let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
-        (self.fired, self.as_new) = (words[0], words[1]);
-        let rows = words[2..].as_chunks::<3>().0;
+        (self.fired, self.applied, self.as_new) = (words[0], words[1], words[2]);
+        let rows = words[3..].as_chunks::<3>().0;
         self.last = rows.iter().filter(|r| r[1] > 0).map(|&[session, last, _]| (SessionId(session), last)).collect();
         self.responses = rows.iter().filter(|r| r[2] > 0).map(|&[session, _, n]| (SessionId(session), n)).collect();
         Ok(())
@@ -727,6 +735,9 @@ struct SimClient {
     sent: u64,
     /// The last `a<k>` response.
     answered: u64,
+    /// For each message sent, from 1: the furthest in the log any client's message answered
+    /// before it was sent had been applied, which it must be applied after.
+    after: Vec<u64>,
     /// Every response: its last `egress_seq`.
     responses: u64,
     timers: BTreeSet<u64>,
@@ -771,6 +782,10 @@ struct Sim {
     /// term it was committed in (that node's: the leader's).
     committed: Vec<Vec<u8>>,
     commit_terms: Vec<u64>,
+    /// The furthest in the log's order an answered message was applied, of this cluster's (until
+    /// it's lost), and which client's message each place answered was.
+    answered: u64,
+    answered_at: BTreeMap<u64, (usize, u64)>,
     leaders: BTreeMap<u64, NodeId>,
     crashes: u64,
     /// The bytes of every snapshot taken, by index: every node's must match.
@@ -840,6 +855,7 @@ fn new_client(c: usize, again: bool) -> SimClient {
         tick_at: None,
         sent: 0,
         answered: 0,
+        after: Vec::new(),
         responses: 0,
         timers: BTreeSet::new(),
         proposals: BTreeSet::new(),
@@ -874,6 +890,8 @@ impl Sim {
             faults: true,
             committed: Vec::new(),
             commit_terms: Vec::new(),
+            answered: 0,
+            answered_at: BTreeMap::new(),
             leaders: BTreeMap::new(),
             crashes: 0,
             snapshots: BTreeMap::new(),
@@ -1506,7 +1524,10 @@ impl Sim {
         }
         let k = self.clients[c].sent + 1;
         match self.clients[c].client.send(k.to_string().as_bytes()) {
-            Ok(_) => self.clients[c].sent = k,
+            Ok(_) => {
+                self.clients[c].sent = k;
+                self.clients[c].after.push(self.answered);
+            }
             Err(client::SendError::Full) => {}
             Err(error) => panic!("seed {}: client {c} can't send: {error}", self.seed),
         }
@@ -1559,8 +1580,22 @@ impl Sim {
             client::Event::Message(payload) => {
                 sim_client.responses += 1;
                 let text = String::from_utf8(payload).unwrap();
-                let k: u64 = text[1..].parse().unwrap();
+                let (k, at) = text[1..].split_once(' ').unwrap_or((&text[1..], ""));
+                let k: u64 = k.parse().unwrap();
                 if text.starts_with('a') {
+                    // Linearizable: after every message answered, any client's, before it was sent.
+                    let at: u64 = at.parse().unwrap();
+                    let after = sim_client.after[usize::try_from(k - 1).unwrap()];
+                    assert!(
+                        at > after,
+                        "seed {seed}: client {c}'s message {k} applied at {at}, sent once one at {after} was answered"
+                    );
+                    let other = self.answered_at.insert(at, (c, k));
+                    assert!(
+                        other.is_none_or(|other| other == (c, k)),
+                        "seed {seed}: client {c}'s message {k} answered as applied at {at}, as {other:?}'s was"
+                    );
+                    self.answered = self.answered.max(at);
                     assert_eq!(
                         k,
                         sim_client.answered + 1,
@@ -2045,6 +2080,12 @@ impl Sim {
             }
         }
         self.cut = [[false; 8]; 8];
+        // The new cluster's order is its own: it may have lost what the old one applied, and not
+        // apply it in the same places. What was sent before is not held to what was answered.
+        (self.answered, self.answered_at) = (0, BTreeMap::new());
+        for client in &mut self.clients {
+            client.after.fill(0);
+        }
     }
 
     /// The operator recovers: promotes the standby, or restores the backup onto it, as a node

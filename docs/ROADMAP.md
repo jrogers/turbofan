@@ -32,13 +32,6 @@ down when they show.
   faults between clients and nodes, which the proxy doesn't stand between; the soak over TLS,
   where the proxy can't read a hello to tell one link from another; and the driver's IO in the
   simulation, the thorough way.
-- **Linearizability, checked across clients.** The simulation checks each session on its own:
-  every message and response once, in order, and every node with the same state. Nothing checks
-  real-time order between clients: a message answered before another was sent, from any client,
-  must come before it in the log, or a stale leader answering, or a response ahead of its
-  commit, goes unseen. The simulation knows the log's order and owns the clock, so it's an
-  assertion on what it already has, with none of the search Jepsen's checkers (Knossos, Elle)
-  need to find an order.
 - **Clock skew.** Every node in the simulation reads the same clock. The cluster's time is the
   leader's, as it logged it, held still when a new leader's is behind, and the driver slews its
   clock toward the wall clock; timers and session timeouts ride on that through failovers. Give
