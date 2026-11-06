@@ -45,8 +45,9 @@ jobs:
           path: sim.log
 
   # Eight busy clients while a node is killed and restarted about every second, and eight more
-  # while the links between the nodes are cut, stalled and slowed, and eight more while the leader
-  # is paused and resumed (see tests/soak.rs). A failure is a message lost, repeated or out of order, or one left unanswered;
+  # while the links between the nodes are cut, stalled and slowed, eight more while the leader is
+  # paused and resumed, and eight more while their links with the leader are faulted (see
+  # tests/soak.rs). A failure is a message lost, repeated or out of order, or one left unanswered;
   # there's no seed: run it again as long.
   soak:
     runs-on: ubuntu-latest

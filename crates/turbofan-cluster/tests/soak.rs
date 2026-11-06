@@ -168,6 +168,63 @@ async fn leader(admins: &[Admin]) -> Option<NodeId> {
     None
 }
 
+/// The same busy clients, through faults in the network between them and the leader, over a
+/// proxy: about once a second for `SOAK_SECS`, its links with its clients are cut both ways, or
+/// have their requests stalled, or their responses, while the requests go on coming, or are
+/// slowed both ways, for a few hundred milliseconds; then they're healed. Clients time out and
+/// reattach, elsewhere and then back; resend what wasn't answered; and must still have every
+/// message answered once each, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_clients_lose_nothing_through_faults_between_them_and_the_leader() {
+    const CLIENTS: usize = 8;
+    const IN_FLIGHT: u64 = 64;
+    let secs = std::env::var("SOAK_SECS").map_or(6, |s| s.parse().expect("SOAK_SECS is a number"));
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::proxied(dir.path());
+    let until = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|_| {
+            let addrs = cluster.client_addrs();
+            let client = ClusterClient::connect(addrs, SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+            tokio::spawn(keep_busy(client, IN_FLIGHT, until))
+        })
+        .collect();
+    let admins: Vec<Admin> =
+        cluster.configs.iter().map(|c| Admin::new(c.admin_listen.to_string(), SERVICE_ID).with_token(TOKEN)).collect();
+    let proxy = cluster.proxy.as_ref().expect("proxied");
+    let mut faults = 0;
+    while tokio::time::Instant::now() < until {
+        let Some(id) = leader(&admins).await else { continue };
+        let (requests, responses) = ((common::proxy::CLIENTS, id), (id, common::proxy::CLIENTS));
+        match faults % 4 {
+            0 => proxy.fault(|f| f.cut.extend([requests, responses])),
+            1 => proxy.fault(|f| {
+                f.stalled.insert(requests);
+            }),
+            2 => proxy.fault(|f| {
+                f.stalled.insert(responses);
+            }),
+            _ => proxy.fault(|f| f.delay.extend([requests, responses].map(|link| (link, Duration::from_millis(20))))),
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        proxy.heal();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        faults += 1;
+    }
+    let mut answered = 0;
+    for client in clients {
+        let Ok(done) = tokio::time::timeout(Duration::from_secs(30), client).await else {
+            panic!("a client not done in time; stopped on their own: {:?}", cluster.stopped().await);
+        };
+        let (sent, reattached) = done.expect("answered once each, in order");
+        assert!(sent > IN_FLIGHT, "it went on sending: {sent}");
+        answered += sent;
+        eprintln!("a client: {sent} answered, reattached {reattached} times");
+    }
+    assert!(faults >= 4, "every kind of fault: {faults}");
+    eprintln!("{answered} answered through {faults} faults between clients and the leader");
+}
+
 /// Keeps `in_flight` messages in flight on `client` in batches, as each is answered, until
 /// `until`, then waits for the last to be: how many it sent, every one answered once and in order
 /// (else it panics), and how many times it reattached.

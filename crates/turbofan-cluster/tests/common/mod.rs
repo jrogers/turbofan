@@ -74,7 +74,7 @@ pub fn ports(n: usize) -> Vec<SocketAddr> {
 
 pub struct Cluster {
     /// Peers', then clients', then operators' addresses, four of each; and, with a proxy, the
-    /// peer listeners' own, behind it.
+    /// peer listeners' own, then the client listeners', behind it.
     pub addrs: Vec<SocketAddr>,
     pub configs: Vec<driver::Config>,
     pub nodes: Vec<Option<JoinHandle<std::io::Result<()>>>>,
@@ -125,14 +125,15 @@ impl Cluster {
         Self::with(dir, tls, false)
     }
 
-    /// As [`Cluster::new`], over plain TCP, with a [`proxy::Proxy`] between the nodes: the
-    /// members' peer addresses are the proxy's, which forwards to each node's own.
+    /// As [`Cluster::new`], over plain TCP, with a [`proxy::Proxy`] between the nodes, and between
+    /// them and their clients: the members' peer and client addresses are the proxy's, which
+    /// forwards to each node's own.
     pub fn proxied(dir: &Path) -> Self {
         Self::with(dir, |_| None, true)
     }
 
     fn with(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>, proxied: bool) -> Self {
-        let addrs = ports(if proxied { 16 } else { 12 });
+        let addrs = ports(if proxied { 20 } else { 12 });
         let ids: Vec<NodeId> = [1, 2, 3, 4].map(NodeId).into();
         let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
         let members: Vec<raft::Member> = ids[..3].iter().map(|&id| member(&addrs, id)).collect();
@@ -146,16 +147,19 @@ impl Cluster {
                 // own address, behind the proxy if there is one, and dials the others' through it.
                 let known = ids.iter().filter(|&&m| m <= id.max(NodeId(3)));
                 let peers = known.map(|&m| (m, if proxied && m == id { addr(12, m) } else { addr(0, m) })).collect();
+                let client = addr(if proxied { 16 } else { 4 }, id);
                 let mut config =
-                    driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(4, id), addr(8, id));
+                    driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, client, addr(8, id));
                 config.admin_token = Some(TOKEN.to_vec());
                 config.peer_token = Some(PEER_TOKEN.to_vec());
                 config.tls = tls(id);
                 config
             })
             .collect();
-        let proxy =
-            proxied.then(|| proxy::Proxy::start(ids.iter().map(|&id| (id, addr(0, id), addr(12, id))).collect()));
+        let proxy = proxied.then(|| {
+            let peers = ids.iter().map(|&id| (id, addr(0, id), addr(12, id)));
+            proxy::Proxy::start(peers.chain(ids.iter().map(|&id| (id, addr(4, id), addr(16, id)))).collect())
+        });
         let pauses = (0..4).map(|_| Arc::default()).collect();
         let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None], proxy, pauses };
         for i in 0..3 {
@@ -203,8 +207,9 @@ impl Cluster {
         stopped
     }
 
+    /// The members' client addresses: the proxy's, if there's one.
     pub fn client_addrs(&self) -> Vec<String> {
-        self.configs.iter().map(|c| c.client_listen.to_string()).collect()
+        self.addrs[4..8].iter().map(ToString::to_string).collect()
     }
 }
 

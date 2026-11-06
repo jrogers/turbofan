@@ -1,9 +1,10 @@
-//! A proxy in front of each node's peer listener, to fault the links between nodes over real TCP:
+//! A proxy in front of each node's peer and client listeners, to fault the links over real TCP:
 //! cut (open connections dropped, new ones refused), stalled (what they carry held, so TCP backs
 //! up behind it), or slowed. A peer connection carries what the node that dialled it sends, and
-//! nothing back, so a link is that node and the one dialled. The proxy knows which node dialled
-//! from its hello, the connection's first frame, which names it: over plain TCP only, as over TLS
-//! the hello can't be read.
+//! nothing back, so a link is that node and the one dialled. A client's carries its requests one
+//! way and their responses the other: links from [`CLIENTS`] to the node, and back. The proxy
+//! knows who dialled from the hello, the connection's first frame: over plain TCP only, as over
+//! TLS the hello can't be read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -17,8 +18,11 @@ use turbofan_cluster::codec;
 use turbofan_cluster::raft::NodeId;
 use turbofan_cluster::wire;
 
-/// A link: the node that dialled, and the node dialled.
+/// A link: the node that dialled, and the node dialled; or [`CLIENTS`] and a node, either way.
 pub type Link = (NodeId, NodeId);
+
+/// The clients, in a [`Link`]: no node is 0.
+pub const CLIENTS: NodeId = NodeId(0);
 
 /// How the links are faulted, now.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -37,7 +41,7 @@ pub struct Proxy {
 
 impl Proxy {
     /// Listens at each of `routes`' addresses for node `to`, forwarding to its listener at the
-    /// target address. In a tokio runtime.
+    /// target address: its peer or client listener. In a tokio runtime.
     pub fn start(routes: Vec<(NodeId, SocketAddr, SocketAddr)>) -> Self {
         let (faults, _) = watch::channel(Faults::default());
         let mut listeners = Vec::new();
@@ -84,18 +88,36 @@ impl Drop for Proxy {
     }
 }
 
-/// Forwards a connection to node `to`, at `target`, as the faults say.
-async fn relay(mut inbound: TcpStream, to: NodeId, target: SocketAddr, mut faults: watch::Receiver<Faults>) {
+/// Forwards a connection to node `to`, at `target`, as the faults say: a client's both ways.
+async fn relay(mut inbound: TcpStream, to: NodeId, target: SocketAddr, faults: watch::Receiver<Faults>) {
     let Ok(hello) = read_frame(&mut inbound).await else { return };
     let Some(from) = dialler(&hello) else { return };
-    let link = (from, to);
-    if faults.borrow().cut.contains(&link) {
+    if faults.borrow().cut.contains(&(from, to)) {
         return;
     }
     let Ok(mut outbound) = TcpStream::connect(target).await else { return };
     if outbound.write_all(&hello).await.is_err() {
         return;
     }
+    if from != CLIENTS {
+        pump(inbound, outbound, (from, to), faults).await;
+        return;
+    }
+    let ((in_read, in_write), (out_read, out_write)) = (inbound.into_split(), outbound.into_split());
+    // Either way ending ends both: the other's half is dropped with it.
+    tokio::select! {
+        () = pump(in_read, out_write, (CLIENTS, to), faults.clone()) => {}
+        () = pump(out_read, in_write, (to, CLIENTS), faults) => {}
+    }
+}
+
+/// Carries what `inbound` reads to `outbound`, over `link`, as the faults say.
+async fn pump(
+    mut inbound: impl AsyncReadExt + Unpin,
+    mut outbound: impl AsyncWriteExt + Unpin,
+    link: Link,
+    mut faults: watch::Receiver<Faults>,
+) {
     let mut chunk = vec![0; 64 * 1024];
     loop {
         let read = tokio::select! {
@@ -134,10 +156,14 @@ async fn relay(mut inbound: TcpStream, to: NodeId, target: SocketAddr, mut fault
     }
 }
 
-/// The node a peer's hello says it is.
+/// The node a peer's hello says it is, or [`CLIENTS`] for a client's.
 fn dialler(hello: &[u8]) -> Option<NodeId> {
     let Ok(Some((wire::Decoded::Hello(h), _))) = codec::decode_frame(hello) else { return None };
-    (h.node_id() != 0).then(|| NodeId(h.node_id()))
+    match h.role() {
+        wire::Role::Client => Some(CLIENTS),
+        wire::Role::Peer => (h.node_id() != 0).then(|| NodeId(h.node_id())),
+        _ => None,
+    }
 }
 
 /// One frame, its length and all.
