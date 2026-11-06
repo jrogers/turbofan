@@ -26,7 +26,7 @@ use common::*;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_isolated_leader_is_replaced_and_follows_once_healed() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::proxied(dir.path());
+    let mut cluster = Cluster::proxied(dir.path(), |_| None);
     let admins: Vec<Admin> = cluster
         .configs
         .iter()
@@ -362,34 +362,6 @@ async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
     admin(0).add_member(&member(&cluster.addrs, NodeId(4))).await.unwrap();
     exchange(&mut cluster, &mut client, 151, 200).await;
     assert_eq!(admin(0).status().await.unwrap().members.len(), 2);
-}
-
-/// A CA's certificate and key, and a certificate it signs for `127.0.0.1`, under `dir`, as PEM:
-/// `<name>-ca.pem`, `<name>.pem`, `<name>.key`.
-#[cfg(feature = "tls")]
-fn certify(dir: &Path, name: &str) {
-    certify_named(dir, name, &[(name, &[])]);
-}
-
-/// A CA, `<ca>-ca.pem`, and for each of `certs` a certificate it signs, `<name>.pem` and
-/// `<name>.key`, for `127.0.0.1` and the DNS names given, under `dir`.
-#[cfg(feature = "tls")]
-fn certify_named(dir: &Path, ca_name: &str, certs: &[(&str, &[&str])]) {
-    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
-    std::fs::write(dir.join(format!("{ca_name}-ca.pem")), ca.pem()).unwrap();
-    for (name, dns) in certs {
-        let key = KeyPair::generate().unwrap();
-        let names = ["127.0.0.1"].iter().chain(*dns).map(|&n| n.to_owned()).collect::<Vec<_>>();
-        // Both, as a node's must be: it serves its listeners and dials its peers with the one.
-        let mut params = CertificateParams::new(names).unwrap();
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
-        let cert = params.signed_by(&key, &ca).unwrap();
-        std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).unwrap();
-        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).unwrap();
-    }
 }
 
 /// With TLS, nodes replicate to each other, and a client and an operator get through; a client

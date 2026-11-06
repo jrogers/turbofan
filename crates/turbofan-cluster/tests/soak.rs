@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use turbofan_cluster::client::Event;
 use turbofan_cluster::raft::NodeId;
+#[cfg(feature = "tls")]
+use turbofan_cluster::tls::{ClientTls, NodeTls};
 use turbofan_cluster::{Admin, ClusterClient};
 
 #[allow(dead_code, reason = "the tests share it; this one uses only some of it")]
@@ -66,7 +68,7 @@ async fn busy_clients_lose_nothing_through_partitions_and_stalls() {
     const IN_FLIGHT: u64 = 64;
     let secs = std::env::var("SOAK_SECS").map_or(6, |s| s.parse().expect("SOAK_SECS is a number"));
     let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::proxied(dir.path());
+    let mut cluster = Cluster::proxied(dir.path(), |_| None);
     let until = tokio::time::Instant::now() + Duration::from_secs(secs);
     let clients: Vec<_> = (0..CLIENTS)
         .map(|_| {
@@ -180,7 +182,7 @@ async fn busy_clients_lose_nothing_through_faults_between_them_and_the_leader() 
     const IN_FLIGHT: u64 = 64;
     let secs = std::env::var("SOAK_SECS").map_or(6, |s| s.parse().expect("SOAK_SECS is a number"));
     let dir = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::proxied(dir.path());
+    let mut cluster = Cluster::proxied(dir.path(), |_| None);
     let until = tokio::time::Instant::now() + Duration::from_secs(secs);
     let clients: Vec<_> = (0..CLIENTS)
         .map(|_| {
@@ -223,6 +225,88 @@ async fn busy_clients_lose_nothing_through_faults_between_them_and_the_leader() 
     }
     assert!(faults >= 4, "every kind of fault: {faults}");
     eprintln!("{answered} answered through {faults} faults between clients and the leader");
+}
+
+/// The same busy clients over TLS, peers' links and clients' and operators', while every fault
+/// above comes in turn to the leader, about once a second for `SOAK_SECS`: killed and restarted,
+/// paused, cut off from what the others send it or that stalled, its clients cut off or their
+/// responses stalled. (Over TLS the proxy can't tell which peer dialled, so it faults every
+/// peer's link into the leader at once, not one.) TLS's handshakes, as connections drop and are
+/// made again, and its reads and writes under load, must lose nothing either.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_clients_lose_nothing_over_tls_through_every_fault() {
+    use common::proxy::{CLIENTS as C, PEERS};
+    const CLIENTS: usize = 8;
+    const IN_FLIGHT: u64 = 64;
+    let secs = std::env::var("SOAK_SECS").map_or(6, |s| s.parse().expect("SOAK_SECS is a number"));
+    let dir = tempfile::tempdir().unwrap();
+    let certs = dir.path().join("certs");
+    std::fs::create_dir(&certs).unwrap();
+    common::certify(&certs, "node");
+    common::certify(&certs, "operator");
+    let file = |name: &str| certs.join(name);
+    let tls = NodeTls::new(file("node.pem"), file("node.key"), file("node-ca.pem"), file("operator-ca.pem"));
+    let mut cluster = Cluster::proxied(dir.path(), |_| Some(tls.clone()));
+    let until = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|_| {
+            let (addrs, gateway) = (cluster.client_addrs(), ClientTls::load(&file("node-ca.pem"), None).unwrap());
+            let timeout = Duration::from_millis(500);
+            let client = ClusterClient::connect_tls(addrs, SERVICE_ID, b"ok".to_vec(), timeout, gateway).unwrap();
+            tokio::spawn(keep_busy(client, IN_FLIGHT, until))
+        })
+        .collect();
+    let operator = ClientTls::load(&file("node-ca.pem"), Some((&file("operator.pem"), &file("operator.key")))).unwrap();
+    let admins: Vec<Admin> = cluster
+        .configs
+        .iter()
+        .map(|c| Admin::new(c.admin_listen.to_string(), SERVICE_ID).with_token(TOKEN).with_tls(operator.clone()))
+        .collect();
+    // Every kind of fault, however long that takes on a busy machine: past `until`, through the
+    // answers to what the clients sent last.
+    let mut faults = 0;
+    while tokio::time::Instant::now() < until || faults < 6 {
+        let Some(id) = leader(&admins).await else { continue };
+        let i = usize::from(id) - 1;
+        let proxy = cluster.proxy.as_ref().expect("proxied");
+        match faults % 6 {
+            0 => {
+                cluster.kill(i).await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                cluster.start(i);
+            }
+            1 => {
+                cluster.pause(i, true);
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                cluster.pause(i, false);
+            }
+            kind => {
+                proxy.fault(|f| match kind {
+                    2 => drop(f.cut.insert((PEERS, id))),
+                    3 => drop(f.stalled.insert((PEERS, id))),
+                    4 => f.cut.extend([(C, id), (id, C)]),
+                    _ => drop(f.stalled.insert((id, C))),
+                });
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                proxy.heal();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        faults += 1;
+    }
+    let mut answered = 0;
+    for client in clients {
+        let Ok(done) = tokio::time::timeout(Duration::from_secs(30), client).await else {
+            panic!("a client not done in time; stopped on their own: {:?}", cluster.stopped().await);
+        };
+        let (sent, reattached) = done.expect("answered once each, in order");
+        assert!(sent > IN_FLIGHT, "it went on sending: {sent}");
+        answered += sent;
+        eprintln!("a client: {sent} answered, reattached {reattached} times");
+    }
+    assert!(faults >= 6, "every kind of fault: {faults}");
+    eprintln!("{answered} answered over TLS through {faults} faults of the leader");
 }
 
 /// Keeps `in_flight` messages in flight on `client` in batches, as each is answered, until

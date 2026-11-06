@@ -1,10 +1,11 @@
 //! A proxy in front of each node's peer and client listeners, to fault the links over real TCP:
 //! cut (open connections dropped, new ones refused), stalled (what they carry held, so TCP backs
 //! up behind it), or slowed. A peer connection carries what the node that dialled it sends, and
-//! nothing back, so a link is that node and the one dialled. A client's carries its requests one
-//! way and their responses the other: links from [`CLIENTS`] to the node, and back. The proxy
-//! knows who dialled from the hello, the connection's first frame: over plain TCP only, as over
-//! TLS the hello can't be read.
+//! nothing back but TLS's own, so a link is that node and the one dialled; or [`PEERS`] and the node dialled,
+//! every peer's link to it at once. The proxy knows which node dialled from its hello, the
+//! connection's first frame: over plain TCP only, as over TLS the hello can't be read, and then
+//! only links from [`PEERS`] can be faulted. A client's connection carries its requests one way
+//! and their responses the other: links from [`CLIENTS`] to the node, and back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -24,6 +25,16 @@ pub type Link = (NodeId, NodeId);
 /// The clients, in a [`Link`]: no node is 0.
 pub const CLIENTS: NodeId = NodeId(0);
 
+/// Every node, in a [`Link`] to one: none is 255.
+pub const PEERS: NodeId = NodeId(u8::MAX);
+
+/// What a node's listener behind the proxy takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listener {
+    Peer,
+    Client,
+}
+
 /// How the links are faulted, now.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Faults {
@@ -40,19 +51,20 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    /// Listens at each of `routes`' addresses for node `to`, forwarding to its listener at the
-    /// target address: its peer or client listener. In a tokio runtime.
-    pub fn start(routes: Vec<(NodeId, SocketAddr, SocketAddr)>) -> Self {
+    /// Listens at each of `routes`' addresses for node `to`, forwarding to its listener of that
+    /// kind at the target address; reading peers' hellos unless the nodes speak `tls`. In a tokio
+    /// runtime.
+    pub fn start(routes: Vec<(NodeId, Listener, SocketAddr, SocketAddr)>, tls: bool) -> Self {
         let (faults, _) = watch::channel(Faults::default());
         let mut listeners = Vec::new();
-        for (to, listen, target) in routes {
+        for (to, kind, listen, target) in routes {
             let listener = std::net::TcpListener::bind(listen).expect("the proxy's port is free");
             listener.set_nonblocking(true).expect("a listener's mode");
             let listener = TcpListener::from_std(listener).expect("in a runtime");
             let faults = faults.subscribe();
             listeners.push(tokio::spawn(async move {
                 while let Ok((inbound, _)) = listener.accept().await {
-                    tokio::spawn(relay(inbound, to, target, faults.clone()));
+                    tokio::spawn(relay(inbound, to, kind, tls, target, faults.clone()));
                 }
             }));
         }
@@ -88,34 +100,52 @@ impl Drop for Proxy {
     }
 }
 
-/// Forwards a connection to node `to`, at `target`, as the faults say: a client's both ways.
-async fn relay(mut inbound: TcpStream, to: NodeId, target: SocketAddr, faults: watch::Receiver<Faults>) {
-    let Ok(hello) = read_frame(&mut inbound).await else { return };
-    let Some(from) = dialler(&hello) else { return };
-    if faults.borrow().cut.contains(&(from, to)) {
+/// Forwards a connection to node `to`'s listener of `kind`, at `target`, both ways, as the faults
+/// say: a client's both ways, a peer's the way it sends (what comes back is TLS's own).
+async fn relay(
+    mut inbound: TcpStream,
+    to: NodeId,
+    kind: Listener,
+    tls: bool,
+    target: SocketAddr,
+    faults: watch::Receiver<Faults>,
+) {
+    let mut hello = Vec::new();
+    let from = match kind {
+        Listener::Client => CLIENTS,
+        Listener::Peer if tls => PEERS,
+        Listener::Peer => {
+            let Ok(frame) = read_frame(&mut inbound).await else { return };
+            let Some(from) = dialler(&frame) else { return };
+            hello = frame;
+            from
+        }
+    };
+    let links = [(from, to), (PEERS, to)];
+    if links.iter().any(|link| faults.borrow().cut.contains(link)) {
         return;
     }
     let Ok(mut outbound) = TcpStream::connect(target).await else { return };
     if outbound.write_all(&hello).await.is_err() {
         return;
     }
-    if from != CLIENTS {
-        pump(inbound, outbound, (from, to), faults).await;
-        return;
-    }
+    let (there, back): (&[Link], &[Link]) = match kind {
+        Listener::Peer => (&links, &[]),
+        Listener::Client => (&[(CLIENTS, to)], &[(to, CLIENTS)]),
+    };
     let ((in_read, in_write), (out_read, out_write)) = (inbound.into_split(), outbound.into_split());
     // Either way ending ends both: the other's half is dropped with it.
     tokio::select! {
-        () = pump(in_read, out_write, (CLIENTS, to), faults.clone()) => {}
-        () = pump(out_read, in_write, (to, CLIENTS), faults) => {}
+        () = pump(in_read, out_write, there, faults.clone()) => {}
+        () = pump(out_read, in_write, back, faults) => {}
     }
 }
 
-/// Carries what `inbound` reads to `outbound`, over `link`, as the faults say.
+/// Carries what `inbound` reads to `outbound`, as the faults on any of `links` say.
 async fn pump(
     mut inbound: impl AsyncReadExt + Unpin,
     mut outbound: impl AsyncWriteExt + Unpin,
-    link: Link,
+    links: &[Link],
     mut faults: watch::Receiver<Faults>,
 ) {
     let mut chunk = vec![0; 64 * 1024];
@@ -124,7 +154,7 @@ async fn pump(
             read = inbound.read(&mut chunk) => read,
             // A fault changed: a cut drops the connection at once, not at its next chunk.
             changed = faults.changed() => {
-                if changed.is_err() || faults.borrow().cut.contains(&link) {
+                if changed.is_err() || links.iter().any(|link| faults.borrow().cut.contains(link)) {
                     return;
                 }
                 continue;
@@ -135,7 +165,8 @@ async fn pump(
         loop {
             let (cut, stalled, delay) = {
                 let f = faults.borrow_and_update();
-                (f.cut.contains(&link), f.stalled.contains(&link), f.delay.get(&link).copied())
+                let delay = links.iter().find_map(|link| f.delay.get(link).copied());
+                (links.iter().any(|l| f.cut.contains(l)), links.iter().any(|l| f.stalled.contains(l)), delay)
             };
             if cut {
                 return;
@@ -156,14 +187,10 @@ async fn pump(
     }
 }
 
-/// The node a peer's hello says it is, or [`CLIENTS`] for a client's.
+/// The node a peer's hello says it is.
 fn dialler(hello: &[u8]) -> Option<NodeId> {
     let Ok(Some((wire::Decoded::Hello(h), _))) = codec::decode_frame(hello) else { return None };
-    match h.role() {
-        wire::Role::Client => Some(CLIENTS),
-        wire::Role::Peer => (h.node_id() != 0).then(|| NodeId(h.node_id())),
-        _ => None,
-    }
+    (h.role() == wire::Role::Peer && h.node_id() != 0).then(|| NodeId(h.node_id()))
 }
 
 /// One frame, its length and all.

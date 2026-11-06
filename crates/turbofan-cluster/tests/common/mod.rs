@@ -125,11 +125,11 @@ impl Cluster {
         Self::with(dir, tls, false)
     }
 
-    /// As [`Cluster::new`], over plain TCP, with a [`proxy::Proxy`] between the nodes, and between
-    /// them and their clients: the members' peer and client addresses are the proxy's, which
-    /// forwards to each node's own.
-    pub fn proxied(dir: &Path) -> Self {
-        Self::with(dir, |_| None, true)
+    /// As [`Cluster::new`], with a [`proxy::Proxy`] between the nodes, and between them and their
+    /// clients: the members' peer and client addresses are the proxy's, which forwards to each
+    /// node's own. Over TLS, it faults only links from [`proxy::PEERS`] between the nodes.
+    pub fn proxied(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>) -> Self {
+        Self::with(dir, tls, true)
     }
 
     fn with(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>, proxied: bool) -> Self {
@@ -137,7 +137,7 @@ impl Cluster {
         let ids: Vec<NodeId> = [1, 2, 3, 4].map(NodeId).into();
         let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
         let members: Vec<raft::Member> = ids[..3].iter().map(|&id| member(&addrs, id)).collect();
-        let configs = ids
+        let configs: Vec<driver::Config> = ids
             .iter()
             .map(|&id| {
                 let mut node = node::Config::new(id, if id == NodeId(4) { Vec::new() } else { members.clone() });
@@ -156,9 +156,11 @@ impl Cluster {
                 config
             })
             .collect();
+        let over_tls = configs.iter().any(|c| c.tls.is_some());
         let proxy = proxied.then(|| {
-            let peers = ids.iter().map(|&id| (id, addr(0, id), addr(12, id)));
-            proxy::Proxy::start(peers.chain(ids.iter().map(|&id| (id, addr(4, id), addr(16, id)))).collect())
+            let peers = ids.iter().map(|&id| (id, proxy::Listener::Peer, addr(0, id), addr(12, id)));
+            let clients = ids.iter().map(|&id| (id, proxy::Listener::Client, addr(4, id), addr(16, id)));
+            proxy::Proxy::start(peers.chain(clients).collect(), over_tls)
         });
         let pauses = (0..4).map(|_| Arc::default()).collect();
         let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None], proxy, pauses };
@@ -238,5 +240,33 @@ pub async fn exchange(cluster: &mut Cluster, client: &mut ClusterClient, from: u
             }
             event => panic!("{event:?}"),
         }
+    }
+}
+
+/// A CA's certificate and key, and a certificate it signs for `127.0.0.1`, under `dir`, as PEM:
+/// `<name>-ca.pem`, `<name>.pem`, `<name>.key`.
+#[cfg(feature = "tls")]
+pub fn certify(dir: &Path, name: &str) {
+    certify_named(dir, name, &[(name, &[])]);
+}
+
+/// A CA, `<ca>-ca.pem`, and for each of `certs` a certificate it signs, `<name>.pem` and
+/// `<name>.key`, for `127.0.0.1` and the DNS names given, under `dir`.
+#[cfg(feature = "tls")]
+pub fn certify_named(dir: &Path, ca_name: &str, certs: &[(&str, &[&str])]) {
+    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+    std::fs::write(dir.join(format!("{ca_name}-ca.pem")), ca.pem()).unwrap();
+    for (name, dns) in certs {
+        let key = KeyPair::generate().unwrap();
+        let names = ["127.0.0.1"].iter().chain(*dns).map(|&n| n.to_owned()).collect::<Vec<_>>();
+        // Both, as a node's must be: it serves its listeners and dials its peers with the one.
+        let mut params = CertificateParams::new(names).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = params.signed_by(&key, &ca).unwrap();
+        std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).unwrap();
+        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).unwrap();
     }
 }
