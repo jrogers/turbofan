@@ -262,17 +262,17 @@ fn a_node_in_doubt_needs_one_more_vote_until_it_catches_up() {
     assert!(!rafts[0].in_doubt());
 }
 
-/// Under a leader of the term it restarted in, which never sends an entry of a later one, a
-/// node in doubt trusts its log once an append reaches the leader's last index.
+/// An append reaching its leader's last index doesn't end a doubt: one sent before the node
+/// restarted, arriving late, says less than it acknowledged. An entry of a later term does.
 #[test]
-fn a_node_in_doubt_trusts_its_log_once_it_has_the_leaders_whole_log() {
+fn a_node_in_doubt_trusts_its_log_only_from_a_later_term() {
     let mut doubting = entries(&[1]);
     doubting.doubt();
     let mut raft = Raft::new(config(2, &[1, 2, 3]), Meta { term: 2, vote: None }, None, doubting, 0);
-    let mut send = |prev_index: u64, prev_term: u64, records: &[u8], last_index: u64| {
+    let mut send = |term: u64, prev_index: u64, prev_term: u64, records: &[u8], last_index: u64| {
         let count = u32::try_from(codec::records(records).count()).unwrap();
         let append = wire::AppendEntries {
-            term: 2,
+            term,
             leader: 1,
             prev_index,
             prev_term,
@@ -287,8 +287,10 @@ fn a_node_in_doubt_trusts_its_log_once_it_has_the_leaders_whole_log() {
         raft.take_outputs();
         raft.in_doubt()
     };
-    assert!(send(0, 0, &log(&[1, 2, 2]), 5), "the leader has two more");
-    assert!(!send(3, 2, &[], 3), "all of it");
+    assert!(send(2, 0, 0, &log(&[1, 2, 2]), 3), "the leader's whole log, as it was");
+    let mut later = Vec::new();
+    Record { term: 3, index: 4, payload: b"x" }.encode_into(&mut later);
+    assert!(!send(3, 3, 2, &later, 4), "an entry of term 3");
 }
 
 /// Two voters in doubt take two more votes than a majority: either may have lost an entry.

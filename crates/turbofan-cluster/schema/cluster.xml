@@ -96,8 +96,9 @@
         <field name="round" id="5" type="uint64" sinceVersion="5"/>
     </sbe:message>
     <!-- `entries` is `count` log records, as stored. None is a heartbeat. `lastIndex`: the
-         leader's, so a follower in doubt knows when it has the leader's whole log. Absent from an
-         older leader. -->
+         leader's, for a follower in doubt to know when it has the leader's whole log, read by
+         followers before version 7 only: an append arriving late says less than it acknowledged.
+         Absent from an older leader. -->
     <sbe:message name="AppendEntries" id="12">
         <field name="term" id="1" type="uint64"/>
         <field name="leader" id="2" type="uint8"/>

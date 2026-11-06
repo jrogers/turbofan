@@ -44,9 +44,9 @@
 //! lost entries it acknowledged, since bit rot in the last record looks like a torn write. It
 //! can't tell, so it doubts until it has everything it could have acknowledged: an entry, or a
 //! snapshot, of a term after the one it restarted in (by log matching, it then has the log of a
-//! leader elected since), or the whole log of the leader it follows, as an append that reaches
-//! that leader's last index says (every entry it acknowledged is in that leader's log, or
-//! committed and so there too). The driver then ends the doubt on disk ([`Persist::Trust`]).
+//! leader elected since). Not an append reaching its leader's last index: one sent before the
+//! restart, arriving late, says less than the node acknowledged. The driver then ends the doubt
+//! on disk ([`Persist::Trust`]).
 //! Meanwhile its votes say so, and an election needs a vote more than a majority for each voter
 //! in doubt, its own included (or every member): however many of those lost a committed entry,
 //! the voters then still include one that holds it and turns down a candidate without it. After

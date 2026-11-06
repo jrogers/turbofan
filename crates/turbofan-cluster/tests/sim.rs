@@ -1093,7 +1093,19 @@ impl Sim {
             Event::Activate => self.activate(),
             Event::Rot => self.rot(),
             Event::Replace(id) => self.replace(id),
-            Event::AdminRetry { frame, tries } => self.admin_frame(frame, tries),
+            Event::AdminRetry { frame, tries } => {
+                // Not a change of members, decided on the members then: the next is decided on
+                // them as they are, and both landing could leave fewer than three voters.
+                let decided = matches!(
+                    codec::decode_frame(&frame).unwrap().unwrap().0,
+                    turbofan_cluster::wire::Decoded::AddMember(_)
+                        | turbofan_cluster::wire::Decoded::RemoveMember(_)
+                        | turbofan_cluster::wire::Decoded::SetRole(_)
+                );
+                if self.disaster.is_some() || !decided {
+                    self.admin_frame(frame, tries);
+                }
+            }
             Event::Shutdown => {
                 let request_id = self.rng.next();
                 self.admin(&turbofan_cluster::wire::Shutdown { request_id });

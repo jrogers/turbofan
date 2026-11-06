@@ -71,11 +71,8 @@ impl Raft {
             return;
         }
         let Some(matched) = self.accept_records(m) else { return };
-        // The leader's whole log, which has every entry this node acknowledged: by the leader
-        // of this term, or of an earlier one, and then committed (or never to be).
-        if m.last_index().is_some_and(|last| matched >= last) {
-            self.end_doubt();
-        }
+        // Reaching the leader's `lastIndex` doesn't end a doubt: an append sent before this node
+        // restarted, arriving late, says less than this node acknowledged before it did.
         // A reordered, older append can match less than is already known committed.
         self.commit = self.commit.max(m.commit().min(matched));
         self.ack(from, true, matched);

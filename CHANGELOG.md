@@ -18,6 +18,11 @@ a patch version (0.1.1) doesn't.
 - A leader never caught up a follower whose log had lost entries it acknowledged (a damaged
   tail dropped on restart), and answered each refusal with the same append, as fast as they
   went back and forth. It now sends the follower its log again from where it refused.
+- A node in doubt (its log dropped a damaged tail on restart) stopped doubting on an append
+  reaching its leader's last index, though one sent before the restart, arriving late, says less
+  than it had acknowledged: a leader could then count its earlier acknowledgement of entries it
+  had lost, and commit an entry a majority didn't hold. It now trusts its log again only from an
+  entry or snapshot of a later term.
 
 ## 0.7.0 (2026-11-05)
 
