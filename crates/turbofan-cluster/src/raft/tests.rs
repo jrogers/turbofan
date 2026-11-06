@@ -1197,3 +1197,39 @@ fn a_snapshot_damaged_on_its_way_is_asked_for_again() {
     assert!(out.persist.iter().any(|op| matches!(op, Persist::InstallSnapshot { .. })));
     assert_eq!(raft.snapshot_index(), 5);
 }
+
+/// A follower that lost entries it acknowledged, its log cut back at a damaged tail, is sent them
+/// again: the leader goes back past what it had matched, rather than sending the same append to
+/// each refusal, for ever.
+#[test]
+fn a_follower_that_lost_acknowledged_entries_is_sent_them_again() {
+    let mut rafts = cluster(3);
+    elect(&mut rafts, &[1, 2, 3], 1, 0);
+    for payload in [b"a", b"b", b"c"] {
+        rafts[0].propose(payload);
+    }
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, MS);
+    let last = rafts[0].last_index();
+    assert_eq!(rafts[1].last_index(), last);
+    // Node 2 restarts with its last two entries gone, in doubt.
+    let terms: Vec<u64> = (1..=last - 2).map(|i| rafts[0].term_at(i).unwrap()).collect();
+    let mut log = entries(&terms);
+    log.doubt();
+    rafts[1] = Raft::new(config(2, &[1, 2, 3]), Meta { term: rafts[0].term(), vote: None }, None, log, MS);
+    // The next entry's append, and what follows, a bounded number of messages.
+    let now = 2 * MS;
+    rafts[0].propose(b"d");
+    let mut queue: Vec<(u8, NodeId, Vec<u8>)> = flush(&mut rafts[0]).into_iter().map(|(to, f)| (1, to, f)).collect();
+    for _ in 0..50 {
+        let Some((from, to, frame)) = queue.pop() else { break };
+        if to.0 == 3 {
+            continue;
+        }
+        let raft = &mut rafts[usize::from(to) - 1];
+        raft.on_message(NodeId(from), &decode(&frame), now);
+        queue.extend(flush(raft).into_iter().map(|(next, f)| (to.0, next, f)));
+    }
+    assert!(queue.is_empty(), "still refusing and resending: {} in flight", queue.len());
+    assert_eq!(rafts[1].last_index(), last + 1, "sent what it lost");
+}

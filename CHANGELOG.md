@@ -15,6 +15,9 @@ a patch version (0.1.1) doesn't.
 - A follower sent a snapshot that didn't match the leader's checksum, damaged in the leader's
   file as it was read, say, stopped as if its own disk were damaged, until an operator replaced
   it. It now checks the checksum as the last chunk arrives, and asks for the snapshot again.
+- A leader never caught up a follower whose log had lost entries it acknowledged (a damaged
+  tail dropped on restart), and answered each refusal with the same append, as fast as they
+  went back and forth. It now sends the follower its log again from where it refused.
 
 ## 0.7.0 (2026-11-05)
 

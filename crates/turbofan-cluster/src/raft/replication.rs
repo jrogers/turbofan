@@ -145,8 +145,22 @@ impl Raft {
             self.check_catch_up(id, matched);
             self.try_transfer();
         } else {
-            p.next = m.index().clamp(p.matched + 1, last + 1);
-            self.send_append(peer, true);
+            // Refused from no further than it had matched: it lost entries it acknowledged, a
+            // damaged tail its log dropped on restart (it doubts), and is sent them again. Else
+            // it never catches up, and each refusal is answered with the same append, as fast
+            // as they travel. (An older refusal, reordered, costs only a resend.)
+            if m.index() <= p.matched {
+                p.matched = m.index().saturating_sub(1);
+            }
+            // Back to where it refused, never on: a refusal further on is of an older append,
+            // overtaken. And sent again only then: each of the appends in flight is refused, and
+            // answering every refusal sends more than are answered, round after round. A resend
+            // that's lost, the next heartbeat makes again.
+            let next = m.index().clamp(p.matched + 1, last + 1);
+            if next < p.next {
+                p.next = next;
+                self.send_append(peer, true);
+            }
         }
         // A learner joins once it's known new enough, caught up or not: the quorum doesn't wait
         // on it, so neither does adding it. It catches up as a member.
