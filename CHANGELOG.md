@@ -12,6 +12,9 @@ a patch version (0.1.1) doesn't.
   whenever it later got a snapshot that far: after the cluster had been started again, a member
   being added or a standby being caught up stopped partway, and a standby told to stop couldn't
   be promoted. It now forgets the stop in a new term.
+- A follower sent a snapshot that didn't match the leader's checksum, damaged in the leader's
+  file as it was read, say, stopped as if its own disk were damaged, until an operator replaced
+  it. It now checks the checksum as the last chunk arrives, and asks for the snapshot again.
 
 ## 0.7.0 (2026-11-05)
 

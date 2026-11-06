@@ -74,12 +74,11 @@ pub fn write_chunk(dir: &Path, offset: u64, bytes: &[u8]) -> io::Result<()> {
 pub fn install(dir: &Path, snapshot: &Snapshot, durable: bool) -> io::Result<()> {
     let temp = dir.join(INCOMING);
     let mut file = OpenOptions::new().read(true).write(true).open(&temp)?;
-    let members = encode_members(&snapshot.members);
-    let sum = checksum_on(sum_body(&mut file, snapshot.len)?, &members);
-    if seal(sum, snapshot.index, snapshot.term, snapshot.len) != snapshot.checksum {
+    if sealed(sum_body(&mut file, snapshot.len)?, snapshot) != snapshot.checksum {
         let what = format!("snapshot {}: not the leader's, by its checksum", snapshot.index);
         return Err(io::Error::new(io::ErrorKind::InvalidData, what));
     }
+    let members = encode_members(&snapshot.members);
     file.seek(SeekFrom::Start(crate::widen(HEADER) + snapshot.len))?;
     file.write_all(&members)?;
     file.set_len(crate::widen(HEADER) + snapshot.len + crate::widen(members.len()))?;
@@ -210,8 +209,15 @@ fn finish(dir: &Path, temp: &Path, mut file: File, snapshot: &Snapshot, durable:
 /// what [`save`] writes in its header, for one kept in memory (`crate::testing`).
 #[cfg_attr(not(any(test, feature = "testing")), expect(dead_code, reason = "only a cluster in memory needs it"))]
 pub(crate) fn checksum(index: u64, term: u64, members: &[Member], body: &[u8]) -> u64 {
-    let sum = checksum_on(checksum_on(CHECKSUM_START, body), &encode_members(members));
-    seal(sum, index, term, crate::widen(body.len()))
+    let snapshot = Snapshot { index, term, len: crate::widen(body.len()), checksum: 0, members: members.to_vec() };
+    sealed(checksum_on(CHECKSUM_START, body), &snapshot)
+}
+
+/// The checksum of `snapshot`, its bytes' being `body_sum` (from [`CHECKSUM_START`]): what the
+/// leader's header says, if they arrived as it sent them.
+pub(crate) fn sealed(body_sum: u64, snapshot: &Snapshot) -> u64 {
+    let sum = checksum_on(body_sum, &encode_members(&snapshot.members));
+    seal(sum, snapshot.index, snapshot.term, snapshot.len)
 }
 
 fn encode_members(members: &[Member]) -> Vec<u8> {

@@ -194,6 +194,7 @@ impl Raft {
                 .collect();
             let (index, term, checksum) = (m.last_index(), m.last_term(), m.checksum());
             self.incoming = Some(Snapshot { index, term, len: 0, checksum, members });
+            self.incoming_sum = crate::codec::CHECKSUM_START;
         }
         let Some(incoming) = self.incoming.as_mut().filter(|s| s.index == m.last_index()) else {
             // Restarted, say: the leader starts again.
@@ -203,10 +204,17 @@ impl Raft {
         if m.offset() == incoming.len {
             let bytes = m.chunk().to_vec();
             incoming.len += crate::widen(bytes.len());
+            self.incoming_sum = crate::codec::checksum_on(self.incoming_sum, &bytes);
             self.out.persist.push(Persist::SnapshotChunk { index: m.last_index(), offset: m.offset(), bytes });
         }
         if m.done() == 1 && m.offset() + crate::widen(m.chunk().len()) == incoming.len {
             let incoming = self.incoming.take().expect("just matched");
+            if crate::snapshot::sealed(self.incoming_sum, &incoming) != incoming.checksum {
+                // Damaged before it got here, in the leader's file, say: not this node's disk.
+                // It's asked for again, from the start.
+                self.send(from, &wire::SnapshotAck { term: self.meta.term, offset: 0, index: incoming.index });
+                return;
+            }
             self.install(incoming);
             self.ack(from, true, self.commit);
         } else {

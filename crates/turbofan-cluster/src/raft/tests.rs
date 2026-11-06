@@ -549,6 +549,15 @@ fn a_reordered_older_append_does_not_take_the_commit_back() {
 }
 
 fn install_snapshot(raft: &mut Raft, last_index: u64, last_term: u64) -> Outputs {
+    install_snapshot_summed(
+        raft,
+        last_index,
+        last_term,
+        crate::snapshot::checksum(last_index, last_term, &[], b"state"),
+    )
+}
+
+fn install_snapshot_summed(raft: &mut Raft, last_index: u64, last_term: u64, checksum: u64) -> Outputs {
     let chunk = wire::InstallSnapshot {
         term: 2,
         leader: 1,
@@ -556,7 +565,7 @@ fn install_snapshot(raft: &mut Raft, last_index: u64, last_term: u64) -> Outputs
         last_term,
         offset: 0,
         done: 1,
-        checksum: 0,
+        checksum,
         member: &[],
         chunk: b"state",
     };
@@ -683,7 +692,9 @@ fn snapshot_chunks_are_pipelined_and_a_lost_one_is_sent_again() {
     const CHUNK: u64 = crate::widen(MAX_READ_BYTES);
     let len = 3 * CHUNK + 10;
     let bytes: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
-    let snapshot = Snapshot { index: 10, term: 1, len, checksum: 0, members: vec![member(1), member(2)] };
+    let members = vec![member(1), member(2)];
+    let checksum = crate::snapshot::checksum(10, 1, &members, &bytes);
+    let snapshot = Snapshot { index: 10, term: 1, len, checksum, members };
     let mut rafts = vec![
         Raft::new(config(1, &[1, 2]), Meta { term: 1, vote: None }, Some(snapshot), Entries::default(), 0),
         Raft::new(config(2, &[1, 2]), Meta::default(), None, Entries::default(), 0),
@@ -1167,4 +1178,22 @@ fn a_stop_is_forgotten_in_a_later_term() {
     assert_eq!(raft.stop, Some((100, MS)), "to stop once it has snapshot 100");
     send(&mut raft, 2, &|f| codec::encode_frame(&heartbeat(2), f).unwrap());
     assert_eq!(raft.stop, None);
+}
+
+/// A snapshot whose bytes don't match the leader's checksum was damaged on its way, in the
+/// leader's file, say: it isn't installed, as a disk this node then finds damaged, and it's asked
+/// for again from the start.
+#[test]
+fn a_snapshot_damaged_on_its_way_is_asked_for_again() {
+    let mut raft = Raft::new(config(2, &[1, 2, 3]), Meta { term: 2, vote: None }, None, Entries::default(), 0);
+    let sum = crate::snapshot::checksum(5, 2, &[], b"state");
+    let out = install_snapshot_summed(&mut raft, 5, 2, sum ^ 1);
+    assert!(!out.persist.iter().any(|op| matches!(op, Persist::InstallSnapshot { .. })), "{:?}", out.persist);
+    assert_eq!(raft.snapshot_index(), 0);
+    let acks: Vec<_> = out.sends.iter().map(|(_, f)| format!("{:?}", decode(f))).collect();
+    assert_eq!(acks, ["SnapshotAck(SnapshotAckRef { term: 2, offset: 0, index: 5 })"]);
+    // Sent again, whole: installed.
+    let out = install_snapshot_summed(&mut raft, 5, 2, sum);
+    assert!(out.persist.iter().any(|op| matches!(op, Persist::InstallSnapshot { .. })));
+    assert_eq!(raft.snapshot_index(), 5);
 }

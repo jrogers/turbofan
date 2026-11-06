@@ -459,6 +459,8 @@ pub struct Raft {
     fetched_chunks: Vec<(u64, Vec<u8>)>,
     /// A snapshot arriving from the leader, chunk by chunk, and how much of it has.
     incoming: Option<Snapshot>,
+    /// The checksum of its bytes so far, to check against the leader's once they're all here.
+    incoming_sum: u64,
     /// A snapshot from the leader replaced the state since [`Raft::take_installed`].
     installed: bool,
 }
@@ -536,6 +538,7 @@ impl Raft {
             snapshot,
             fetched_chunks: Vec::new(),
             incoming: None,
+            incoming_sum: crate::codec::CHECKSUM_START,
             installed: false,
         };
         raft.durable = raft.last_index();
