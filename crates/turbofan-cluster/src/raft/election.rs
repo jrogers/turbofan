@@ -90,6 +90,7 @@ impl Raft {
 
     pub(super) fn become_candidate(&mut self, now: u64) {
         self.role = Role::Candidate;
+        self.forget_stop();
         self.meta = Meta { term: self.meta.term + 1, vote: Some(self.config.id) };
         self.out.persist.push(Persist::Meta(self.meta));
         // Only the voters' votes count: its own too, if it's one.
@@ -128,6 +129,7 @@ impl Raft {
             self.meta = Meta { term, vote: None };
             self.out.persist.push(Persist::Meta(self.meta));
             self.leader = None;
+            self.forget_stop();
         }
         if self.role == Role::Leader {
             self.leader = None;
@@ -141,6 +143,16 @@ impl Raft {
         self.role = Role::Follower;
         self.votes.clear();
         self.reset_election(now);
+    }
+
+    /// A follower told to stop, but short of the snapshot it was to stop with, carries on in a
+    /// new term: that shutdown was its leader's, and the cluster has been started since, or
+    /// another leader elected. Else it stops when, much later, it gets a snapshot that far. A
+    /// leader keeps its own: it answered that it's shut down.
+    fn forget_stop(&mut self) {
+        if self.role != Role::Leader {
+            self.stop = None;
+        }
     }
 
     /// A majority of the voters.

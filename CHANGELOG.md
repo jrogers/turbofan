@@ -4,6 +4,15 @@ Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, 
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Fixed
+
+- A node told to stop by a shutdown, but short of the snapshot it was to stop with, stopped
+  whenever it later got a snapshot that far: after the cluster had been started again, a member
+  being added or a standby being caught up stopped partway, and a standby told to stop couldn't
+  be promoted. It now forgets the stop in a new term.
+
 ## 0.7.0 (2026-11-05)
 
 ### Changed

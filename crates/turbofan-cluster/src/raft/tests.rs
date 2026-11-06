@@ -1141,3 +1141,30 @@ fn nearby_seeds_give_different_election_timeouts() {
     let distinct: std::collections::BTreeSet<_> = deadlines.iter().collect();
     assert_eq!(distinct.len(), deadlines.len(), "{deadlines:?}");
 }
+
+/// A follower told to stop with a snapshot it doesn't have yet forgets it in a later term: else,
+/// caught up there, it stops long after the cluster started again.
+#[test]
+fn a_stop_is_forgotten_in_a_later_term() {
+    let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 1, vote: None }, None, Entries::default(), 0);
+    let send = |raft: &mut Raft, from: u8, message: &dyn Fn(&mut Vec<u8>)| {
+        let mut frame = Vec::new();
+        message(&mut frame);
+        raft.on_message(NodeId(from), &decode(&frame), MS);
+    };
+    let heartbeat = |term| wire::AppendEntries {
+        term,
+        leader: 2,
+        prev_index: 0,
+        prev_term: 0,
+        commit: 0,
+        count: 0,
+        entries: &[],
+        last_index: 0,
+    };
+    send(&mut raft, 2, &|f| codec::encode_frame(&heartbeat(1), f).unwrap());
+    send(&mut raft, 2, &|f| codec::encode_frame(&wire::Stop { term: 1, index: 100 }, f).unwrap());
+    assert_eq!(raft.stop, Some((100, MS)), "to stop once it has snapshot 100");
+    send(&mut raft, 2, &|f| codec::encode_frame(&heartbeat(2), f).unwrap());
+    assert_eq!(raft.stop, None);
+}
