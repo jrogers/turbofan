@@ -1,8 +1,7 @@
 # Architecture
 
 An overview of how Turbofan fits together, for working on it. Each crate's README says how to use
-it, [WIRE.md](WIRE.md) how the wire protocol may change,
-[ROADMAP.md](ROADMAP.md) what's left, and
+it, [WIRE.md](WIRE.md) how the wire protocol may change, and
 [STYLE.md](STYLE.md) the house style. Paths are in
 `crates/turbofan-cluster` unless they name another crate.
 
@@ -268,6 +267,18 @@ later term.
 | Settings | `raft::Config`, `node::Config` and `driver::Config`, and their defaults in `cli.rs`. |
 | Limits | The `MAX_` constants in `codec.rs`, `raft/mod.rs`, `node/mod.rs`, `client.rs`, `remote.rs`, `log.rs` and `driver.rs`. |
 | The generated codecs | `turbofan-sbe`'s `codegen/`; its checked-in test codecs are rewritten with `SBE_REGENERATE=1`. |
+
+## Left out on purpose
+
+- **Reads without the log.** A query goes through the log like any message. Lease or ReadIndex
+  reads would be faster but add a second path through the service; add them if a service needs
+  read throughput the log can't give.
+- **Several services per cluster.** Run one cluster per service.
+- **Fewer hops between a client and the leader.** Of a quiet cluster's 65 µs a message, about 25
+  are tasks waking each other: a connection's reader and writer are tasks of their own, at both
+  ends, so a peer slow to read never stops one writing, nor one slow to write one reading. About
+  10 more are a write handed to a thread and back, on the leader and on the follower whose ack
+  commits it, so a write the disk holds up never holds up the node. Fewer would cost those.
 
 ## How it's tested
 

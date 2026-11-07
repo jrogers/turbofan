@@ -17,6 +17,8 @@ before writing code.
 - Services live in repositories of their own, depending on it by git (or crates.io): the OMS (an order book) is
   at `../oms`. A framework change can break one: check it there with `cargo update -p
   turbofan-cluster` and its `scripts/check.sh`.
+- Planned work is in GitHub issues (`gh issue list`), each with its size (S, M or L) in the body
+  and `research` or `needs-linux` where they apply; a commit that does one closes it ("Closes #12").
 - `scripts/check.sh` (fmt, clippy `-D warnings`, tests, rustdoc, `cargo deny`) before calling work
   done.
   `cargo bench -p turbofan-cluster --bench cluster` for throughput and latency (`--features tls`

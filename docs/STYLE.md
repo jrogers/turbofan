@@ -16,8 +16,8 @@ to read.
 - The first design that works is rarely the simple one. Spend the thinking up front, and revise
   until the design is simple. It costs less than fixing it once it's in use.
 - Don't ship a known showstopper: work that grows without limit, a latency spike on a common
-  path, or an error that's silently ignored. If a problem is accepted for now, write it down: in
-  [ROADMAP.md](ROADMAP.md), or as a `ponytail:` comment at the
+  path, or an error that's silently ignored. If a problem is accepted for now, write it down: in an
+  [issue](https://github.com/jrogers/turbofan/issues), or as a `ponytail:` comment at the
   code that has the ceiling, saying what the ceiling is and what would lift it.
 
 ## The core is sans-IO

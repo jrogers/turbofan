@@ -136,7 +136,6 @@ def llms(chapters: list[tuple[str, str, str]], ref: str) -> str:
         "", "## Reference", "",
         f"- [Architecture]({SITE}/guide/architecture.md): how its crates and layers fit together",
         "- [API reference](https://docs.rs/turbofan-cluster): every public type, on docs.rs",
-        f"- [Roadmap]({REPO}/blob/{ref}/docs/ROADMAP.md): what's left before production",
         f"- [Wire protocol]({REPO}/blob/{ref}/docs/WIRE.md): how the protocol may change, with old and new nodes side by side",
         f"- [Changelog]({REPO}/blob/{ref}/CHANGELOG.md)",
         "", "## Optional", "",

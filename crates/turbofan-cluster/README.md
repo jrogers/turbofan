@@ -124,7 +124,3 @@ before appending.
   a client keeps sending, it kills each node in turn (the leader among them) and restarts it from
   disk.
 
-## Roadmap
-
-[`ROADMAP.md`](../../docs/ROADMAP.md): what's left before production, from security and backup to a stable
-API.
