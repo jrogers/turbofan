@@ -6,9 +6,9 @@
 //!
 //! A round is a number each append carries (`AppendEntries.readRound`) and each ack echoes. The
 //! leader starts one only while none is in flight, so the reads arriving while one is share the
-//! next. A round lost on the way goes again with the next heartbeat, which carries it too. An
-//! older follower doesn't echo it, and confirms no round, so a cluster takes reads only once
-//! every voter is new enough: the node's concern ([`crate::node::PROTOCOL`]).
+//! next. A round lost on the way goes again with the next heartbeat, which carries it too. A
+//! follower before 0.9.0 doesn't echo it, and confirms no round: a cluster takes reads once every
+//! voter is new enough.
 //!
 //! A read is never written, so one dropped (this node stopped leading) is asked again of the new
 //! leader, and one answered twice is harmless.

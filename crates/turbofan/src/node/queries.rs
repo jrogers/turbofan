@@ -4,13 +4,12 @@
 //! kept out of the session's egress ring and never replayed: one dropped (the leader stepped
 //! down, or the connection went) is asked again by its client.
 //!
-//! Only from protocol [`QUERY_PROTOCOL`], once every member echoes the rounds that confirm reads
-//! (`readRound`): before, an older voter's acks would never confirm one.
+//! Every voter must echo the rounds that confirm reads (`readRound`), which a node before 0.9.0
+//! doesn't: with one among them, a read may never be confirmed. So every member must be of 0.9.0
+//! or later before a client queries.
 
 use super::*;
 
-/// The protocol from which a leader takes queries ([`PROTOCOL`]).
-pub const QUERY_PROTOCOL: u32 = 2;
 /// The most bytes of queries waiting on a leader, to be confirmed or applied up to: a round trip's
 /// worth from many clients. Past it, a query is refused as busy, for its client to ask again.
 pub const MAX_WAITING_QUERY_BYTES: usize = 16 << 20;
@@ -30,10 +29,6 @@ impl<S: Service> Node<S> {
     /// A query from `session`, attached on `conn`.
     pub(super) fn query(&mut self, conn: ConnId, session: SessionId, query_id: u64, payload: &[u8]) {
         self.local.activity.insert(session, self.now);
-        if self.state.protocol < QUERY_PROTOCOL {
-            self.refuse_query(conn, session, query_id, true);
-            return;
-        }
         let read = self.next_read;
         if self.local.query_bytes + payload.len() > MAX_WAITING_QUERY_BYTES || !self.raft.read_index(read) {
             self.refuse_query(conn, session, query_id, false);
@@ -96,10 +91,5 @@ impl<S: Service> Node<S> {
     fn refuse_query(&mut self, conn: ConnId, session: SessionId, query_id: u64, unsupported: bool) {
         let refused = wire::QueryRefused { session: session.0, query_id, unsupported: u8::from(unsupported) };
         self.send_client(conn, &refused);
-    }
-
-    /// Whether this node takes a `Query`, as `Opened` says.
-    pub(super) fn takes_queries(&self) -> u8 {
-        u8::from(self.config.protocol >= QUERY_PROTOCOL)
     }
 }

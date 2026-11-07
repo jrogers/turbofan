@@ -210,6 +210,38 @@ session lasts:
   (`Ctx::propose`) as `ServiceProposal` entries, each applied once, even when the leaders either
   side of a failover both log it.
 
+## A query's path
+
+```mermaid
+sequenceDiagram
+    participant G as Gateway (Client)
+    participant L as Leader
+    participant F as Followers
+    participant S as Service, on the leader
+
+    G->>L: Query (session, queryId)
+    Note over L: asks Raft to confirm a read:<br/>the next round
+    L->>F: AppendEntries (readRound)
+    F-->>L: AppendAck, echoing it
+    Note over L: a quorum echoed it: still leads,<br/>reads at the commit index
+    L->>S: once applied that far: on_query
+    L->>G: QueryAnswer (queryId)
+```
+
+A query reads the state without logging anything (Raft's ReadIndex, `raft/reads.rs` and
+`node/queries.rs`):
+
+- **The leader confirms it still leads.** A read waits for a quorum to echo a round of appends
+  started after it came in, and the leader to have committed an entry of its own term, so its
+  commit index holds every write completed before. A leader deposed without knowing it can't get
+  the echoes: a majority has moved to a later term. One round in flight at a time; the reads that
+  come in meanwhile share the next, and appends of records carry the round anyway.
+- **Only the leader answers**, once it has applied up to that index. Nothing is logged, kept in
+  a session's ring, or replayed: a query the leader drops (it stepped down, or the connection
+  went) is asked again by its client, and answered once.
+- **Every member of 0.9.0 or later.** A follower before it ignores the round, and confirms no
+  read; a leader before it skips a query unanswered.
+
 ## Durability
 
 | What | Where | How it survives a crash |
@@ -264,15 +296,18 @@ later term.
 | When the driver persists, reads and sends | `Core::run` and `Core::flush` in `driver.rs`. |
 | Formats on disk | `codec.rs` (records), `log.rs`, `meta.rs`, `snapshot.rs`. |
 | How a gateway finds the leader and resends | `client.rs`, and `ClusterClient` in `remote.rs`. |
+| Reads without the log | `raft/reads.rs` (confirming a read), `node/queries.rs` (answering it), `Client::query`. |
 | Settings | `raft::Config`, `node::Config` and `driver::Config`, and their defaults in `cli.rs`. |
 | Limits | The `MAX_` constants in `codec.rs`, `raft/mod.rs`, `node/mod.rs`, `client.rs`, `remote.rs`, `log.rs` and `driver.rs`. |
 | The generated codecs | `turbofan-sbe`'s `codegen/`; its checked-in test codecs are rewritten with `SBE_REGENERATE=1`. |
 
 ## Left out on purpose
 
-- **Reads without the log.** A query goes through the log like any message. Lease or ReadIndex
-  reads would be faster but add a second path through the service; add them if a service needs
-  read throughput the log can't give.
+- **Followers and leases answering queries.** Only the leader answers one, a round trip to a
+  quorum after it comes in. A follower could, asking the leader for the index to read at, if
+  followers took clients; a leader could skip the round trip by trusting a lease, at the cost of
+  trusting bounded clock drift, which the simulation's stepped clocks argue against. Add either if
+  a service needs it.
 - **Several services per cluster.** Run one cluster per service.
 - **Fewer hops between a client and the leader.** Of a quiet cluster's 65 µs a message, about 25
   are tasks waking each other: a connection's reader and writer are tasks of their own, at both

@@ -177,16 +177,7 @@ impl<S: Service> Node<S> {
             self.local.conns.insert(conn, Some(session));
             self.local.attached.insert(session, conn);
             let epoch = self.state.epoch;
-            self.send_client(
-                conn,
-                &wire::Opened {
-                    session: session.0,
-                    applied_seq: 0,
-                    last_egress_seq: 0,
-                    epoch,
-                    queries: self.takes_queries(),
-                },
-            );
+            self.send_client(conn, &wire::Opened { session: session.0, applied_seq: 0, last_egress_seq: 0, epoch });
         }
         if self.local.was_leader {
             self.local.activity.insert(session, self.now);

@@ -386,16 +386,6 @@ impl<S: Service> Cluster<S> {
         self.admin(&wire::SnapshotRequest { request_id: 1 })
     }
 
-    /// An operator's `activate` of `protocol` and `service_version` ([`Admin::activate`]), sent to
-    /// the leader: whether there was one to send it to. Queries ([`Cluster::query`]) need protocol
-    /// [`QUERY_PROTOCOL`]. The leader refuses versions a member doesn't have, or a step back.
-    ///
-    /// [`Admin::activate`]: crate::Admin::activate
-    /// [`QUERY_PROTOCOL`]: crate::node::QUERY_PROTOCOL
-    pub fn activate(&mut self, protocol: u32, service_version: u32) -> bool {
-        self.admin(&wire::Activate { request_id: 1, protocol, service_version })
-    }
-
     fn admin(&mut self, request: &impl turbofan_sbe::Encode) -> bool {
         let Some(id) = self.leader() else { return false };
         let mut frame = Vec::new();

@@ -57,7 +57,7 @@
 //! applied after every message answered, any client's, before it was sent, each place in the order
 //! answered for one message only. Cluster time never goes back, whichever leader logged an entry.
 //!
-//! Clients query too, once the new version has activated queries, never logged: each answer says
+//! Clients query too, never logged: each answer says
 //! how far in the log's order the leader had applied. At least as far as any node had applied as
 //! the query was sent, all of it committed by then (ReadIndex's promise, more than
 //! linearizability's: every message answered before); and a message sent after an answer is applied
@@ -1808,8 +1808,8 @@ impl Sim {
                 self.queried = self.queried.max(at);
                 self.covered.queries_answered += 1;
             }
-            // Before the new version is activated, or from a node of the old; or a busy leader.
-            Err(client::QueryError::Unsupported | client::QueryError::Busy) => {}
+            // A leader with too many waiting.
+            Err(client::QueryError::Busy) => {}
             Err(error) => panic!("seed {seed}: client {c}'s query: {error}"),
         }
     }
@@ -2069,7 +2069,7 @@ impl Sim {
             self.schedule(after, Event::Activate);
         }
         let request_id = self.rng.next();
-        self.admin(&turbofan::wire::Activate { request_id, protocol: node::PROTOCOL, service_version: 1 });
+        self.admin(&turbofan::wire::Activate { request_id, protocol: 1, service_version: 1 });
     }
 
     /// The operator hands the leadership over: to the member most caught up, or a given one
@@ -2302,7 +2302,7 @@ impl Sim {
         config.snapshot_every_entries = 300;
         // Covers a client's messages in flight, each with its response and some a timer's.
         config.egress_ring_entries = 2 * client::MAX_UNACKED;
-        config.protocol = if sim_node.upgraded { node::PROTOCOL } else { 0 };
+        config.protocol = u32::from(sim_node.upgraded);
         // Its log or snapshot is damaged: it refuses to start.
         let log = match sim_node.disk.open(self.window) {
             Ok((log, cut)) => {

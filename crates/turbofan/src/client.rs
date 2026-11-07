@@ -109,9 +109,7 @@ pub enum QueryError {
     TooLong,
     /// The leader had too many waiting: ask again.
     Busy,
-    /// The cluster takes no such query: it hasn't activated queries (protocol 2), the service
-    /// answers none, or the leader is of a version without them. Asking again won't help, unless
-    /// that changes.
+    /// The service takes no such query: asking again won't help.
     Unsupported,
 }
 
@@ -122,7 +120,7 @@ impl std::fmt::Display for QueryError {
             Self::Closed => "the session is closed",
             Self::TooLong => "payload over MAX_PAYLOAD_BYTES",
             Self::Busy => "the leader is busy",
-            Self::Unsupported => "the cluster takes no such query",
+            Self::Unsupported => "the service takes no such query",
         })
     }
 }
@@ -175,8 +173,6 @@ pub struct Client {
     reconnect: Option<Reconnect>,
     frames: Vec<Vec<u8>>,
     events: VecDeque<Event>,
-    /// The node connected to takes queries, as its `Opened` said.
-    takes_queries: bool,
     next_query: u64,
     /// Queries sent and not yet answered, by ID: sent again on each `Opened`.
     queries: BTreeMap<u64, Vec<u8>>,
@@ -223,7 +219,6 @@ impl Client {
             reconnect: None,
             frames: Vec::new(),
             events: VecDeque::new(),
-            takes_queries: false,
             next_query: 1,
             queries: BTreeMap::new(),
             answers: VecDeque::new(),
@@ -317,7 +312,7 @@ impl Client {
                 for (client_seq, payload) in resend {
                     self.frame(&wire::Message { session: m.session(), client_seq, payload: &payload });
                 }
-                self.resend_queries(m.session(), m.queries() == Some(1));
+                self.resend_queries(m.session());
             }
             wire::Decoded::QueryAnswer(m) if Some(SessionId(m.session())) == self.session => {
                 self.answered(m.query_id(), Ok(m.payload().to_vec()));
@@ -423,10 +418,6 @@ impl Client {
         let query_id = self.next_query;
         self.next_query += 1;
         if let (true, Some(session)) = (self.open, self.session) {
-            if !self.takes_queries {
-                self.answers.push_back(Answer { query: query_id, answer: Err(QueryError::Unsupported) });
-                return Ok(query_id);
-            }
             self.frame(&wire::Query { session: session.0, query_id, payload: &payload });
         }
         self.queries.insert(query_id, payload);
@@ -444,14 +435,8 @@ impl Client {
         self.queries.len()
     }
 
-    /// The session opened on a node that `takes` queries, or not: the queries waiting are sent
-    /// it, or refused, since an older node would leave them unanswered.
-    fn resend_queries(&mut self, session: u64, takes: bool) {
-        self.takes_queries = takes;
-        if !takes {
-            self.fail_queries(QueryError::Unsupported);
-            return;
-        }
+    /// The session opened, again perhaps on another node: the queries waiting are sent it.
+    fn resend_queries(&mut self, session: u64) {
         let resend: Vec<(u64, Vec<u8>)> = self.queries.iter().map(|(&id, q)| (id, q.clone())).collect();
         for (query_id, payload) in resend {
             self.frame(&wire::Query { session, query_id, payload: &payload });
@@ -598,10 +583,7 @@ mod tests {
     fn reattached_to(opened: &[u8]) -> Client {
         let mut client = Client::new(["a", "b"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
         client.on_connected(0);
-        deliver(
-            &mut client,
-            &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0, queries: 0 }),
-        );
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0 }));
         for _ in 0..4 {
             client.send(b"order".to_vec()).unwrap();
         }
@@ -620,10 +602,7 @@ mod tests {
     fn open() -> Client {
         let mut client = Client::new(["a", "b"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
         client.on_connected(0);
-        deliver(
-            &mut client,
-            &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0, queries: 0 }),
-        );
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0 }));
         while client.poll_event().is_some() {}
         client.take_frames();
         client
@@ -784,7 +763,7 @@ mod tests {
     }
 
     fn opened(applied_seq: u64, last_egress_seq: u64) -> Vec<u8> {
-        frame(&wire::Opened { session: 9, applied_seq, last_egress_seq, epoch: 0, queries: 0 })
+        frame(&wire::Opened { session: 9, applied_seq, last_egress_seq, epoch: 0 })
     }
 
     /// A reattach names the epoch the last `Opened` said: none, from an older node.
@@ -797,10 +776,7 @@ mod tests {
             decoded(&client.take_frames())
         };
         assert!(reattach(&mut client)[0].contains("epoch: Some(0)"), "none said");
-        deliver(
-            &mut client,
-            &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 5, queries: 0 }),
-        );
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 5 }));
         assert!(reattach(&mut client)[0].contains("epoch: Some(5)"));
     }
 
@@ -843,9 +819,9 @@ mod tests {
     #[test]
     fn an_older_nodes_opened_is_checked_for_messages_only() {
         let mut older = opened(3, 1);
-        // Without `lastEgressSeq`, `epoch` and `queries`, the block's last 17 bytes, and saying
-        // version 3, as an older node writes it.
-        older.truncate(older.len() - 17);
+        // Without `lastEgressSeq` and `epoch`, the block's last 16 bytes, and saying version 3, as
+        // an older node writes it.
+        older.truncate(older.len() - 16);
         let len = u32::try_from(older.len() - 4).unwrap();
         older[..4].copy_from_slice(&len.to_le_bytes());
         older[4..6].copy_from_slice(&16_u16.to_le_bytes());
@@ -854,11 +830,11 @@ mod tests {
         assert_eq!(client.poll_event(), Some(Event::Opened(SessionId(9))), "a lost response it can't tell");
     }
 
-    /// A client with session 9 open on a node that takes queries, or not.
-    fn queried(takes: u8) -> Client {
+    /// A client with session 9 open.
+    fn queried() -> Client {
         let mut client = Client::new(["a"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
         client.on_connected(0);
-        let opened = wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0, queries: takes };
+        let opened = wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0 };
         deliver(&mut client, &frame(&opened));
         client.take_frames();
         client
@@ -868,7 +844,7 @@ mod tests {
     /// failover, say), and a refusal says whether asking again would help.
     #[test]
     fn a_query_is_answered_once() {
-        let mut client = queried(1);
+        let mut client = queried();
         let id = client.query(b"book".to_vec()).unwrap();
         let sent = client.take_frames();
         assert!(format!("{:?}", codec::decode_frame(&sent[0]).unwrap().unwrap().0).starts_with("Query("));
@@ -883,32 +859,11 @@ mod tests {
         assert_eq!(client.poll_answer(), Some(Answer { query: busy, answer: Err(QueryError::Busy) }));
     }
 
-    /// An older node, which would leave a query unanswered, isn't sent one: each waiting, and each
-    /// asked while it's connected to, is refused as unsupported.
-    #[test]
-    fn an_older_node_is_sent_no_query() {
-        let mut client = queried(1);
-        let waiting = client.query(b"book".to_vec()).unwrap();
-        client.on_disconnected();
-        client.on_connected(0);
-        deliver(&mut client, &opened(0, 0));
-        let asked = client.query(b"book".to_vec()).unwrap();
-        assert!(
-            client
-                .take_frames()
-                .iter()
-                .all(|f| !format!("{:?}", codec::decode_frame(f).unwrap().unwrap().0).starts_with("Query("))
-        );
-        let refused = |query| Some(Answer { query, answer: Err(QueryError::Unsupported) });
-        assert_eq!(client.poll_answer(), refused(waiting));
-        assert_eq!(client.poll_answer(), refused(asked));
-    }
-
     /// The session closing answers each query waiting as closed; queries, and answers not yet
     /// taken, are bounded.
     #[test]
     fn queries_end_with_the_session_and_are_bounded() {
-        let mut client = queried(1);
+        let mut client = queried();
         for _ in 0..MAX_QUERIES {
             client.query(b"q".to_vec()).unwrap();
         }
@@ -925,9 +880,7 @@ mod tests {
     /// the client goes elsewhere, the session whole. Of another epoch, it is.
     #[test]
     fn a_stale_leader_of_the_same_epoch_is_left_not_diverged_from() {
-        let opened = |applied_seq, epoch| {
-            frame(&wire::Opened { session: 9, applied_seq, last_egress_seq: 2, epoch, queries: 0 })
-        };
+        let opened = |applied_seq, epoch| frame(&wire::Opened { session: 9, applied_seq, last_egress_seq: 2, epoch });
         let mut client = Client::new(["a", "b"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
         client.on_connected(0);
         deliver(&mut client, &opened(0, 5));

@@ -11,11 +11,11 @@ a patch version (0.1.1) doesn't.
 - Queries, answered without logging them (ReadIndex, #19): `ClusterClient::query` (and
   `Client::query`, `testing::Cluster::query`) asks, and `Service::on_query` answers from the
   state as applied, on the leader, once it has confirmed it still leads by a round trip to a
-  quorum. A query is asked again of a new leader after a failover, and answered once.
-  `testing::Cluster::activate` activates protocol 2 for them. Protocol 2 (`node::PROTOCOL`): a
-  cluster takes them once an operator runs `activate --protocol 2`, which waits for every
-  member to be of this version. Schema version 8: `Query`, `QueryAnswer` and `QueryRefused`
-  for clients, `Opened`'s `queries`, and `readRound` on `AppendEntries` and `AppendAck`.
+  quorum. A query is asked again of a new leader after a failover, and answered once. Every
+  node must be of this version before a client queries: a node before it skips a query
+  unanswered, and a voter before it doesn't echo the rounds that confirm one. Schema version 8:
+  `Query`, `QueryAnswer` and `QueryRefused` for clients, and `readRound` on `AppendEntries` and
+  `AppendAck`.
 - `Role`, the type of `Metrics::role`, is exported, as `turbofan::Role`.
 
 ### Fixed

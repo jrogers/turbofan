@@ -210,17 +210,11 @@ fn answer(cluster: &mut Cluster<Tally>, client: ClientId) -> Answer {
     answers.remove(0)
 }
 
-/// A query is refused as unsupported until the cluster activates queries; then the leader answers
-/// it from the messages applied, logging nothing.
+/// The leader answers a query from the messages applied, logging nothing.
 #[test]
-fn a_query_is_answered_once_activated_from_what_is_applied() {
+fn a_query_is_answered_from_what_is_applied() {
     let mut cluster = Cluster::new(3, |_| Tally::default());
     let alice = cluster.connect(b"alice").unwrap();
-    assert!(cluster.run_until(Duration::from_secs(1), |c| c.session(alice).is_some()));
-    let id = cluster.query(alice, b"count").unwrap();
-    assert_eq!(answer(&mut cluster, alice), Answer { query: id, answer: Err(QueryError::Unsupported) });
-
-    assert!(cluster.activate(crate::node::QUERY_PROTOCOL, 0));
     cluster.send_batch(alice, [b"a", b"b", b"c"]).unwrap();
     assert!(cluster.run_until(Duration::from_secs(1), |c| c.client(alice).applied() == 3));
     let leader = cluster.leader().unwrap();
@@ -235,7 +229,6 @@ fn a_query_is_answered_once_activated_from_what_is_applied() {
 fn a_query_in_flight_through_a_failover_is_answered_by_the_new_leader() {
     let mut cluster = Cluster::new(3, |_| Tally::default());
     let alice = cluster.connect(b"alice").unwrap();
-    cluster.activate(crate::node::QUERY_PROTOCOL, 0);
     cluster.send_batch(alice, [b"a", b"b"]).unwrap();
     assert!(cluster.run_until(Duration::from_secs(1), |c| c.client(alice).applied() == 2));
     let old = cluster.leader().unwrap();

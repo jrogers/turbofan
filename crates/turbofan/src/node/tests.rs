@@ -861,33 +861,13 @@ fn a_connection_holds_one_session_and_a_closed_one_none() {
     assert!(!node.local.conns.contains_key(&8) && !node.local.attached.values().any(|&c| c == 8));
 }
 
-/// Activates `protocol`, as an operator would.
-fn activate_protocol(node: &mut Node<Recorder>, protocol: u32) {
-    let mut frame = Vec::new();
-    codec::encode_frame(&wire::Activate { request_id: 1, protocol, service_version: 0 }, &mut frame).unwrap();
-    // Its leader silent an election timeout since it started.
-    node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 1_000_000_000);
-    drive(node);
-}
-
-/// A node says it takes queries, but refuses them as unsupported until the cluster activates
-/// their protocol; then answers each from the state as applied, logging nothing.
+/// A leader answers a query from the state as applied, logging nothing.
 #[test]
-fn a_query_is_answered_once_its_protocol_is_activated_and_never_logged() {
+fn a_query_is_answered_and_never_logged() {
     let mut node = leader();
-    let sent = client(&mut node, 7, &wire::Connect { credentials: b"" }, 0);
-    assert!(sent[0].contains("queries: Some(1)"), "{sent:?}");
-    let session = node.local.attached.iter().find(|&(_, &c)| c == 7).map(|(&s, _)| s).unwrap();
-    let query = |query_id, payload| wire::Query { session: session.0, query_id, payload };
-    let refused = client(&mut node, 7, &query(1, b"count"), 0);
-    assert_eq!(
-        refused,
-        [format!("7: QueryRefused(QueryRefusedRef {{ session: {}, query_id: 1, unsupported: 1 }})", session.0)]
-    );
-
-    activate_protocol(&mut node, QUERY_PROTOCOL);
+    let session = open(&mut node, 7, 0);
     let (last, ring) = (node.raft().last_index(), node.state.sessions[&session].ring.len());
-    let answered = client(&mut node, 7, &query(2, b"count"), 0);
+    let answered = client(&mut node, 7, &wire::Query { session: session.0, query_id: 2, payload: b"count" }, 0);
     let logged = node.service.0.len();
     let answer: Vec<u8> = format!("count {logged}").into_bytes();
     assert_eq!(
@@ -905,7 +885,6 @@ fn a_query_is_answered_once_its_protocol_is_activated_and_never_logged() {
 fn a_query_is_refused_as_unsupported_or_busy() {
     let mut node = leader();
     let session = open(&mut node, 7, 0);
-    activate_protocol(&mut node, QUERY_PROTOCOL);
     let query = |payload| wire::Query { session: session.0, query_id: 1, payload };
     assert!(client(&mut node, 7, &query(b"none"), 0)[0].contains("unsupported: 1"));
     node.local.query_bytes = MAX_WAITING_QUERY_BYTES;
@@ -918,7 +897,6 @@ fn a_query_is_refused_as_unsupported_or_busy() {
 fn a_query_waiting_as_its_connection_closes_is_dropped() {
     let mut node = leader();
     let session = open(&mut node, 7, 0);
-    activate_protocol(&mut node, QUERY_PROTOCOL);
     let mut frame = Vec::new();
     codec::encode_frame(&wire::Query { session: session.0, query_id: 1, payload: b"count" }, &mut frame).unwrap();
     node.on_client(7, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);

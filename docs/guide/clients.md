@@ -100,6 +100,34 @@ while session.recv_many(&mut events, 256).await > 0 {
 # }
 ```
 
+## Queries
+
+A query reads the state without logging anything, if the service answers queries (see
+[Services][services]): `query` sends one and waits for its answer. Queries go beside messages,
+not in their order, and any number up to `client::MAX_QUERIES` (4096) may be in flight at once,
+from tasks of their own.
+
+```rust,no_run
+# use turbofan::ClusterClient;
+# async fn price(session: &ClusterClient) -> Result<(), Box<dyn std::error::Error>> {
+let answer = session.query(b"AAPL".to_vec()).await?;
+# Ok(())
+# }
+```
+
+The answer reflects every message the cluster had applied when the query was sent, any client's,
+as of one moment between then and the answer. A message this client sent but the cluster hasn't
+yet applied may be missing: to read its own, a client waits for `applied()` to pass its
+`client_seq` first. A query is never logged, so it's never kept for a failover either: one in
+flight as the leader changes is asked again of the new one, and answered once.
+
+`QueryError` says why there's no answer:
+
+- **`Busy`**: the leader had too many waiting. Ask again.
+- **`Unsupported`**: the service doesn't take this one. Asking again won't help.
+- **`Closed`**: the session closed first.
+- **`Full`** or **`TooLong`**: refused before it was sent, as `send` refuses a message.
+
 ## When it doesn't hold
 
 A session is the unit of the guarantee. It ends when:
@@ -137,6 +165,8 @@ service answer a request for what was missed (an order's state, say) if it matte
   whole, so one of more than 4096 is always refused.
 - The client queues 4096 events for `recv`; past that, it stops reading the connection until
   they're taken. Keep reading.
+- `query` refuses past `client::MAX_QUERIES` (4096) waiting: `QueryError::Full`. A leader with
+  too many waiting from every client refuses one as `QueryError::Busy`.
 - A leader with 64 MiB of proposals not yet committed (`max_uncommitted_bytes`) takes nothing
   more from clients until they commit. Clients see this as latency, not an error.
 - A client too slow to read what the leader sends it is disconnected. It reconnects, and the
@@ -173,10 +203,12 @@ another runtime, or one that polls its sockets itself. The caller:
 3. calls `on_tick` by `next_deadline`, for keepalives;
 4. drops the connection and connects to the new target when `take_reconnect` says so (at once,
    or after a pause), and calls `on_disconnected` when a connection fails or drops;
-5. takes what the cluster said with `poll_event`.
+5. takes what the cluster said with `poll_event`, and queries' answers with `poll_answer`.
 
-`send`, `applied` and `close` are as on `ClusterClient`. The task behind `ClusterClient`, `run`
+`send`, `applied` and `close` are as on `ClusterClient`; `query` returns the query's ID, which
+its `client::Answer` has. The task behind `ClusterClient`, `run`
 in `src/remote.rs`, is this loop on tokio, and the place to start.
 
 [membership]: membership.md
 [running]: running.md
+[services]: services.md

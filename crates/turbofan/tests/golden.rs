@@ -73,7 +73,7 @@ fn frames() -> Vec<u8> {
     put(&mut out, &wire::Close { session: 9 });
     put(&mut out, &wire::Query { session: 9, query_id: 6, payload: b"book" });
     put(&mut out, &wire::Redirect { leader: 2, addr: b"10.0.0.2:7101" });
-    put(&mut out, &wire::Opened { session: 9, applied_seq: 5, last_egress_seq: 4, epoch: 3, queries: 1 });
+    put(&mut out, &wire::Opened { session: 9, applied_seq: 5, last_egress_seq: 4, epoch: 3 });
     put(&mut out, &wire::Egress { session: 9, egress_seq: 5, applied_seq: 5, payload: b"fill" });
     put(&mut out, &wire::KeepAliveAck { applied_seq: 5 });
     put(&mut out, &wire::Closed { session: 9, reason: CloseReason::Timeout });
@@ -100,10 +100,7 @@ fn expected(version: &str) -> Vec<String> {
         "Close(CloseRef { session: 9 })".into(),
         "Query(QueryRef { session: 9, query_id: 6, payload: [98, 111, 111, 107] })".into(),
         "Redirect(RedirectRef { leader: 2, addr: [49, 48, 46, 48, 46, 48, 46, 50, 58, 55, 49, 48, 49] })".into(),
-        format!(
-            "Opened(OpenedRef {{ session: 9, applied_seq: 5, last_egress_seq: {last_egress}, epoch: {epoch}, queries: {} }})",
-            if queries { "Some(1)" } else { "None" }
-        ),
+        format!("Opened(OpenedRef {{ session: 9, applied_seq: 5, last_egress_seq: {last_egress}, epoch: {epoch} }})"),
         "Egress(EgressRef { session: 9, egress_seq: 5, applied_seq: 5, payload: [102, 105, 108, 108] })".into(),
         "KeepAliveAck(KeepAliveAckRef { applied_seq: 5 })".into(),
         "Closed(ClosedRef { session: 9, reason: Timeout })".into(),

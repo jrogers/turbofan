@@ -55,7 +55,9 @@ cargo bench -p turbofan --bench cluster --features tls
 It runs three nodes on one machine, over real TCP and files, with and without fsync (and with
 `--features tls`, over TLS too). For each, one client with one message in flight, for latency,
 then several clients with many in flight, for throughput: messages per second, and latency from
-p50 to the maximum. A second table splits the time between persisted, committed and applied.
+p50 to the maximum. Then, without fsync, which they don't touch, queries the same two ways: they
+cost a round trip to a quorum but no write, so they're the reads a service can make without the
+log. A second table splits the messages' time between persisted, committed and applied.
 `BENCH_SECS` sets how long each run measures (10 s by default), and
 `BENCH_THROUGHPUT=<clients>x<in flight>` the throughput run's shape (`8x256` by default).
 

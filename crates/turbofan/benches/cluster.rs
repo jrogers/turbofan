@@ -10,6 +10,10 @@
 //! throughput run's shape (`8x256` by default), each client's at most
 //! [`MAX_UNACKED`](turbofan::client::MAX_UNACKED).
 //!
+//! Then, without fsync, which they don't touch, queries (`ClusterClient::query`, never logged)
+//! the same two ways: one in flight, then as many as the throughput run's messages, each a client's
+//! query of 64 bytes answered with 8.
+//!
 //! With `--features tls`, all the runs again on a cluster over TLS, everywhere: peers, clients.
 //!
 //! `BENCH_RESULTS=<file>` writes each run's msgs/s there, and `BENCH_BASELINE=<file>`, such a file
@@ -95,12 +99,16 @@ impl metrics::Recorder for Stages {
     }
 }
 
-/// Answers each message with its first 8 bytes, keeping nothing.
+/// Answers each message, and each query, with its first 8 bytes, keeping nothing.
 struct Ack;
 
 impl Service for Ack {
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
         ctx.send(session, payload.get(..8).unwrap_or(payload)).expect("at most 8 bytes");
+    }
+
+    fn on_query(&self, _session: SessionId, query: &[u8]) -> Option<Vec<u8>> {
+        Some(query.get(..8).unwrap_or(query).to_vec())
     }
 
     fn snapshot(&self) -> SnapshotWriter {
@@ -145,7 +153,7 @@ async fn main() {
             for (name, msgs, row, stage_row, reattached) in
                 bench(&addrs, tls.as_ref(), fsync, secs, shape, &stages).await
             {
-                stage_rows.push(stage_row);
+                stage_rows.extend(stage_row);
                 if reattached > 0 {
                     warnings.push(format!(
                         "::warning title=Benchmark failover::{name}: clients reattached {reattached} times, after a \
@@ -199,8 +207,8 @@ fn throughput_shape() -> (usize, usize) {
 }
 
 /// Both runs on the cluster at `addrs`, the throughput run's `(clients, in flight)` as
-/// `shape`: each one's name, msgs/s, table row, row of stages, and how many times its
-/// clients reattached.
+/// `shape`, and without fsync the queries' two: each one's name, msgs/s, table row, row of stages
+/// (none for queries, which aren't logged), and how many times its clients reattached.
 async fn bench(
     addrs: &[String],
     tls: Option<&ClientTls>,
@@ -208,7 +216,7 @@ async fn bench(
     secs: u64,
     shape: (usize, usize),
     stages: &Stages,
-) -> Vec<(String, u64, String, String, usize)> {
+) -> Vec<(String, u64, String, Option<String>, usize)> {
     let mut rows = Vec::new();
     let over = if tls.is_some() { ", TLS" } else { "" };
     let over = if fsync == driver::Fsync::EachBatch { format!("{over}, fsync") } else { over.to_owned() };
@@ -228,9 +236,61 @@ async fn bench(
         let both = |sorted: &[u64]| format!("{} / {}", per_mille(sorted, 500), per_mille(sorted, 990));
         let [persisted, committed, applied] = by_stage.each_ref().map(|s| both(s));
         let stage_row = format!("| {name}{over} | {persisted} | {committed} | {applied} | {} |", both(&latencies));
-        rows.push((format!("{name}{over}"), msgs, row, stage_row, reattached));
+        rows.push((format!("{name}{over}"), msgs, row, Some(stage_row), reattached));
+    }
+    if fsync == driver::Fsync::Never {
+        for (name, clients, window) in [("query latency", 1, 1), ("query throughput", shape.0, shape.1)] {
+            let mut latencies = run_queries(addrs, tls, clients, window, secs).await;
+            latencies.sort_unstable();
+            let at = |q: usize| per_mille(&latencies, q);
+            let msgs = latencies.len() as u64 / secs;
+            let row = format!(
+                "| {name}{over} | {clients} × {window} | {msgs} | {} | {} | {} | {} |",
+                at(500),
+                at(990),
+                at(999),
+                at(1000),
+            );
+            rows.push((format!("{name}{over}"), msgs, row, None, 0));
+        }
     }
     rows
+}
+
+/// `clients` sessions, each keeping `window` queries in flight, for a warm-up second then `secs`:
+/// the latency of each query asked after the warm-up and answered before the end.
+async fn run_queries(addrs: &[String], tls: Option<&ClientTls>, clients: usize, window: usize, secs: u64) -> Vec<u64> {
+    let warm = Instant::now() + Duration::from_secs(1);
+    let end = warm + Duration::from_secs(secs);
+    let mut tasks = Vec::new();
+    for _ in 0..clients {
+        let client = Arc::new(connect(addrs, tls).await);
+        for _ in 0..window {
+            tasks.push(tokio::spawn(keep_querying(Arc::clone(&client), warm, end)));
+        }
+    }
+    let mut latencies = Vec::new();
+    for task in tasks {
+        latencies.extend(task.await.unwrap());
+    }
+    latencies
+}
+
+/// Asks one query after another until `end`: their latencies, from the warm-up on.
+async fn keep_querying(client: Arc<ClusterClient>, warm: Instant, end: Instant) -> Vec<u64> {
+    let query = vec![7; PAYLOAD_BYTES];
+    let mut latencies = Vec::new();
+    loop {
+        let sent = Instant::now();
+        client.query(query.clone()).await.expect("answered");
+        let now = Instant::now();
+        if now >= end {
+            return latencies;
+        }
+        if sent >= warm {
+            latencies.push(u64::try_from((now - sent).as_nanos()).unwrap());
+        }
+    }
 }
 
 /// Starts three nodes on free local ports, in `dir`, over TLS if `tls`, syncing as `fsync`, returning where they take

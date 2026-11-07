@@ -40,7 +40,7 @@ mod service;
 mod sessions;
 mod state;
 
-pub use queries::{MAX_WAITING_QUERY_BYTES, QUERY_PROTOCOL};
+pub use queries::MAX_WAITING_QUERY_BYTES;
 pub use service::{Ctx, Effect, PayloadTooLong, Service, SessionId};
 pub(crate) use state::with_epoch;
 use state::{Session, State, decode_state, encode_state};
@@ -55,9 +55,7 @@ pub const MAX_EGRESS_RING: usize = 65_536;
 pub const MAX_SESSIONS: usize = 10_000;
 /// The highest protocol version this code supports: see `WIRE.md`, and [`Config::protocol`].
 /// 1: an activation logs the leader's [`Config::egress_ring_entries`] for every node.
-/// 2: a leader takes queries ([`Service::on_query`]), every member echoing the rounds that
-/// confirm them.
-pub const PROTOCOL: u32 = QUERY_PROTOCOL;
+pub const PROTOCOL: u32 = 1;
 /// The longest principal [`Service::authenticate`] can give.
 pub const MAX_PRINCIPAL_BYTES: usize = 255;
 

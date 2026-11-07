@@ -70,16 +70,7 @@ impl<S: Service> Node<S> {
         let (applied_seq, last) = s.carried.filter(|_| earlier).unwrap_or((s.last_seq, s.next_egress - 1));
         let replay: Vec<(u64, Vec<u8>)> = s.ring.iter().filter(|(seq, _)| *seq > last_egress_seq).cloned().collect();
         let epoch = self.state.epoch;
-        self.send_client(
-            conn,
-            &wire::Opened {
-                session: session.0,
-                applied_seq,
-                last_egress_seq: last,
-                epoch,
-                queries: self.takes_queries(),
-            },
-        );
+        self.send_client(conn, &wire::Opened { session: session.0, applied_seq, last_egress_seq: last, epoch });
         for (egress_seq, payload) in replay {
             self.send_client(conn, &wire::Egress { session: session.0, egress_seq, applied_seq, payload: &payload });
         }

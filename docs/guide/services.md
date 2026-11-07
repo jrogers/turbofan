@@ -2,12 +2,13 @@
 
 [A first service][first-service] wrote the three callbacks a service must have. This chapter
 covers the rest of `Service` and `Ctx`: who may open a session, sessions opening and closing,
-timers, work the service hands itself through the log, and testing a service without a cluster.
+timers, work the service hands itself through the log, queries answered without it, and testing a
+service without a cluster.
 
 ## The callbacks
 
-Every callback but `authenticate` runs on every node, as its entry is applied, in log order, one
-at a time. Each is given a `Ctx`, and what it does through the `Ctx` takes effect once it returns,
+Every callback but `authenticate` and `on_query` runs on every node, as its entry is applied, in
+log order, one at a time. Each is given a `Ctx`, and what it does through the `Ctx` takes effect once it returns,
 in order:
 
 | Callback | When |
@@ -19,6 +20,7 @@ in order:
 | `on_timer(id)` | A timer the service scheduled fired. |
 | `on_proposal(payload)` | A payload the service proposed came back through the log. |
 | `on_activate(version)` | An operator switched the cluster to a new version of the service's behaviour (see [Upgrades][upgrades]). |
+| `on_query(session, query)` | A query from a session: on the leader only, never logged, answered from the state as applied (see [Queries](#queries)). |
 | `snapshot()`, `restore(from)` | The node saves the state, or replaces it with a saved one. |
 
 And what a callback can do:
@@ -153,6 +155,51 @@ impl Service for Tally {
 
 Other entries may come between the callback and its proposal, so a proposal says what it's for:
 an order's ID, not "the order just changed".
+
+## Queries
+
+A read needn't go through the log. `on_query(session, query)` answers one from the state as
+applied, returning the answer, or `None` for a query the service doesn't take (the client is told
+it's unsupported). It takes `&self`: it can't change the state, send, or schedule. Nothing of it
+is logged, so a read costs no entry, no write on a quorum and no apply on every node, and only the
+leader answers.
+
+The leader answers once it has confirmed, by a round trip to a quorum, that it still leads, and
+has applied what was committed when the query came in (Raft's ReadIndex). So the answer reflects
+every message the cluster had applied when the client sent the query: a leader deposed without
+knowing it yet can't answer from what it has. Not a message the client sent first but that's
+still on its way: a client that needs to see its own waits for it to be applied first (see
+[Clients][clients]).
+
+```rust
+# use std::collections::BTreeMap;
+# use std::io::{self, Read};
+# use turbofan::{Ctx, Service, SessionId, SnapshotWriter};
+/// A store of keys and values: a message `k=v` sets one, a query `k` reads it.
+#[derive(Debug, Default)]
+struct Store(BTreeMap<Vec<u8>, Vec<u8>>);
+
+impl Service for Store {
+    fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
+        if let Some(at) = payload.iter().position(|&b| b == b'=') {
+            self.0.insert(payload[..at].to_vec(), payload[at + 1..].to_vec());
+        }
+        ctx.send(session, b"ok".to_vec()).ok();
+    }
+
+    fn on_query(&self, _session: SessionId, key: &[u8]) -> Option<Vec<u8>> {
+        Some(self.0.get(key).cloned().unwrap_or_default())
+    }
+#     fn snapshot(&self) -> SnapshotWriter { Box::new(|_| Ok(())) }
+#     fn restore(&mut self, _from: &mut dyn Read) -> io::Result<()> { Ok(()) }
+}
+```
+
+Every node must be of 0.9.0 or later before a client queries: a leader before it skips a query
+unanswered, and a follower before it doesn't confirm one (see [Upgrades][upgrades]). An answer
+is at most `codec::MAX_PAYLOAD_BYTES`; a longer one is refused as unsupported. A leader holds at
+most 16 MiB of queries waiting (`node::MAX_WAITING_QUERY_BYTES`) and refuses more as busy, for
+the client to ask again.
 
 ## Testing a service
 

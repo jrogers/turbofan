@@ -91,4 +91,10 @@ Protocol 1 makes the responses each session keeps (`egress_ring_entries`) the cl
 `activate` logs the leader's, for every node. To change it, restart the nodes with the new value,
 then `activate` again.
 
+Queries ([Services][services]), from 0.9.0, need no activation, but they need every node of
+0.9.0 or later: the leader confirms each with a round its followers echo, which a node before
+0.9.0 doesn't, and a leader before it skips a query unanswered. Upgrade every node before a
+client queries.
+
 [operations]: operations.md
+[services]: services.md
