@@ -466,6 +466,66 @@ async fn a_cluster_over_tls_takes_only_who_it_should() {
     }
 }
 
+/// TLS turned on over a running cluster, a node at a time, each restarted: every node to
+/// `Plain::Dialled`, then `Accepted`, then TLS only; then off again, backwards. Messages are
+/// exchanged while each node is down, before it's restarted, so a node restarted and one not yet
+/// are the quorum: they talk, or no message is answered. A client on plain TCP is answered until every node takes TLS, one over
+/// TLS from then on; with TLS only, a plain client gets no session; and once every node takes
+/// plain TCP again, a plain one is answered to the end.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_is_turned_on_and_off_a_node_at_a_time() {
+    use turbofan::tls::Plain;
+    let dir = tempfile::tempdir().unwrap();
+    let certs = dir.path().join("certs");
+    std::fs::create_dir(&certs).unwrap();
+    certify(&certs, "node");
+    let file = |name: &str| certs.join(name);
+    let tls = |plain| {
+        let mut tls = NodeTls::new(file("node.pem"), file("node.key"), file("node-ca.pem"), file("node-ca.pem"));
+        tls.plain = plain;
+        tls
+    };
+    let mut cluster = Cluster::new(dir.path(), |_| None);
+    let (addrs, keepalive) = (cluster.client_addrs(), Duration::from_millis(500));
+    let plain_client = || ClusterClient::connect(addrs.clone(), SERVICE_ID, b"ok".to_vec(), keepalive).unwrap();
+    let tls_client = || {
+        let gateway = ClientTls::load(&file("node-ca.pem"), None).unwrap();
+        ClusterClient::connect_tls(addrs.clone(), SERVICE_ID, b"ok".to_vec(), keepalive, gateway).unwrap()
+    };
+    let (mut client, mut sent) = (plain_client(), 0);
+    let steps = [
+        Some(tls(Plain::Dialled)),
+        Some(tls(Plain::Accepted)),
+        Some(tls(Plain::Refused)),
+        Some(tls(Plain::Accepted)),
+        Some(tls(Plain::Dialled)),
+        None,
+    ];
+    // Each session's messages count from 1, as the service checks.
+    for (step, config) in steps.into_iter().enumerate() {
+        for i in 0..3 {
+            cluster.kill(i).await;
+            exchange(&mut cluster, &mut client, sent + 1, sent + 10).await;
+            sent += 10;
+            cluster.configs[i].tls.clone_from(&config);
+            cluster.start(i);
+        }
+        match step {
+            // Every node takes TLS now.
+            0 => (client, sent) = (tls_client(), 0),
+            2 => {
+                let mut plain = plain_client();
+                let opened = tokio::time::timeout(Duration::from_secs(2), plain.recv()).await;
+                assert!(opened.is_err(), "no session on plain TCP with TLS only");
+            }
+            // Every node takes plain TCP again.
+            3 => (client, sent) = (plain_client(), 0),
+            _ => {}
+        }
+    }
+}
+
 /// With TLS on the admin listener only, peers replicate and a client gets through over plain
 /// TCP; an operator gets through with its certificate, and not without TLS.
 #[cfg(feature = "tls")]

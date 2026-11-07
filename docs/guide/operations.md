@@ -157,6 +157,7 @@ nowhere. The main ones:
 | `turbofan_snapshot_age_seconds` | Since the node's latest snapshot. |
 | `turbofan_sessions` | Client sessions open. |
 | `turbofan_in_doubt` | 1 while the node doubts its log (see [Members][membership]). |
+| `turbofan_plain_connections{listener}` | With `--tls-plain`, the connections taken on plain TCP beside TLS, on the `peer` or `client` listener (see [Running a cluster][running]). |
 | `turbofan_persist_latency_seconds`, `turbofan_commit_latency_seconds`, `turbofan_apply_latency_seconds` | On the leader, how long its entries take to be durable on its own disk, committed, and applied and answered. |
 
 `src/metrics.rs` lists them all. Worth an alert:
@@ -176,4 +177,5 @@ leader's for the latencies.
 
 [clients]: clients.md
 [membership]: membership.md
+[running]: running.md
 [upgrades]: upgrades.md

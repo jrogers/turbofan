@@ -4,6 +4,17 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Added
+
+- TLS turned on or off over a running cluster, a node at a time (#6): `NodeTls::plain`
+  (`serve --tls-plain accept|dial`) takes plain TCP beside TLS on the peer and client listeners,
+  told apart by how a connection begins, and with `Plain::Dialled` dials peers over plain TCP.
+  Every node to `dial`, then to `accept`, then to TLS only, a restart each; off is the same
+  backwards. `turbofan_plain_connections{listener}` counts the connections still plain. Not on
+  the admin listener, nor with `peer_ids`.
+
 ## 0.10.0 (2026-11-07)
 
 The API made ready to freeze for 1.0 (#8): what may grow can, without breaking a caller.

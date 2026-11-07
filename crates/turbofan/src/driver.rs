@@ -911,11 +911,12 @@ async fn accept_peers(
             tokio::time::sleep(ACCEPT_RETRY).await;
             continue;
         };
-        let tls = tls.borrow().as_ref().and_then(|t| t.peer.clone());
+        let (tls, plain_beside) =
+            tls.borrow().as_ref().map_or((None, None), |t| (t.peer.clone(), t.plain.then_some("peer")));
         let (inputs, token, hello) = (inputs.clone(), token.clone(), hello.clone());
         conns.spawn(async move {
             let handshake = async {
-                let (mut stream, cert) = tls::accept(stream, tls.as_ref()).await?;
+                let (mut stream, cert) = tls::accept(stream, tls.as_ref(), plain_beside).await?;
                 let first = read_frame(&mut stream).await?;
                 io::Result::Ok((stream, cert, first))
             };
@@ -986,9 +987,14 @@ async fn accept(listener: TcpListener, gate: Gate, next_conn: Arc<AtomicU64>) {
 async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
     let Gate { role, hello, token, tls, inputs, idle } = gate;
     let admin = role == wire::Role::Admin;
-    let tls = tls.borrow().as_ref().and_then(|t| if admin { Some(t.admin.clone()) } else { t.client.clone() });
+    // The admin listener's TLS is each node's own: never plain beside it.
+    let (tls, plain_beside) = match tls.borrow().as_ref() {
+        Some(t) if admin => (Some(t.admin.clone()), None),
+        Some(t) => (t.client.clone(), t.plain.then_some("client")),
+        None => (None, None),
+    };
     let handshake = async {
-        let (mut stream, _) = tls::accept(stream, tls.as_ref()).await?;
+        let (mut stream, _) = tls::accept(stream, tls.as_ref(), plain_beside).await?;
         let first = read_frame(&mut stream).await?;
         io::Result::Ok((stream, first))
     };

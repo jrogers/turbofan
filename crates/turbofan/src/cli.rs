@@ -75,7 +75,10 @@
 //! `--tls-peer-ca`, on the admin listener only; the operators' commands then take `--tls-ca <pem>
 //! --tls-cert <pem> --tls-key <pem>`, a certificate the admin CA signed. Without `--tls-admin-ca`,
 //! operators present none (`--tls-ca <pem>` alone), and the admin token says who they are. Only in
-//! a binary built with the `tls` feature; without it, the flags are refused.
+//! a binary built with the `tls` feature; without it, the flags are refused. `--tls-plain accept`
+//! takes plain TCP beside TLS on the peer and client listeners, and `--tls-plain dial` dials
+//! peers over it too, to turn TLS on or off over a running cluster, node by node
+//! ([`NodeTls::plain`]).
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -87,7 +90,7 @@ use crate::driver::{self, serve_until};
 use crate::node::{self, Effect, Service};
 use crate::raft::{self, Member, NodeId};
 use crate::remote::{Admin, AdminError, Captured, ClusterStatus};
-use crate::tls::{ClientTls, NodeTls};
+use crate::tls::{ClientTls, NodeTls, Plain};
 
 /// A new member may take a while to catch up.
 const MEMBERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -121,7 +124,9 @@ const USAGE: &str = "usage:
         losing power together may lose committed entries)
         [--election-timeout <ms>] [--heartbeat <ms>]
         [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]
-         [--tls-reload <secs>]] (the files reread every 60 seconds, or --tls-reload's)
+         [--tls-reload <secs>] [--tls-plain accept|dial]] (the files reread every 60 seconds,
+         or --tls-reload's; --tls-plain takes plain TCP beside TLS, and with dial, dials peers
+         over it, to turn TLS on or off node by node)
         (without --tls-peer-ca, TLS on the admin listener only; without --tls-admin-ca,
         operators present no certificate, and the admin token says who they are)
   restore --from <snapshot file>, then serve's flags: a new cluster of one, this node
@@ -444,6 +449,13 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
 fn node_tls(args: &[String]) -> Result<Option<NodeTls>, String> {
     let (peer_ca, admin_ca) = (optional_flag(args, "--tls-peer-ca")?, optional_flag(args, "--tls-admin-ca")?);
     let peer_ids = args.iter().any(|a| a == "--tls-peer-ids");
+    let plain = optional_flag(args, "--tls-plain")?;
+    let plain_parsed = match plain.as_deref() {
+        None => Plain::Refused,
+        Some("accept") => Plain::Accepted,
+        Some("dial") => Plain::Dialled,
+        Some(_) => return Err("--tls-plain: accept or dial".into()),
+    };
     let reload = optional_flag(args, "--tls-reload")?;
     let reload_every = match &reload {
         Some(secs) => secs.parse().ok().filter(|&n| n > 0).map(Duration::from_secs),
@@ -452,6 +464,9 @@ fn node_tls(args: &[String]) -> Result<Option<NodeTls>, String> {
     let reload_every = reload_every.ok_or("--tls-reload: a number of seconds from 1")?;
     match tls_flags(args, ["--tls-cert", "--tls-key"])? {
         Some(_) if peer_ids && peer_ca.is_none() => Err("--tls-peer-ids takes --tls-peer-ca".into()),
+        Some(_) if plain.is_some() && (peer_ca.is_none() || peer_ids) => {
+            Err("--tls-plain takes --tls-peer-ca, and not --tls-peer-ids".into())
+        }
         Some([cert, key]) => Ok(Some(NodeTls {
             cert: cert.into(),
             key: key.into(),
@@ -459,10 +474,12 @@ fn node_tls(args: &[String]) -> Result<Option<NodeTls>, String> {
             admin_ca: admin_ca.map(Into::into),
             peer_ids,
             reload_every,
+            plain: plain_parsed,
         })),
-        None if peer_ca.is_some() || admin_ca.is_some() || peer_ids || reload.is_some() => {
-            Err("--tls-peer-ca, --tls-admin-ca, --tls-peer-ids and --tls-reload take --tls-cert and --tls-key".into())
-        }
+        None if peer_ca.is_some() || admin_ca.is_some() || peer_ids || plain.is_some() || reload.is_some() => Err(
+            "--tls-peer-ca, --tls-admin-ca, --tls-peer-ids, --tls-plain and --tls-reload take --tls-cert and --tls-key"
+                .into(),
+        ),
         None => Ok(None),
     }
 }
@@ -603,7 +620,7 @@ fn members(list: &str) -> Result<Vec<(NodeId, String)>, String> {
 mod tests {
     use std::time::Duration;
 
-    use super::{learners, member_to_add, node_tls, optional_flag, serve_config, tls_flags, tune};
+    use super::{Plain, learners, member_to_add, node_tls, optional_flag, serve_config, tls_flags, tune};
     use crate::driver::Fsync;
     use crate::raft::NodeId;
 
@@ -705,6 +722,22 @@ mod tests {
         assert_eq!((all.peer_ca, all.peer_ids), (Some("p".into()), false));
         assert!(node_tls(&args(&["--tls-peer-ca", "p"])).is_err());
         assert!(node_tls(&args(&[])).unwrap().is_none());
+    }
+
+    /// `--tls-plain accept` takes plain TCP beside TLS, and `dial` dials peers over it too; only
+    /// with a peer CA and a certificate, not with peer IDs, and nothing else.
+    #[test]
+    fn tls_plain_is_accept_or_dial() {
+        let args = |a: &[&str]| a.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+        let tls = ["--tls-cert", "c", "--tls-key", "k", "--tls-peer-ca", "p"];
+        let with = |more: &[&str]| node_tls(&args(&[&tls[..], more].concat()));
+        assert_eq!(with(&[]).unwrap().unwrap().plain, Plain::Refused);
+        assert_eq!(with(&["--tls-plain", "accept"]).unwrap().unwrap().plain, Plain::Accepted);
+        assert_eq!(with(&["--tls-plain", "dial"]).unwrap().unwrap().plain, Plain::Dialled);
+        assert!(with(&["--tls-plain", "yes"]).is_err());
+        assert!(with(&["--tls-plain", "accept", "--tls-peer-ids"]).is_err(), "with peer IDs");
+        assert!(node_tls(&args(&[&tls[..4], &["--tls-plain", "accept"]].concat())).is_err(), "without a peer CA");
+        assert!(node_tls(&args(&["--tls-plain", "accept"])).is_err(), "without a certificate");
     }
 
     /// A flag given without its value is an error, not taken for absent.

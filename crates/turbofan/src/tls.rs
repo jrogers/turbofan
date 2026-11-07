@@ -22,6 +22,16 @@
 //! Without a peer CA ([`NodeTls::admin_only`]), only operators connect over TLS: peers and clients
 //! stay on plain TCP, so a cluster can put TLS on its admin listeners alone, one node at a time.
 //!
+//! A node with TLS to peers and one without can't talk, so a running cluster turns it on or off
+//! with [`NodeTls::plain`], node by node, a restart each: first every node to [`Plain::Dialled`],
+//! taking plain TCP beside TLS and dialling peers over plain TCP, as those not yet restarted do;
+//! then every node to [`Plain::Accepted`], dialling over TLS, which every node now takes; then
+//! every node to [`Plain::Refused`], TLS only. Turning it off is the same backwards: every node to
+//! `Accepted`, then `Dialled`, then without TLS. A listener tells the two apart by how a
+//! connection begins, a TLS handshake or a hello. Clients move to TLS once every node takes it,
+//! and before the last step: `turbofan_plain_connections` counts the connections still plain.
+//! Only on the peer and client listeners: the admin listener's TLS is each node's own already.
+//!
 //! A node rereads its files every [`NodeTls::reload_every`], and when they've changed, loads them
 //! again, for the connections made after: a certificate or CA is replaced by rewriting its file.
 //! Files that don't load, half written, say, are left until they do, the node keeping what it
@@ -80,6 +90,25 @@ pub struct NodeTls {
     /// How often the node rereads the files, to load them again if they've changed: 60 seconds
     /// by default. Not zero.
     pub reload_every: Duration,
+    /// Whether plain TCP is taken beside TLS on the peer and client listeners, and peers dialled
+    /// over it, while TLS is turned on or off over a running cluster: see [the module](self).
+    /// Only with a peer CA, and without [`NodeTls::peer_ids`], since a peer on plain TCP has no
+    /// certificate to name it.
+    pub plain: Plain,
+}
+
+/// Plain TCP beside TLS, for [`NodeTls::plain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Plain {
+    /// TLS only: plain TCP refused. The default.
+    #[default]
+    Refused,
+    /// Plain TCP taken beside TLS, on the peer and client listeners; peers dialled over TLS.
+    Accepted,
+    /// Plain TCP taken beside TLS, on the peer and client listeners, and peers dialled over plain
+    /// TCP.
+    Dialled,
 }
 
 /// [`NodeTls::reload_every`]'s default.
@@ -102,6 +131,7 @@ impl NodeTls {
             admin_ca: Some(admin_ca.into()),
             peer_ids: false,
             reload_every: RELOAD_EVERY,
+            plain: Plain::Refused,
         }
     }
 
@@ -116,6 +146,7 @@ impl NodeTls {
             admin_ca: Some(admin_ca.into()),
             peer_ids: false,
             reload_every: RELOAD_EVERY,
+            plain: Plain::Refused,
         }
     }
 }
@@ -232,6 +263,8 @@ pub(crate) struct Loaded {
     pub(crate) dial: Option<ClientTls>,
     /// [`NodeTls::peer_ids`], with a peer CA.
     pub(crate) peer_ids: bool,
+    /// Whether the peer and client listeners take plain TCP beside TLS ([`NodeTls::plain`]).
+    pub(crate) plain: bool,
 }
 
 impl Loaded {
@@ -239,10 +272,18 @@ impl Loaded {
         if tls.reload_every.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS: reload_every is zero"));
         }
+        if tls.plain != Plain::Refused && (tls.peer_ca.is_none() || tls.peer_ids) {
+            let refused = "TLS: plain TCP beside TLS needs a peer CA, and not peer_ids";
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, refused));
+        }
         let (cluster, admin) = imp::acceptors(tls)?;
-        let dial = tls.peer_ca.as_deref().map(|ca| ClientTls::load(ca, Some((&tls.cert, &tls.key)))).transpose()?;
+        let dial = match tls.plain {
+            Plain::Dialled => None,
+            _ => tls.peer_ca.as_deref().map(|ca| ClientTls::load(ca, Some((&tls.cert, &tls.key)))).transpose()?,
+        };
         let (peer, client) = cluster.unzip();
-        Ok(Self { peer, client, admin, dial, peer_ids: tls.peer_ids && tls.peer_ca.is_some() })
+        let peer_ids = tls.peer_ids && tls.peer_ca.is_some();
+        Ok(Self { peer, client, admin, dial, peer_ids, plain: tls.plain != Plain::Refused })
     }
 }
 
@@ -311,13 +352,56 @@ fn plain(stream: TcpStream) -> Conn {
     Conn::Plain(BufReader::new(BufWriter::new(stream)))
 }
 
-/// An accepted TCP connection, over TLS if there's `tls`, and the certificate the other end
-/// presented, if it did.
-pub(crate) async fn accept(stream: TcpStream, tls: Option<&Acceptor>) -> io::Result<(Conn, Option<Cert>)> {
+/// An accepted TCP connection, over TLS if there's `tls` (with plain TCP taken beside it, by
+/// the listener `plain_beside` names, only if the connection begins with a TLS handshake), and
+/// the certificate the other end presented, if it did. A plain one taken beside TLS is counted,
+/// by listener, in `turbofan_plain_connections`.
+pub(crate) async fn accept(
+    stream: TcpStream,
+    tls: Option<&Acceptor>,
+    plain_beside: Option<&'static str>,
+) -> io::Result<(Conn, Option<Cert>)> {
     let _ = stream.set_nodelay(true);
-    match tls {
-        Some(tls) => imp::accept(tls, stream).await,
-        None => Ok((plain(stream), None)),
+    match (tls, plain_beside) {
+        (Some(tls), None) => imp::accept(tls, stream).await,
+        (Some(tls), Some(listener)) => {
+            if begins_tls(&stream).await? {
+                return imp::accept(tls, stream).await;
+            }
+            metrics::counter!("turbofan_plain_connections", "listener" => listener).increment(1);
+            Ok((plain(stream), None))
+        }
+        (None, _) => Ok((plain(stream), None)),
+    }
+}
+
+/// The first bytes of a TLS connection: a handshake record (22), of version 3.1 to 3.3, which a
+/// `ClientHello`'s record says it is.
+const TLS_RECORD: (u8, u8, std::ops::RangeInclusive<u8>) = (22, 3, 1..=3);
+
+/// A plain connection begins with its hello's length, little-endian: a TLS record's first three
+/// bytes only if it's at least 0x01_0316 bytes long. A hello is a few fixed fields and its
+/// token, which a kilobyte covers with room for fields to come.
+const _: () = assert!(crate::driver::MAX_TOKEN_BYTES + 1024 < 0x01_0316);
+
+/// Whether `stream` begins with a TLS handshake ([`TLS_RECORD`]), peeked, not read.
+async fn begins_tls(stream: &TcpStream) -> io::Result<bool> {
+    let mut start = [0; 3];
+    loop {
+        let n = stream.peek(&mut start).await?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let (record, major, minor) = &TLS_RECORD;
+        if start[0] != *record || (n >= 2 && start[1] != *major) {
+            return Ok(false);
+        }
+        if n == 3 {
+            return Ok(minor.contains(&start[2]));
+        }
+        // ponytail: polls for the rest, the first segment having been under three bytes, which no
+        // TLS stack or hello sends; the hello's timeout bounds it. A buffered replay if one ever does.
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -497,7 +581,7 @@ mod without {
     mod tests {
         use std::path::{Path, PathBuf};
 
-        use super::super::{ClientTls, Loaded, NodeTls};
+        use super::super::{ClientTls, Loaded, NodeTls, Plain};
 
         /// Asked for TLS it can't give, a build without it says so, rather than going plain.
         #[test]
@@ -512,6 +596,7 @@ mod without {
                 admin_ca: Some(file("a")),
                 peer_ids: false,
                 reload_every: std::time::Duration::from_secs(1),
+                plain: Plain::Refused,
             };
             assert_eq!(Loaded::load(&node).err().map(|e| e.kind()), Some(std::io::ErrorKind::Unsupported));
         }
@@ -525,8 +610,58 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
-    use super::{accept, connect};
+    use super::{Loaded, NodeTls, Plain, accept, begins_tls, connect};
     use crate::driver::{read_frame, write_frames};
+
+    /// A listener taking plain TCP beside TLS tells them apart by the first three bytes: a TLS
+    /// handshake's record, of versions 3.1 to 3.3, from a hello's length, even one whose first
+    /// byte is a handshake's (278 bytes) or first two (790 bytes), and from a handshake's first
+    /// byte and third with another's second; a connection closed before sending anything is
+    /// neither.
+    #[tokio::test]
+    async fn a_tls_handshake_is_told_from_a_hello() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hello = |len: u32| len.to_le_bytes().to_vec();
+        let cases = [
+            (vec![22, 3, 1, 0, 200], Some(true)),
+            (vec![22, 3, 3, 0, 200], Some(true)),
+            (hello(278), Some(false)),
+            (hello(790), Some(false)),
+            (hello(40), Some(false)),
+            (vec![22, 4, 1, 0], Some(false)),
+            (vec![], None),
+        ];
+        for (start, tls) in cases {
+            let dialled = tokio::spawn(async move {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream.write_all(&start).await.unwrap();
+                stream
+            });
+            let (accepted, _) = listener.accept().await.unwrap();
+            let stream = dialled.await.unwrap();
+            if tls.is_none() {
+                drop(stream);
+            }
+            assert_eq!(begins_tls(&accepted).await.ok(), tls);
+        }
+    }
+
+    /// Plain TCP beside TLS needs a peer CA, else peers and clients are plain already, and can't
+    /// be with peer IDs, since a plain peer has no certificate to name it.
+    #[test]
+    fn plain_beside_tls_without_a_peer_ca_or_with_peer_ids_is_refused() {
+        let mut admin_only = NodeTls::admin_only("c", "k", "a");
+        admin_only.plain = Plain::Accepted;
+        let mut ids = NodeTls::new("c", "k", "p", "a");
+        (ids.peer_ids, ids.plain) = (true, Plain::Dialled);
+        // Refused for that, before the files, which aren't there, are read.
+        for tls in [admin_only, ids] {
+            let error = Loaded::load(&tls).err().expect("refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("plain TCP beside TLS"), "{error}");
+        }
+    }
 
     /// Split plain TCP, its halves go on from where the whole left off: what was read ahead past the
     /// hello, in the buffer, is read first, then the socket's; and each half works while the other
@@ -536,7 +671,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let dialled = tokio::spawn(async move { connect(&addr, None, None).await.unwrap() });
-        let (mut accepted, _) = accept(listener.accept().await.unwrap().0, None).await.unwrap();
+        let (mut accepted, _) = accept(listener.accept().await.unwrap().0, None, None).await.unwrap();
         let mut dialled = dialled.await.unwrap();
         let frame = |byte: u8| [&3_u32.to_le_bytes()[..], &[byte; 3]].concat();
         // The hello and the frame after it in one write, read into one buffer.

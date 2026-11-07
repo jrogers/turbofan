@@ -237,8 +237,24 @@ the connections it makes and takes after; those open keep what they had. So a ce
 replaced by rewriting its file, as cert-manager, a Vault agent or SPIRE does, with no restart.
 Files that don't load, half written, say, are left until they do, the node keeping what it had:
 `turbofan_tls_reloads{result="failed"}` counts them. Adding or taking away a CA, which changes
-what TLS is on, is still a restart. A node with TLS and one without can't talk, so a cluster turns TLS on or off all
-at once.
+what TLS is on, is still a restart.
+
+A node with TLS to its peers and one without can't talk, so a running cluster turns TLS on with
+`--tls-plain` (`NodeTls::plain`), restarting the nodes one at a time, three times over:
+
+1. Every node with TLS and `--tls-plain dial` (`Plain::Dialled`): it takes plain TCP beside TLS on
+   its peer and client listeners, telling them apart by how a connection begins, and dials its
+   peers over plain TCP, as the nodes not yet restarted do.
+2. Every node with `--tls-plain accept` (`Plain::Accepted`): it dials its peers over TLS, which
+   every node now takes. Move the clients to TLS now, too.
+3. Every node without `--tls-plain`: TLS only. Before it, check that
+   `turbofan_plain_connections{listener="client"}` has stopped counting on every node: a client
+   still on plain TCP would be refused.
+
+Turning it off is the same backwards: every node to `accept`, then `dial`, moving the clients to
+plain TCP, then without TLS. Wait for each node to catch up before restarting the next, as in an
+upgrade. The admin listener isn't in it: its TLS is each node's own already. Nor are peer IDs,
+since a peer on plain TCP has no certificate to name it: turn `--tls-peer-ids` on after.
 
 Leave out `--tls-peer-ca` (`tls::NodeTls::admin_only`, with no peer CA) and only the admin listener
 has TLS: peers and clients stay on plain TCP, keep the peer token. That's each node's own, so a
