@@ -1,8 +1,9 @@
 #![doc = guide_links!()]
 #![doc = include_str!("../docs/guide/README.md")]
 
-// Each chapter is a file in docs/guide/, read on GitHub as well as here, with its examples run as
-// doctests. The chapters link to each other with reference-style links whose definitions name the
+// Each chapter is a file in the repository's docs/guide/, which crate's docs/guide links to, as
+// cargo publish packages only the crate's own files: read on GitHub as well as here, with its
+// examples run as doctests. The chapters link to each other with reference-style links whose definitions name the
 // files; `guide_links!` defines the same names first, as module paths, and in Markdown the first
 // definition of a name is the one used.
 

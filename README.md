@@ -41,7 +41,7 @@ every machine agrees on, and quickly:
 - **Ledgers, reservations, quotas and schedulers**: a balance checked and debited in one step,
   the last seat won by one request, a timer fired once though the node that set it fails.
 
-[What it's for](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/use-cases.md), the guide's first chapter,
+[What it's for](https://github.com/jrogers/turbofan/blob/main/docs/guide/use-cases.md), the guide's first chapter,
 goes into each, and when it isn't the right tool.
 
 ## A service
@@ -113,13 +113,13 @@ exactly once and in order, and responses arrive exactly once and in order.
 
 ## The guide
 
-[The guide](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/README.md), also in the crate docs as `turbofan::guide`, goes
-from [what it's for](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/use-cases.md) and a first service to running a cluster in
-production: [services](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/services.md),
-[clients](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/clients.md), [the command line, configuration, durability, tokens and
-TLS](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/running.md), [members, learners and standbys](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/membership.md),
-[operations and metrics](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/operations.md), [upgrades](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/upgrades.md) and
-[performance](https://github.com/jrogers/turbofan/blob/main/crates/turbofan/docs/guide/performance.md). Its examples run as doctests.
+[The guide](https://github.com/jrogers/turbofan/blob/main/docs/guide/README.md), also in the crate docs as `turbofan::guide`, goes
+from [what it's for](https://github.com/jrogers/turbofan/blob/main/docs/guide/use-cases.md) and a first service to running a cluster in
+production: [services](https://github.com/jrogers/turbofan/blob/main/docs/guide/services.md),
+[clients](https://github.com/jrogers/turbofan/blob/main/docs/guide/clients.md), [the command line, configuration, durability, tokens and
+TLS](https://github.com/jrogers/turbofan/blob/main/docs/guide/running.md), [members, learners and standbys](https://github.com/jrogers/turbofan/blob/main/docs/guide/membership.md),
+[operations and metrics](https://github.com/jrogers/turbofan/blob/main/docs/guide/operations.md), [upgrades](https://github.com/jrogers/turbofan/blob/main/docs/guide/upgrades.md) and
+[performance](https://github.com/jrogers/turbofan/blob/main/docs/guide/performance.md). Its examples run as doctests.
 
 ## How it's built
 

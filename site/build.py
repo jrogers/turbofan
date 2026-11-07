@@ -2,7 +2,7 @@
 
 Called by scripts/site.sh, which runs mdBook after it:
 
-- the book's sources, in BOOK/src: the guide's chapters (crates/turbofan/docs/guide/*.md),
+- the book's sources, in BOOK/src: the guide's chapters (docs/guide/*.md),
   with a contents page made from the guide's own index, and the architecture overview
   (docs/ARCHITECTURE.md). A link to a file outside the book (WIRE.md, say)
   goes to it on GitHub, at REF.
@@ -31,7 +31,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 REPO = "https://github.com/jrogers/turbofan"
 SITE = "https://jrogers.github.io/turbofan"
-CLUSTER_DOCS = "crates/turbofan/docs"
 
 
 def main(book: Path, out: Path, ref: str) -> None:
@@ -44,17 +43,17 @@ def main(book: Path, out: Path, ref: str) -> None:
     shutil.copy(ROOT / "docs" / "assets" / "logo-512.png", book / "theme" / "favicon.png")
     shutil.copy(ROOT / "site" / "theme.css", book / "theme" / "turbofan.css")
 
-    guide = ROOT / "crates" / "turbofan" / "docs" / "guide"
+    guide = ROOT / "docs" / "guide"
     chapters = []
     # The guide's index is the book's first page, index.html: mdBook would render a README.md
     # there but leave links to it pointing at README.html.
     names = {p.name: ("index.md" if p.name == "README.md" else p.name) for p in guide.glob("*.md")}
     for path in sorted(guide.glob("*.md")):
-        text = relink(path.read_text().replace(f"]({REPO}/blob/main/docs/ARCHITECTURE.md)", "](architecture.md)"), f"{CLUSTER_DOCS}/guide", set(names) | {"architecture.md"}, ref).replace("](README.md)", "](index.md)")
+        text = relink(path.read_text().replace(f"]({REPO}/blob/main/docs/ARCHITECTURE.md)", "](architecture.md)"), "docs/guide", set(names) | {"architecture.md"}, ref).replace("](README.md)", "](index.md)")
         (src / names[path.name]).write_text(text)
         chapters.append(names[path.name])
     architecture = (ROOT / "docs" / "ARCHITECTURE.md").read_text()
-    architecture = architecture.replace("](../crates/turbofan/docs/guide/README.md)", "](index.md)")
+    architecture = architecture.replace("](guide/README.md)", "](index.md)")
     (src / "architecture.md").write_text(relink(architecture, "docs", {"index.md"}, ref))
     (src / "SUMMARY.md").write_text(summary((guide / "README.md").read_text(), chapters))
 
@@ -203,7 +202,7 @@ def serve() -> str:
 def bench() -> dict[str, str]:
     """The landing page's figures, from the results in the guide's performance chapter: the
     machine they're from, and cells of its table, which has a row per run and a column per figure."""
-    chapter = (ROOT / CLUSTER_DOCS / "guide" / "performance.md").read_text()
+    chapter = (ROOT / "docs" / "guide" / "performance.md").read_text()
     _, found, results = chapter.partition("\n## Results\n")
     assert found, "the performance chapter has no Results section: update site/build.py's bench"
     machine = re.search(r"^On (?:an? )?(.+?): ", results, re.M)
