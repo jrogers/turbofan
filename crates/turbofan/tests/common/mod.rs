@@ -1,7 +1,7 @@
 //! What the tests of a cluster over real TCP and files share: a cluster of three, and a fourth to
 //! add, running a service that echoes and checks each session's messages come once each, in order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::{self, Read};
 use std::net::{SocketAddr, TcpListener};
@@ -66,10 +66,21 @@ impl Service for Echo {
     }
 }
 
-/// Free local ports: bound, read and released, so there's a small race with other processes.
+/// Free local ports, none handed out before in this process: bound, read and released, so another
+/// process may take one first, but this one's tests, which run at once, never share one. Linux
+/// hands a port just released out again, to the next test asking: one of two clusters would then
+/// fail to bind it, and the other test's requests to it reach the wrong cluster, or none.
 pub fn ports(n: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<TcpListener> = (0..n).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
+    static GIVEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    let mut given = GIVEN.lock().unwrap();
+    let mut ports = Vec::new();
+    while ports.len() < n {
+        let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        if given.insert(addr.port()) {
+            ports.push(addr);
+        }
+    }
+    ports
 }
 
 pub struct Cluster {
