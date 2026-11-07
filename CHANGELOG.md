@@ -6,6 +6,15 @@ a patch version (0.1.1) doesn't.
 
 ## Unreleased
 
+### Added
+
+- Addresses may be host names: `serve --peers 1=oms-0.oms:7001,...`, and `add-member`'s. A node
+  looks a name up each time it dials it, so a node that moves and keeps its name, as a
+  Kubernetes StatefulSet's pod does, is found again. With a name among its own addresses,
+  `serve --listen <ip>` says which interface its listeners bind (`0.0.0.0` for all of them): a
+  name isn't bound to an interface the operator didn't name. `driver::Config::peer_listen`
+  does the same for a service calling `serve` itself.
+
 ### Fixed
 
 - A node told to stop by a shutdown, but short of the snapshot it was to stop with, stopped
@@ -28,6 +37,11 @@ a patch version (0.1.1) doesn't.
   append it refuses (`AppendAck`'s `prevIndex`, schema version 7), and after one the leader
   probes with one append at a time, ignoring refusals of older ones. A refusal from an older
   node, without it, is answered as before.
+
+### Breaking
+
+- `driver::Config::peer_addrs` holds `host:port` strings, not `SocketAddr`s. `Config::new`
+  takes `SocketAddr`s as before.
 
 ## 0.7.0 (2026-11-05)
 

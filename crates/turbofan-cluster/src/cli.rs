@@ -17,6 +17,12 @@
 //! <binary> remove-member --admin 127.0.0.1:7201 --id 4
 //! ```
 //!
+//! An address is `host:port`, the host an IP address or a name: a node looks a name up each time
+//! it dials it, so a node can move, as a Kubernetes pod does, and keep its name (a StatefulSet's
+//! `oms-0.oms:7001`). With a name among its own addresses, `serve --listen <ip>` says which
+//! interface its listeners bind, on their ports (`--listen 0.0.0.0` for all of them); with IP
+//! addresses, it binds those, unless `--listen` says otherwise.
+//!
 //! `add-member --learner` adds it as a learner: it takes the log but doesn't vote, so the
 //! cluster's commits don't wait on it, as for a standby in another region. Nor does anything
 //! else wait for it to catch up: `--wait <entries>` returns once it's within that many of the
@@ -67,7 +73,7 @@
 //! a binary built with the `tls` feature; without it, the flags are refused.
 
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -103,7 +109,9 @@ const WAIT_POLL: Duration = Duration::from_secs(2);
 
 const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
-        [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
+        [--listen <ip>] [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
+        (an address is <host>:<port>; with a host name for this node's, --listen is the
+        interface its listeners bind, on those ports: 0.0.0.0, say)
         [--election-timeout <ms>] [--heartbeat <ms>]
         [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]
          [--tls-reload <secs>]] (the files reread every 60 seconds, or --tls-reload's)
@@ -354,11 +362,20 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
     let peers = members(&flag(args, "--peers")?)?;
     let clients = members(&flag(args, "--clients")?)?;
     let admins = members(&flag(args, "--admin")?)?;
-    let ids = |list: &[(NodeId, SocketAddr)]| list.iter().map(|(m, _)| *m).collect::<Vec<_>>();
+    let ids = |list: &[(NodeId, String)]| list.iter().map(|(m, _)| *m).collect::<Vec<_>>();
     if ids(&clients) != ids(&peers) || ids(&admins) != ids(&peers) || !ids(&peers).contains(&id) {
         return Err("--peers, --clients and --admin must list the same members, --id among them".into());
     }
-    let own = |list: &[(NodeId, SocketAddr)]| list.iter().find(|(m, _)| *m == id).map(|&(_, a)| a).expect("checked");
+    let interface = optional_flag(args, "--listen")?;
+    let interface: Option<IpAddr> =
+        interface.map(|ip| ip.parse().map_err(|_| format!("--listen {ip}: an IP address"))).transpose()?;
+    let own = |list: &[(NodeId, String)]| -> Result<SocketAddr, String> {
+        let addr = &list.iter().find(|(m, _)| *m == id).expect("checked").1;
+        match interface {
+            Some(ip) => Ok(SocketAddr::new(ip, port(addr).expect("checked"))),
+            None => addr.parse().map_err(|_| format!("{addr}: a host name, so --listen <ip> to listen on")),
+        }
+    };
     let nanos = |d: Duration| u64::try_from(d.as_nanos()).expect("small");
     let learners = learners(args, &ids(&peers))?;
     // Joining, the lists are where to find the cluster; otherwise they're its first members.
@@ -368,7 +385,7 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
         }
         Vec::new()
     } else {
-        let addr = |list: &[(NodeId, SocketAddr)], i: usize| list[i].1.to_string();
+        let addr = |list: &[(NodeId, String)], i: usize| list[i].1.clone();
         (0..peers.len())
             .map(|i| Member {
                 id: peers[i].0,
@@ -386,8 +403,9 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
         service_id,
         data_dir: flag(args, "--data")?.into(),
         log_fsync: driver::Fsync::Never,
-        client_listen: own(&clients),
-        admin_listen: own(&admins),
+        client_listen: own(&clients)?,
+        admin_listen: own(&admins)?,
+        peer_listen: Some(own(&peers)?),
         peer_addrs: peers,
         admin_token: None,
         peer_token: None,
@@ -502,9 +520,9 @@ fn member(text: &str) -> Result<Member, String> {
     let bad = || format!("{text}: not <id>=<peer addr>,<client addr>,<admin addr>");
     let (id, addrs) = text.split_once('=').ok_or_else(bad)?;
     let id: NodeId = id.parse().map_err(|_| bad())?;
-    let addrs: Vec<SocketAddr> = addrs.split(',').map(str::parse).collect::<Result<_, _>>().map_err(|_| bad())?;
-    let [peer, client, admin] = addrs[..] else { return Err(bad()) };
-    Ok(Member { id, peer: peer.to_string(), client: client.to_string(), admin: admin.to_string(), learner: false })
+    let addrs: Vec<String> = addrs.split(',').map(address).collect::<Result<_, _>>()?;
+    let [peer, client, admin] = <[String; 3]>::try_from(addrs).map_err(|_| bad())?;
+    Ok(Member { id, peer, client, admin, learner: false })
 }
 
 /// `add-member`'s member: `--member`, a learner with `--learner`.
@@ -526,14 +544,27 @@ fn learners(args: &[String], members: &[NodeId]) -> Result<Vec<NodeId>, String> 
     Ok(learners)
 }
 
+/// `host:port`, the host an IP address or a name, as it goes on the wire.
+fn address(addr: &str) -> Result<String, String> {
+    let host = addr.rsplit_once(':').map_or("", |(host, _)| host);
+    if host.is_empty() || port(addr).is_none() || addr.len() > usize::from(u8::MAX) {
+        return Err(format!("{addr}: not <host>:<port>, at most {} bytes", u8::MAX));
+    }
+    Ok(addr.to_owned())
+}
+
+/// `host:port`'s port.
+fn port(addr: &str) -> Option<u16> {
+    addr.rsplit_once(':')?.1.parse().ok()
+}
+
 /// `1=host:port,2=host:port,...`, sorted by ID.
-fn members(list: &str) -> Result<Vec<(NodeId, SocketAddr)>, String> {
+fn members(list: &str) -> Result<Vec<(NodeId, String)>, String> {
     let mut members = Vec::new();
     for member in list.split(',') {
         let (id, addr) = member.split_once('=').ok_or_else(|| format!("{member}: not <id>=<addr>"))?;
         let id: NodeId = id.parse().map_err(|_| format!("{member}: bad ID"))?;
-        let addr: SocketAddr = addr.parse().map_err(|_| format!("{member}: bad address"))?;
-        members.push((id, addr));
+        members.push((id, address(addr)?));
     }
     members.sort_unstable_by_key(|&(id, _)| id);
     if members.windows(2).any(|w| w[0].0 == w[1].0) || members.len() > raft::MAX_MEMBERS {
@@ -576,6 +607,30 @@ mod tests {
         assert!(tuned(&["--heartbeat", "1000"]).is_err(), "a heartbeat not under half the timeout");
         assert!(tuned(&["--election-timeout", "0"]).is_err());
         assert!(tuned(&["--keep-snapshots", "x"]).is_err());
+    }
+
+    /// Addresses may be host names, dialled as given; with one for this node, `--listen` says
+    /// where to bind, and without it the node is refused rather than bound somewhere it wasn't told.
+    #[test]
+    fn host_names_are_dialled_and_listen_binds() {
+        let args = |peer: &str, extra: &[&str]| {
+            let peers = format!("1={peer}:7001,2=node-2.svc:7001");
+            let base =
+                ["--id", "1", "--data", "d", "--peers", &peers, "--clients", "1=node-1.svc:7101,2=node-2.svc:7101"];
+            let admin = ["--admin", "1=10.0.0.1:7201,2=node-2.svc:7201"];
+            base.iter().chain(&admin).chain(extra).map(|&s| s.to_owned()).collect::<Vec<_>>()
+        };
+        let config = serve_config(&args("node-1.svc", &["--listen", "0.0.0.0"]), 7).unwrap();
+        assert_eq!(config.peer_addrs[1], (NodeId(2), "node-2.svc:7001".to_owned()));
+        assert_eq!(config.node.raft.members[1].client, "node-2.svc:7101");
+        let listening = [config.peer_listen.unwrap(), config.client_listen, config.admin_listen].map(|a| a.to_string());
+        assert_eq!(listening, ["0.0.0.0:7001", "0.0.0.0:7101", "0.0.0.0:7201"]);
+        assert!(serve_config(&args("node-1.svc", &[]), 7).unwrap_err().contains("--listen"));
+        assert!(serve_config(&args("node-1.svc", &["--listen", "node-1.svc"]), 7).is_err(), "--listen is an IP");
+        assert!(serve_config(&args("", &["--listen", "0.0.0.0"]), 7).is_err(), "no host");
+        assert!(serve_config(&args(&"a".repeat(256), &["--listen", "0.0.0.0"]), 7).is_err(), "too long for the wire");
+        let added = ["--member", "4=node-4.svc:7001,node-4.svc:7101,node-4.svc:7201"].map(str::to_owned);
+        assert_eq!(member_to_add(&added).unwrap().admin, "node-4.svc:7201");
     }
 
     /// `add-member` adds a voter, or with `--learner`, a learner.

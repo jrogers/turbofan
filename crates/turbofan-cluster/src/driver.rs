@@ -89,9 +89,12 @@ pub struct Config {
     /// Whether the log is synced: by default not, the other nodes' copies being the redundancy.
     /// The term and vote, and snapshots, are synced regardless.
     pub log_fsync: Fsync,
-    /// Peers' addresses, this node's included: it listens on its own, and dials the others as
-    /// well as the members.
-    pub peer_addrs: Vec<(NodeId, SocketAddr)>,
+    /// Peers' addresses, `host:port`, this node's included: it dials the others as well as the
+    /// members, looking a host name up again each time it dials, so a node may move.
+    pub peer_addrs: Vec<(NodeId, String)>,
+    /// Where it listens for peers: with none, its own of `peer_addrs`, which must then be an IP
+    /// address.
+    pub peer_listen: Option<SocketAddr>,
     /// Where it listens for clients.
     pub client_listen: SocketAddr,
     /// Where it listens for operators. Without TLS on it, keep it on a private interface.
@@ -127,7 +130,8 @@ impl Config {
             service_id,
             data_dir: data_dir.into(),
             log_fsync: Fsync::Never,
-            peer_addrs,
+            peer_addrs: peer_addrs.into_iter().map(|(id, addr)| (id, addr.to_string())).collect(),
+            peer_listen: None,
             client_listen,
             admin_listen,
             admin_token: None,
@@ -217,8 +221,10 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     let (node, storage, lock, clock) = open_node(&config, service)?;
     let snapshots = storage.snapshots.clone();
 
-    let own = config.peer_addrs.iter().find(|(m, _)| *m == id).map(|&(_, a)| a);
-    let own = own.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no peer address for this node"))?;
+    let own = config.peer_addrs.iter().find(|(m, _)| *m == id).and_then(|(_, a)| a.parse().ok());
+    let own = config.peer_listen.or(own).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "no peer address for this node, or a host name and no peer_listen")
+    })?;
     let (peer_listener, client_listener, admin_listener) = (
         TcpListener::bind(own).await?,
         TcpListener::bind(config.client_listen).await?,
@@ -249,7 +255,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     let operators = Gate { role: wire::Role::Admin, token, inputs: inputs.clone(), idle: None, ..clients.clone() };
     tasks.spawn(accept(client_listener, clients, next_conn.clone()));
     tasks.spawn(accept(admin_listener, operators, next_conn));
-    let contacts = config.peer_addrs.iter().map(|&(m, a)| (m, a.to_string())).collect();
+    let contacts = config.peer_addrs.clone();
     let mut core = Core {
         node,
         storage: Some(storage),
