@@ -28,6 +28,28 @@ started with the same lists: they're its first members, written into its log. Af
 says who the members are, and the lists only matter to a node joining (see [Members][membership]).
 `--learners 3` starts the cluster with node 3 as a learner, on every node.
 
+An address is `host:port`, the host an IP address or a name. A node looks a name up each time it
+dials it, so a node that moves keeps its place in the cluster as long as it keeps its name. A
+node binds its own addresses if they're IP addresses; if one is a name, `--listen <ip>` says which
+interface its three listeners bind, on their ports (`--listen 0.0.0.0` for all of them), and
+without it `serve` refuses to start rather than guess.
+
+On Kubernetes, that's a StatefulSet and a headless Service, each pod named by its ordinal and
+reached at `<pod>.<service>`:
+
+```sh
+my-service serve --id $((${HOSTNAME##*-} + 1)) --data /var/lib/my-service --listen 0.0.0.0 \
+    --peers   1=my-service-0.my-service:7001,2=my-service-1.my-service:7001,3=my-service-2.my-service:7001 \
+    --clients 1=my-service-0.my-service:7101,2=my-service-1.my-service:7101,3=my-service-2.my-service:7101 \
+    --admin   1=my-service-0.my-service:7201,2=my-service-1.my-service:7201,3=my-service-2.my-service:7201
+```
+
+Node IDs start at 1 and ordinals at 0, hence the `+ 1`. The data directory is the pod's
+persistent volume. Set `publishNotReadyAddresses: true` on the Service: the nodes must find each
+other before any is ready, or no leader is elected. Spread the pods over zones (a topology spread
+constraint) for the reason in [Durability](#durability). Scaling the StatefulSet doesn't change the
+members: add and remove them as [Members][membership] says.
+
 The service ID is the first argument to `run`. Every connection's hello carries it, and a node
 refuses a client, operator or peer of another service, so two clusters can't be confused for one.
 
