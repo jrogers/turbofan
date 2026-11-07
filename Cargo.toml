@@ -27,7 +27,7 @@ turbofan-cluster = { path = "crates/turbofan-cluster", version = "0.7.0" }
 # The SBE runtime the generated codecs call, and the generator their build.rs runs.
 turbofan-sbe = { path = "crates/turbofan-sbe", version = "0.7.0" }
 roxmltree = "0.21"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
 tempfile = "3"
 # Log record and snapshot checksums, in hardware where the CPU has it.
 crc32c = "0.6"

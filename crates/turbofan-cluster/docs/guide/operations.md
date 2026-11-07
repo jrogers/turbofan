@@ -122,8 +122,10 @@ them one at a time, so a majority is always up:
 
    Without `--to`, it goes to the member most caught up. The leader sends the target the rest of
    its log, then tells it to stand for election at once, so the cluster is without a leader for
-   a round trip rather than an election timeout. Stopping the leader without it works too, at the
-   cost of an election timeout (300 ms to 600 ms by default) with no leader.
+   a round trip rather than an election timeout. A leader stopped by SIGTERM (or Ctrl-C) does
+   this itself, to the member most caught up, before it exits, so `kill` or a process manager's
+   stop is enough. Only a leader killed outright (SIGKILL, a lost machine) costs an election
+   timeout (300 ms to 600 ms by default) with no leader.
 
 Clients carry on throughout: a `ClusterClient` follows the leader and resends what wasn't
 applied. A release that changes what the service does, or what the nodes send each other, takes

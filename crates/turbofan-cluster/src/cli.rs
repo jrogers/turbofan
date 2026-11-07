@@ -56,6 +56,9 @@
 //! then `serve` runs it as the one member of a new cluster, of a new epoch, which grows with
 //! `add-member`. What was applied after the snapshot is lost.
 //!
+//! `serve` stops on SIGTERM (as Kubernetes or systemd stops a process) or Ctrl-C, a leader first
+//! handing leadership over, as `transfer-leadership` does: see [`driver::serve_until`].
+//!
 //! `capture --admin <addr>` has that node copy its latest snapshot and its log from there to its
 //! commit index into `<data>/captures/` (see [`crate::capture`]): copy it off the node, then
 //! delete it there. `replay --capture <dir> [--to <n>]` replays one into this binary's service,
@@ -77,7 +80,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::driver::{self, serve};
+use crate::driver::{self, serve_until};
 
 use crate::node::{self, Effect, Service};
 use crate::raft::{self, Member, NodeId};
@@ -166,7 +169,9 @@ pub fn run_with<S: Service + 'static>(
                     "warning: {PEER_TOKEN} isn't set, so anyone who can reach the peer listener can act as a node"
                 );
             }
-            runtime()?.block_on(serve(config, service)).map_err(|e| format!("node stopped: {e}"))
+            let runtime = runtime()?;
+            let stop = runtime.block_on(async { terminated() }).map_err(|e| format!("signals: {e}"))?;
+            runtime.block_on(serve_until(config, service, stop)).map_err(|e| format!("node stopped: {e}"))
         }),
         Some("restore") => restore(&args[1..], service_id),
         Some("replay") => replay(&args[1..], service),
@@ -351,6 +356,23 @@ async fn wait_caught_up(admin: &Admin, id: NodeId, within: u64) -> Result<(), Ad
         println!("member {id} is {lag} entries behind");
         tokio::time::sleep(WAIT_POLL).await;
     }
+}
+
+/// Completes on SIGTERM, as Kubernetes or systemd stops a process, or Ctrl-C. Listening from the
+/// start, so neither kills the process outright later.
+fn terminated() -> std::io::Result<impl Future<Output = ()>> {
+    #[cfg(unix)]
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("stopping: handing leadership over if this node leads");
+    })
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {

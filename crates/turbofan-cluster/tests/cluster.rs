@@ -71,6 +71,48 @@ async fn an_isolated_leader_is_replaced_and_follows_once_healed() {
     assert!(caught_up, "the old leader caught up");
 }
 
+/// A leader told to stop hands leadership over first: another leads, and it returns, well within
+/// the election timeout the others would otherwise have waited out in silence. A long one (2 s),
+/// so that a slow machine's delays can't be taken for a handover, nor a handover for an election.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_told_to_stop_hands_over_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new(dir.path(), |_| None);
+    let mut stops = Vec::new();
+    let timeout = Duration::from_secs(2);
+    for i in 0..3 {
+        cluster.kill(i).await;
+        cluster.configs[i].node.raft.election_timeout = timeout;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        cluster.start_until(i, async move { drop(rx.await) });
+        stops.push(Some(tx));
+    }
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 50).await;
+    let admins: Vec<String> = cluster.configs.iter().map(|c| c.admin_listen.to_string()).collect();
+    let admin = |i: usize| Admin::new(admins[i].clone(), SERVICE_ID).with_token(TOKEN);
+    let old = usize::from(admin(0).status().await.unwrap().leader) - 1;
+
+    let started = std::time::Instant::now();
+    stops[old].take().unwrap().send(()).unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), cluster.nodes[old].take().unwrap()).await;
+    assert!(stopped.unwrap().unwrap().is_ok(), "stopped cleanly");
+    // Asked until it names a leader: one elected the slow way takes an election timeout.
+    let new = usize::from(admin((old + 1) % 3).status().await.unwrap().leader) - 1;
+    let took = started.elapsed();
+    assert_ne!(new, old, "another leads");
+    assert!(took < timeout / 2, "led again in {took:?}");
+    exchange(&mut cluster, &mut client, 51, 100).await;
+
+    // A follower told to stop just stops.
+    let follower = (0..3).find(|&i| i != old && i != new).unwrap();
+    stops[follower].take().unwrap().send(()).unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), cluster.nodes[follower].take().unwrap()).await;
+    assert!(stopped.unwrap().unwrap().is_ok());
+    assert_eq!(usize::from(admin(new).status().await.unwrap().leader) - 1, new, "the leader stays");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cluster_answers_every_message_once_through_failovers() {
     let dir = tempfile::tempdir().unwrap();

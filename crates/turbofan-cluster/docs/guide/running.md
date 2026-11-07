@@ -48,7 +48,9 @@ Node IDs start at 1 and ordinals at 0, hence the `+ 1`. The data directory is th
 persistent volume. Set `publishNotReadyAddresses: true` on the Service: the nodes must find each
 other before any is ready, or no leader is elected. Spread the pods over zones (a topology spread
 constraint) for the reason in [Durability](#durability). Scaling the StatefulSet doesn't change the
-members: add and remove them as [Members][membership] says.
+members: add and remove them as [Members][membership] says. A pod stopped in a rolling update gets
+SIGTERM, and a leader hands its leadership over before it exits (see [Operations][operations]),
+well within the default grace period.
 
 The service ID is the first argument to `run`. Every connection's hello carries it, and a node
 refuses a client, operator or peer of another service, so two clusters can't be confused for one.

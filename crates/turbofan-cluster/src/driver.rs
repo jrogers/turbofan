@@ -36,7 +36,7 @@ use crate::meta::MetaFile;
 use crate::metrics;
 use crate::node::{self, ConnId, Node, Service};
 use crate::pipeline::{self, Pipeline};
-use crate::raft::{Entries, MAX_READ_BYTES, Member, NodeId, Persist, SnapshotRead};
+use crate::raft::{Entries, MAX_READ_BYTES, Member, NodeId, Persist, Role, SnapshotRead};
 use crate::tls::{self, NodeTls};
 use crate::{snapshot, wire};
 
@@ -206,14 +206,32 @@ enum Input {
     SnapshotSaved(io::Result<crate::raft::Snapshot>),
 }
 
-/// Runs a node of `service` until the cluster is shut down (`Ok`), or an IO error stops it.
+/// Runs a node of `service` until the cluster is shut down (`Ok`), or an IO error stops it: as
+/// [`serve_until`], never told to stop.
+///
+/// # Errors
+///
+/// As [`serve_until`].
+pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Result<()> {
+    serve_until(config, service, std::future::pending()).await
+}
+
+/// Runs a node of `service` until the cluster is shut down or `stop` completes (`Ok`), or an IO
+/// error stops it. On `stop`, as a process manager's SIGTERM, say, a leader first hands
+/// leadership to the voter most caught up, and stops once it follows, or after an election
+/// timeout: the cluster is led again in a round trip, not after an election timeout of silence.
+/// A node that doesn't lead stops at once. Either way, once its write under way is done.
 ///
 /// # Errors
 ///
 /// If the data directory can't be opened (or another process has it), a listener can't bind,
 /// or the disk fails. A failed write or sync leaves the node's durable state unknown, so it
 /// stops; restart it, and it recovers from what's on disk.
-pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Result<()> {
+pub async fn serve_until<S: Service + 'static>(
+    config: Config,
+    service: S,
+    stop: impl Future<Output = ()>,
+) -> io::Result<()> {
     check_tokens(&config)?;
     let (tls, reloading) = tls::start(config.tls.clone())?;
     let peer_ids = tls.borrow().as_ref().is_some_and(|t| t.peer_ids);
@@ -277,7 +295,7 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
     };
     let peers = core.node.raft().peers();
     core.dial(&peers);
-    core.run(rx, client_rx).await
+    core.run(rx, client_rx, stop, config.node.raft.election_timeout).await
 }
 
 /// The node, and everything it sends through.
@@ -315,7 +333,18 @@ struct Core<S> {
 }
 
 impl<S: Service + 'static> Core<S> {
-    async fn run(mut self, mut rx: mpsc::Receiver<Input>, mut client_rx: mpsc::Receiver<Input>) -> io::Result<()> {
+    /// Runs the node until it stops, or `stop` completes and it has handed leadership over (or
+    /// `handover` has passed trying).
+    async fn run(
+        mut self,
+        mut rx: mpsc::Receiver<Input>,
+        mut client_rx: mpsc::Receiver<Input>,
+        stop: impl Future<Output = ()>,
+        handover: Duration,
+    ) -> io::Result<()> {
+        let mut stop = std::pin::pin!(stop);
+        // Told to stop, and by when it stops leading or stops regardless.
+        let mut leaving: Option<Instant> = None;
         loop {
             self.flush();
             if self.published.elapsed() >= METRICS_EVERY {
@@ -323,13 +352,20 @@ impl<S: Service + 'static> Core<S> {
                 self.node.metrics(self.clock.now()).publish();
             }
             let stopped = self.node.stopped();
-            if stopped && self.writing.is_none() {
+            let left = leaving.is_some_and(|by| self.node.raft().role() != Role::Leader || Instant::now() >= by);
+            if (stopped || left) && self.writing.is_none() {
                 tokio::time::sleep(STOP_GRACE).await;
                 return Ok(());
             }
             let take_inputs = !stopped && self.pipeline.takes_inputs();
             let wake = self.clock.instant(self.node.next_deadline());
+            let wake = leaving.map_or(wake, |by| wake.min(by));
             tokio::select! {
+                () = &mut stop, if leaving.is_none() => {
+                    // With no handover begun, nothing to wait for.
+                    let wait = if self.node.transfer_leadership() { handover } else { Duration::ZERO };
+                    leaving = Some(Instant::now() + wait);
+                }
                 written = async { self.writing.as_mut().expect("guarded").await }, if self.writing.is_some() => {
                     self.writing = None;
                     self.written(written.map_err(io::Error::other)?)?;

@@ -390,6 +390,13 @@ impl<S: Service> Node<S> {
         self.raft.stopped()
     }
 
+    /// As leader, hands leadership to the voter most caught up, as a node about to stop does: false
+    /// if it doesn't lead, or can't hand over now (no voter heard from lately, or a handover or
+    /// shutdown already under way).
+    pub fn transfer_leadership(&mut self) -> bool {
+        self.raft.transfer_leadership(None).is_some()
+    }
+
     /// Its Raft state.
     #[must_use]
     pub fn raft(&self) -> &Raft {

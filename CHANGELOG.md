@@ -14,6 +14,11 @@ a patch version (0.1.1) doesn't.
   `serve --listen <ip>` says which interface its listeners bind (`0.0.0.0` for all of them): a
   name isn't bound to an interface the operator didn't name. `driver::Config::peer_listen`
   does the same for a service calling `serve` itself.
+- `serve` stops on SIGTERM, as Kubernetes or systemd stops a process, or Ctrl-C, and a leader
+  first hands its leadership to the member most caught up, as `transfer-leadership` does: the
+  cluster is led again in a round trip, not after an election timeout. A leader killed by
+  SIGTERM was gone at once. `driver::serve_until` takes the future that stops it, for a service
+  calling it itself.
 
 ### Fixed
 

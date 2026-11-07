@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use turbofan_cluster::client::Event;
-use turbofan_cluster::driver::{self, serve};
+use turbofan_cluster::driver::{self, serve_until};
 use turbofan_cluster::raft::{self, NodeId};
 use turbofan_cluster::tls::NodeTls;
 use turbofan_cluster::{ClusterClient, Ctx, Service, SessionId, SnapshotWriter, node};
@@ -171,19 +171,25 @@ impl Cluster {
     }
 
     pub fn start(&mut self, i: usize) {
+        self.start_until(i, std::future::pending());
+    }
+
+    /// Starts node `i`, to stop when `stop` completes ([`driver::serve_until`]).
+    pub fn start_until(&mut self, i: usize, stop: impl Future<Output = ()> + Send + 'static) {
         let config = self.configs[i].clone();
         self.pauses[i].set(false);
         self.nodes[i] = Some(tokio::spawn(self.pauses[i].clone().hold(async move {
             // A killed node's blocking write may still hold the directory's lock for a moment.
+            let mut stop = Box::pin(stop);
             for _ in 0..100 {
-                match serve(config.clone(), Echo::default()).await {
+                match serve_until(config.clone(), Echo::default(), &mut stop).await {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         tokio::time::sleep(Duration::from_millis(20)).await
                     }
                     other => return other,
                 }
             }
-            serve(config, Echo::default()).await
+            serve_until(config, Echo::default(), stop).await
         })));
     }
 
