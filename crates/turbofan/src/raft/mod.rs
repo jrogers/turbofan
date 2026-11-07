@@ -36,6 +36,10 @@
 //! leader knows the lowest among the members ([`Raft::lowest_versions`]), and doesn't add a
 //! member below those the cluster requires ([`Raft::require`]).
 //!
+//! **Reads** ([`Raft::read_index`]): a leader confirms a read without logging it, by a quorum's
+//! acks to a round of appends started after it came in, and hands it back with the commit index
+//! its answer must reflect (ReadIndex, `reads.rs`).
+//!
 //! **Stopping** ([`Raft::stop`]): a leader shutting the cluster down sends its peers `Stop` with
 //! its heartbeats for a couple of them, then stops; a follower stops on `Stop` once it has the
 //! snapshot it names durable. Nothing in the log stops a node, so a restart never stops again.
@@ -76,10 +80,12 @@ use crate::wire;
 mod election;
 mod entries;
 mod membership;
+mod reads;
 mod replication;
 mod snapshots;
 
 pub use entries::Entries;
+pub use reads::{MAX_WAITING_READS, ReadIndex};
 
 /// A cluster member's ID, from 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -323,6 +329,11 @@ pub struct Outputs {
     /// As leader, how long each of its entries took from proposed to each [`Stage`] it reached
     /// in this batch, in nanoseconds.
     pub latencies: Vec<(Stage, u64)>,
+    /// As leader, reads ([`Raft::read_index`]) confirmed: answer each once the state has applied
+    /// up to its index.
+    pub confirmed_reads: Vec<ReadIndex>,
+    /// Reads dropped, as this node stopped leading: ask the new leader.
+    pub dropped_reads: Vec<u64>,
 }
 
 /// A stage a leader's own entry reaches, timed from when it was proposed: see
@@ -367,6 +378,8 @@ struct Peer {
     probe: Option<u64>,
     /// The probe went without its records, on disk only: it goes again once they're read.
     probe_read: bool,
+    /// The latest read round it echoed, in this term ([`Raft::read_index`]).
+    read_round: u64,
 }
 
 /// A leadership transfer under way.
@@ -468,6 +481,8 @@ pub struct Raft {
     incoming_sum: u64,
     /// A snapshot from the leader replaced the state since [`Raft::take_installed`].
     installed: bool,
+    /// As leader, the reads waiting to be confirmed.
+    reads: reads::Reads,
 }
 
 impl Raft {
@@ -545,6 +560,7 @@ impl Raft {
             incoming: None,
             incoming_sum: crate::codec::CHECKSUM_START,
             installed: false,
+            reads: reads::Reads::default(),
         };
         raft.durable = raft.last_index();
         raft.rebuild_peers();
@@ -795,6 +811,8 @@ impl Raft {
     /// What to persist and send. A leader replicates anything new here, once per batch.
     pub fn take_outputs(&mut self) -> Outputs {
         if self.role == Role::Leader {
+            // First, so the appends below carry a round it starts.
+            self.confirm_reads();
             for i in 0..self.peers.len() {
                 // A peer behind the snapshot moves on by its snapshot acks and heartbeats. Each
                 // append moves `next` on, to `matched + MAX_IN_FLIGHT` at most, so that bounds the
@@ -854,6 +872,7 @@ impl Peer {
             versions: None,
             probe: None,
             probe_read: false,
+            read_round: 0,
         }
     }
 }

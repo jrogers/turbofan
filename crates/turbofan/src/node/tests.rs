@@ -383,6 +383,7 @@ fn a_follower_redirects_clients_to_the_leader() {
         count: 0,
         entries: &[],
         last_index: 0,
+        read_round: 0,
     };
     codec::encode_frame(&append, &mut frame).unwrap();
     node.on_peer(NodeId(1), &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
@@ -411,6 +412,7 @@ fn sends_queued_across_a_change_of_leader_go() {
         count: 0,
         entries: &[],
         last_index: 0,
+        read_round: 0,
     };
     codec::encode_frame(&append, &mut frame).unwrap();
     node.on_peer(NodeId(2), &codec::decode_frame(&frame).unwrap().unwrap().0, 2);
@@ -450,6 +452,7 @@ fn a_connection_opening_a_session_is_redirected_when_the_leader_steps_down() {
         count: 0,
         entries: &[],
         last_index: 0,
+        read_round: 0,
     };
     codec::encode_frame(&append, &mut frame).unwrap();
     node.on_peer(NodeId(2), &codec::decode_frame(&frame).unwrap().unwrap().0, 2);

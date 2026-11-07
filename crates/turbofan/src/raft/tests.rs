@@ -73,12 +73,13 @@ fn flush(raft: &mut Raft) -> Vec<(NodeId, Vec<u8>)> {
     out.appends
 }
 
-/// Delivers `sends` from `from`, and everything they cause, between the nodes in `up`.
-fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Vec<u8>)>, now: u64) {
+/// Delivers `sends` from `from`, and everything they cause, between the nodes in `up`. Returns
+/// the reads they confirmed, and dropped, on the way.
+fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Vec<u8>)>, now: u64) -> Reads {
     /// Far more than any exchange here takes: past it, messages go back and forth for ever.
     const MAX_DELIVERED: usize = 100_000;
     let mut queue: Vec<_> = sends.into_iter().map(|(to, frame)| (NodeId(from), to, frame)).collect();
-    let mut delivered = 0;
+    let (mut delivered, mut reads) = (0, Reads::default());
     while let Some((from, to, frame)) = queue.pop() {
         delivered += 1;
         assert!(delivered <= MAX_DELIVERED, "messages going back and forth for ever: {} queued", queue.len());
@@ -87,8 +88,21 @@ fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Vec<u8>)
         }
         let raft = &mut rafts[usize::from(to) - 1];
         raft.on_message(from, &decode(&frame), now);
-        queue.extend(flush(raft).into_iter().map(|(next, frame)| (to, next, frame)));
+        let mut out = raft.take_outputs();
+        reads.confirmed.append(&mut out.confirmed_reads);
+        reads.dropped.append(&mut out.dropped_reads);
+        raft.on_persisted(raft.log_end(), raft.now);
+        out.appends.append(&mut out.sends);
+        queue.extend(out.appends.into_iter().map(|(next, frame)| (to, next, frame)));
     }
+    reads
+}
+
+/// Reads confirmed and dropped, by [`deliver`].
+#[derive(Debug, Default)]
+struct Reads {
+    confirmed: Vec<ReadIndex>,
+    dropped: Vec<u64>,
 }
 
 /// Times `id` out from `now` and runs its election among `up`, retrying as a real node
@@ -285,6 +299,7 @@ fn a_node_in_doubt_trusts_its_log_only_from_a_later_term() {
             count,
             entries: records,
             last_index,
+            read_round: 0,
         };
         let mut frame = Vec::new();
         codec::encode_frame(&append, &mut frame).unwrap();
@@ -433,6 +448,7 @@ fn a_follower_acks_and_commits_only_what_matches_the_leader() {
         count: 0,
         entries: &[],
         last_index: 3,
+        read_round: 0,
     };
     codec::encode_frame(&append, &mut frame).unwrap();
     raft.on_message(NodeId(2), &decode(&frame), 0);
@@ -462,6 +478,7 @@ fn an_earlier_batch_durable_does_not_count_entries_that_replaced_its_own() {
             count,
             entries: &bytes,
             last_index: 0,
+            read_round: 0,
         };
         let mut frame = Vec::new();
         codec::encode_frame(&append, &mut frame).unwrap();
@@ -497,6 +514,7 @@ fn an_append_with_terms_out_of_order_is_ignored() {
             count,
             entries: &bytes,
             last_index: 0,
+            read_round: 0,
         };
         let mut frame = Vec::new();
         codec::encode_frame(&append, &mut frame).unwrap();
@@ -542,8 +560,17 @@ fn a_reordered_older_append_does_not_take_the_commit_back() {
     let mut send = |prev_index: u64, commit: u64, entries: &[u8]| {
         let count = u32::try_from(codec::records(entries).count()).unwrap();
         let prev_term = u64::from(prev_index > 0);
-        let append =
-            wire::AppendEntries { term: 1, leader: 1, prev_index, prev_term, commit, count, entries, last_index: 0 };
+        let append = wire::AppendEntries {
+            term: 1,
+            leader: 1,
+            prev_index,
+            prev_term,
+            commit,
+            count,
+            entries,
+            last_index: 0,
+            read_round: 0,
+        };
         let mut frame = Vec::new();
         codec::encode_frame(&append, &mut frame).unwrap();
         raft.on_message(NodeId(1), &decode(&frame), 0);
@@ -1144,6 +1171,7 @@ fn a_truncated_members_entry_is_undone() {
         count: 2,
         entries: &entries,
         last_index: 2,
+        read_round: 0,
     };
     let mut frame = Vec::new();
     codec::encode_frame(&append, &mut frame).unwrap();
@@ -1181,6 +1209,7 @@ fn a_stop_is_forgotten_in_a_later_term() {
         count: 0,
         entries: &[],
         last_index: 0,
+        read_round: 0,
     };
     send(&mut raft, 2, &|f| codec::encode_frame(&heartbeat(1), f).unwrap());
     send(&mut raft, 2, &|f| codec::encode_frame(&wire::Stop { term: 1, index: 100 }, f).unwrap());
@@ -1346,4 +1375,126 @@ fn appends_are_pipelined() {
     }
     let to_2 = flush(&mut rafts[0]).into_iter().filter(|&(to, _)| to == NodeId(2)).count();
     assert_eq!(to_2, 3, "three appends at once");
+}
+
+/// A three-node cluster led by node 1, with an entry of its term committed everywhere.
+fn led_and_committed(now: u64) -> Vec<Raft> {
+    let mut rafts = cluster(3);
+    elect(&mut rafts, &[1, 2, 3], 1, now);
+    rafts[0].propose(b"new term");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, now);
+    assert_eq!(rafts[0].commit_index(), 1);
+    rafts
+}
+
+/// The read round each append carries, by whom it's to.
+fn read_rounds(sends: &[(NodeId, Vec<u8>)]) -> Vec<(NodeId, u64)> {
+    let round = |frame| match decode(frame) {
+        wire::Decoded::AppendEntries(m) => m.read_round(),
+        _ => None,
+    };
+    sends.iter().filter_map(|(to, frame)| Some((*to, round(frame)?))).collect()
+}
+
+/// A lone voter confirms a read itself, but not before an entry of its own term commits: until
+/// then its commit index may lack what an earlier leader committed.
+#[test]
+fn a_lone_voter_confirms_a_read_once_its_term_has_committed() {
+    let mut raft = Raft::new(config(1, &[1]), Meta::default(), None, Entries::default(), 0);
+    raft.on_tick(raft.next_deadline());
+    raft.take_outputs();
+    assert!(raft.read_index(7));
+    assert_eq!(raft.take_outputs().confirmed_reads, [], "nothing of its term committed");
+    raft.propose(b"new term");
+    raft.on_persisted(raft.log_end(), raft.now);
+    assert_eq!(raft.take_outputs().confirmed_reads, [ReadIndex { id: 7, index: 1 }]);
+}
+
+/// A leader starts a round for a read, which its appends carry, and a quorum's acks to it
+/// (the leader's own among them) confirm the read at the commit index.
+#[test]
+fn a_read_is_confirmed_by_a_quorums_acks_to_its_round() {
+    let now = 1000 * MS;
+    let mut rafts = led_and_committed(now);
+    assert!(rafts[0].read_index(1));
+    let sends = flush(&mut rafts[0]);
+    assert_eq!(read_rounds(&sends), [(NodeId(2), 1), (NodeId(3), 1)]);
+    let reads = deliver(&mut rafts, &[1, 2], 1, sends, now);
+    assert_eq!(reads.confirmed, [ReadIndex { id: 1, index: 1 }], "node 2 and the leader, two of three");
+}
+
+/// A read that comes in while a round is in flight waits for the next: that round may have
+/// started before it. The next starts once the one in flight is confirmed.
+#[test]
+fn a_read_waits_for_the_round_after_the_one_in_flight() {
+    let now = 1000 * MS;
+    let mut rafts = led_and_committed(now);
+    rafts[0].read_index(1);
+    let first = flush(&mut rafts[0]);
+    rafts[0].read_index(2);
+    assert_eq!(read_rounds(&flush(&mut rafts[0])), [], "no round while one is in flight");
+    for (to, append) in first {
+        let follower = &mut rafts[usize::from(to) - 1];
+        follower.on_message(NodeId(1), &decode(&append), now);
+        for (_, ack) in flush(follower) {
+            rafts[0].on_message(to, &decode(&ack), now);
+        }
+    }
+    let out = rafts[0].take_outputs();
+    assert_eq!(out.confirmed_reads, [ReadIndex { id: 1, index: 1 }], "the second isn't, by the first round");
+    assert_eq!(read_rounds(&out.appends), [(NodeId(2), 2), (NodeId(3), 2)], "the next round, at once");
+    let reads = deliver(&mut rafts, &[1, 2, 3], 1, out.appends, now);
+    assert_eq!(reads.confirmed, [ReadIndex { id: 2, index: 1 }]);
+}
+
+/// A leader cut off while the others elect another can't confirm a read: a majority refuses
+/// its round's term. It learns of the new term and drops the read, for the client to ask again.
+#[test]
+fn a_deposed_leader_confirms_no_read_and_drops_it() {
+    let now = 1000 * MS;
+    let mut rafts = led_and_committed(now);
+    elect(&mut rafts, &[2, 3], 2, 2 * now);
+    assert_eq!(rafts[0].role(), Role::Leader, "it hasn't heard");
+    assert!(rafts[0].read_index(9));
+    let sends = flush(&mut rafts[0]);
+    let reads = deliver(&mut rafts, &[1, 2, 3], 1, sends, 2 * now);
+    assert_eq!(reads.confirmed, []);
+    assert_eq!(reads.dropped, [9]);
+    assert_eq!(rafts[0].role(), Role::Follower);
+}
+
+/// A peer's echo of a round the leader hasn't started counts for no more than its latest: it
+/// can't confirm, in advance, a read yet to come.
+#[test]
+fn an_echo_of_a_round_not_started_confirms_no_later_read() {
+    let now = 1000 * MS;
+    let mut rafts = led_and_committed(now);
+    let ack = wire::AppendAck {
+        term: rafts[0].term(),
+        success: 1,
+        index: 1,
+        snapshot_index: 0,
+        protocol: 0,
+        service_version: 0,
+        prev_index: 1,
+        read_round: 5,
+    };
+    let mut frame = Vec::new();
+    codec::encode_frame(&ack, &mut frame).unwrap();
+    rafts[0].on_message(NodeId(2), &decode(&frame), now);
+    rafts[0].read_index(1);
+    assert_eq!(rafts[0].take_outputs().confirmed_reads, [], "its round 1 not yet acked");
+}
+
+/// Only a leader takes reads, and only so many at once.
+#[test]
+fn reads_are_a_leaders_and_bounded() {
+    let now = 1000 * MS;
+    let mut rafts = led_and_committed(now);
+    assert!(!rafts[1].read_index(1), "a follower");
+    for id in 0..crate::widen(MAX_WAITING_READS) {
+        assert!(rafts[0].read_index(id));
+    }
+    assert!(!rafts[0].read_index(0), "past MAX_WAITING_READS");
 }

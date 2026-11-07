@@ -139,6 +139,7 @@ impl Raft {
             self.unpersisted.clear();
             self.unapplied.clear();
             self.uncommitted_bytes = 0;
+            self.drop_reads();
         }
         self.role = Role::Follower;
         self.votes.clear();

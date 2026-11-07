@@ -50,7 +50,7 @@ impl Raft {
 
     pub(super) fn on_append_entries(&mut self, from: NodeId, m: &wire::AppendEntriesRef<'_>, now: u64) {
         if m.term() < self.meta.term {
-            self.ack(from, false, self.last_index() + 1, m.prev_index());
+            self.ack(from, false, self.last_index() + 1, m.prev_index(), 0);
             return;
         }
         if m.term() > self.meta.term || self.role != Role::Follower {
@@ -61,13 +61,15 @@ impl Raft {
         self.reset_election(now);
 
         let prev = m.prev_index();
+        // An append of this term, refused or not: the leader is still this node's.
+        let round = m.read_round().unwrap_or(0);
         if prev > self.last_index() {
-            self.ack(from, false, self.last_index() + 1, prev);
+            self.ack(from, false, self.last_index() + 1, prev, round);
             return;
         }
         if prev >= self.log.first - 1 && self.term_at(prev) != Some(m.prev_term()) {
             let hint = self.first_index_of_term_at(prev).max(self.commit + 1);
-            self.ack(from, false, hint, prev);
+            self.ack(from, false, hint, prev, round);
             return;
         }
         let Some(matched) = self.accept_records(m) else { return };
@@ -75,7 +77,7 @@ impl Raft {
         // restarted, arriving late, says less than this node acknowledged before it did.
         // A reordered, older append can match less than is already known committed.
         self.commit = self.commit.max(m.commit().min(matched));
-        self.ack(from, true, matched, prev);
+        self.ack(from, true, matched, prev, round);
     }
 
     /// Appends `m`'s records where they're new, truncating a conflicting suffix first. Returns
@@ -124,6 +126,8 @@ impl Raft {
         p.heard_at = now;
         p.snapshot_index = p.snapshot_index.max(m.snapshot_index());
         p.versions = Some((m.protocol(), m.service_version()));
+        // No further than the rounds started: a peer can't echo one it wasn't sent.
+        p.read_round = p.read_round.max(m.read_round().unwrap_or(0).min(self.reads.round));
         let id = p.id;
         if self.catching_up.as_ref().is_some_and(|c| c.member.id == id) && self.held_back(peer) {
             // Too old to run what the cluster does: it isn't added, nor sent the log.
@@ -196,6 +200,7 @@ impl Raft {
                     count: 0,
                     entries: &[],
                     last_index: self.last_index(),
+                    read_round: self.reads.round,
                 };
                 self.send_append_frame(id, &heartbeat);
             }
@@ -237,6 +242,7 @@ impl Raft {
             count,
             entries: &bytes,
             last_index: self.last_index(),
+            read_round: self.reads.round,
         };
         self.send_append_frame(id, &append);
         let p = &mut self.peers[peer];
@@ -313,7 +319,8 @@ impl Raft {
         self.out.persist.push(Persist::TruncateFrom(index));
     }
 
-    pub(super) fn ack(&mut self, to: NodeId, success: bool, index: u64, prev_index: u64) {
+    /// Answers an append (or a snapshot, `read_round` 0), echoing its round.
+    pub(super) fn ack(&mut self, to: NodeId, success: bool, index: u64, prev_index: u64, read_round: u64) {
         let ack = wire::AppendAck {
             term: self.meta.term,
             success: u8::from(success),
@@ -322,6 +329,7 @@ impl Raft {
             protocol: self.advertised.0,
             service_version: self.advertised.1,
             prev_index,
+            read_round,
         };
         self.send(to, &ack);
     }
