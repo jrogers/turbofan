@@ -35,8 +35,9 @@ before writing code.
 - `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan/fuzz`,
   outside the workspace; nightly and cargo-fuzz). `check.sh` only checks it builds.
 - Releasing: both crates share the workspace version. Bump it (and `cargo update -w` both lock files, the
-  fuzz crate's too), date its `CHANGELOG.md` section, write its golden files (`GOLDEN_WRITE=1 cargo
-  test -p turbofan --test golden`, checked in under `tests/golden/<version>/`),
+  fuzz crate's too), date its `CHANGELOG.md` section, set the docs' dependency lines to it (`git grep
+  '= "0\.' -- '*.md'`), write its golden files (`GOLDEN_WRITE=1 cargo test -p turbofan --test
+  golden`, checked in under `tests/golden/<version>/`),
   `cargo publish --workspace` (the user runs it: their token), then `scripts/github-release.sh <version>`
   tags `v<version>` and makes the GitHub release from that section. Pushing the tag also
   deploys the website (`.github/workflows/site.yml`), built from the tag's docs.
