@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "turbofan"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "crc32c",
  "metrics",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "turbofan-sbe"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "roxmltree",
 ]
