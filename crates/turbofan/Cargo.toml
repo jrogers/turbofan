@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-readme = "README.md"
+readme = "../../README.md"
 keywords = ["raft", "replication", "consensus", "state-machine", "distributed"]
 categories = ["network-programming", "database-implementations", "asynchronous"]
 # The fuzz targets build only with cargo fuzz, outside the workspace.

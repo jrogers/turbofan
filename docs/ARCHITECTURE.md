@@ -1,6 +1,6 @@
 # Architecture
 
-An overview of how Turbofan fits together, for working on it. Each crate's README says how to use
+An overview of how Turbofan fits together, for working on it. The README (and `turbofan-sbe`'s) says how to use
 it, [WIRE.md](WIRE.md) how the wire protocol may change, and
 [STYLE.md](STYLE.md) the house style. Paths are in
 `crates/turbofan` unless they name another crate.
