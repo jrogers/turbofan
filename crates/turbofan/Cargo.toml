@@ -37,6 +37,9 @@ turbofan-sbe.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+# Itself with the cluster in memory, which the benchmark runs the core alone on. A path
+# without a version, so `cargo publish` leaves it out.
+turbofan = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 
 [lints]

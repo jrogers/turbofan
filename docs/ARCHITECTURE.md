@@ -324,7 +324,7 @@ later term.
 | A real cluster | `tests/cluster.rs` | Mistakes in the driver: three nodes over TCP and files, killed and restarted, joining and leaving, with tokens; and over TLS, refusing who has no certificate or the wrong one. |
 | Fuzzing | `fuzz/` (`scripts/fuzz.sh`) | Panics on what the network sends: frames and records (`decode`), and any sequence of client and admin steps against a node (`client`). |
 | Codecs | `turbofan-sbe/tests/sbe.rs` | Generated code that differs from what's checked in, or from real-logic's SBE codecs' bytes. |
-| Benchmark | `benches/cluster.rs` | Throughput, and latency to p99.9, of three nodes over TCP and synced files; CI puts each run's in its summary. |
+| Benchmark | `benches/cluster.rs` | Throughput, and latency to p99.9, of three nodes over TCP and synced files, and of the core alone in memory; CI puts each run's in its summary. |
 
 `scripts/check.sh` runs fmt, clippy (the fuzz crate's too), the tests (16 simulation seeds),
 rustdoc and `cargo deny`. CI runs the same on every push, less the fuzz build and the

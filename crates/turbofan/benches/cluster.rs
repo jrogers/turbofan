@@ -16,6 +16,12 @@
 //!
 //! With `--features tls`, all the runs again on a cluster over TLS, everywhere: peers, clients.
 //!
+//! First, though, the messages' two runs on the core alone: the cluster in memory
+//! ([`turbofan::testing`]), its nodes and clients on one thread, no sockets or files, its network
+//! and writes taking none of its time, timed by the wall's clock. That's what openraft's benchmark
+//! measures, so it's the number to set beside theirs, and its gap to the runs over TCP is the
+//! driver's cost.
+//!
 //! `BENCH_RESULTS=<file>` writes each run's msgs/s there, and `BENCH_BASELINE=<file>`, such a file
 //! from an earlier run, adds a column comparing them, flagging a run below
 //! [`REGRESSION_PERCENT`] of it, and a GitHub `::warning` line after the table for each. CI keeps
@@ -36,6 +42,7 @@ use std::time::{Duration, Instant};
 use turbofan::client::{Event, MAX_UNACKED};
 use turbofan::driver::{self, serve};
 use turbofan::raft::{self, NodeId};
+use turbofan::testing::{self, ClientId};
 use turbofan::tls::{ClientTls, NodeTls};
 use turbofan::{ClusterClient, Ctx, Service, SessionId, SnapshotWriter, node};
 
@@ -140,6 +147,24 @@ async fn main() {
     let (mut results, mut warnings, mut stage_rows) = (String::new(), Vec::new(), Vec::new());
     let stages = Stages::default();
     metrics::set_global_recorder(stages.clone()).unwrap();
+    let mut report = |(name, msgs, row, stage_row, reattached): (String, u64, String, Option<String>, usize)| {
+        stage_rows.extend(stage_row);
+        if reattached > 0 {
+            warnings.push(format!(
+                "::warning title=Benchmark failover::{name}: clients reattached {reattached} times, after a leader \
+                 change or a dropped connection"
+            ));
+        }
+        results.push_str(&format!("{name}\t{msgs}\n"));
+        println!("{row}{}", compared(&name, msgs, baseline.as_deref(), &mut warnings));
+    };
+    // Before the clusters over TCP, which go on heartbeating once they're done with.
+    for (name, clients, window) in [("latency, in memory", 1, 1), ("throughput, in memory", shape.0, shape.1)] {
+        let mut latencies = in_memory(clients, window, secs);
+        latencies.sort_unstable();
+        let (msgs, row) = table_row(name, clients, window, &latencies, secs);
+        report((name.to_owned(), msgs, row, None, 0));
+    }
     let dir = tempfile::tempdir().unwrap();
     for tls in [false, true] {
         if tls && !cfg!(feature = "tls") {
@@ -150,18 +175,8 @@ async fn main() {
             let (addrs, tls) = start(&dir, tls, fsync);
             // Once a client has a session, there's a leader.
             drop(connect(&addrs, tls.as_ref()).await);
-            for (name, msgs, row, stage_row, reattached) in
-                bench(&addrs, tls.as_ref(), fsync, secs, shape, &stages).await
-            {
-                stage_rows.extend(stage_row);
-                if reattached > 0 {
-                    warnings.push(format!(
-                        "::warning title=Benchmark failover::{name}: clients reattached {reattached} times, after a \
-                         leader change or a dropped connection"
-                    ));
-                }
-                results.push_str(&format!("{name}\t{msgs}\n"));
-                println!("{row}{}", compared(&name, msgs, baseline.as_deref(), &mut warnings));
+            for run in bench(&addrs, tls.as_ref(), fsync, secs, shape, &stages).await {
+                report(run);
             }
         }
     }
@@ -223,16 +238,8 @@ async fn bench(
     for (name, clients, window) in [("latency", 1, 1), ("throughput", shape.0, shape.1)] {
         let (mut latencies, by_stage, reattached) = run(addrs, tls, clients, window, secs, stages).await;
         latencies.sort_unstable();
-        let at = |q: usize| per_mille(&latencies, q);
-        let msgs = latencies.len() as u64 / secs;
         let failover = if reattached > 0 { format!(" ⚠️ {reattached} reattached") } else { String::new() };
-        let row = format!(
-            "| {name}{over}{failover} | {clients} × {window} | {msgs} | {} | {} | {} | {} |",
-            at(500),
-            at(990),
-            at(999),
-            at(1000),
-        );
+        let (msgs, row) = table_row(&format!("{name}{over}{failover}"), clients, window, &latencies, secs);
         let both = |sorted: &[u64]| format!("{} / {}", per_mille(sorted, 500), per_mille(sorted, 990));
         let [persisted, committed, applied] = by_stage.each_ref().map(|s| both(s));
         let stage_row = format!("| {name}{over} | {persisted} | {committed} | {applied} | {} |", both(&latencies));
@@ -242,19 +249,64 @@ async fn bench(
         for (name, clients, window) in [("query latency", 1, 1), ("query throughput", shape.0, shape.1)] {
             let mut latencies = run_queries(addrs, tls, clients, window, secs).await;
             latencies.sort_unstable();
-            let at = |q: usize| per_mille(&latencies, q);
-            let msgs = latencies.len() as u64 / secs;
-            let row = format!(
-                "| {name}{over} | {clients} × {window} | {msgs} | {} | {} | {} | {} |",
-                at(500),
-                at(990),
-                at(999),
-                at(1000),
-            );
+            let (msgs, row) = table_row(&format!("{name}{over}"), clients, window, &latencies, secs);
             rows.push((format!("{name}{over}"), msgs, row, None, 0));
         }
     }
     rows
+}
+
+/// A run's msgs/s, and its row of the table, from its latencies over `secs`, `sorted`.
+fn table_row(name: &str, clients: usize, window: usize, sorted: &[u64], secs: u64) -> (u64, String) {
+    let msgs = sorted.len() as u64 / secs;
+    let at = |q: usize| per_mille(sorted, q);
+    let row =
+        format!("| {name} | {clients} × {window} | {msgs} | {} | {} | {} | {} |", at(500), at(990), at(999), at(1000));
+    (msgs, row)
+}
+
+/// The core alone: three nodes in memory, `clients` sessions each keeping `window` messages in
+/// flight as [`keep_sending`] does, the cluster run between their batches as fast as one thread
+/// runs it, for a warm-up second then `secs` of the wall's time. Its network and writes take none
+/// of the cluster's time, which so never moves: no timer fires, and no session times out. The
+/// latency of each message sent after the warm-up, by the wall's clock.
+fn in_memory(clients: usize, window: usize, secs: u64) -> Vec<u64> {
+    let mut cluster = testing::Builder::new(3)
+        .network_latency(Duration::ZERO)
+        .write_latency(Duration::ZERO)
+        // Every response a client can have in flight, kept for it, as over TCP.
+        .configure(|node| node.egress_ring_entries = MAX_UNACKED)
+        .build(|_| Ack);
+    let ids: Vec<ClientId> = (0..clients).map(|_| cluster.connect(Vec::new()).unwrap()).collect();
+    let opened = cluster.run_until(Duration::from_secs(10), |c| ids.iter().all(|&id| c.session(id).is_some()));
+    assert!(opened, "every client has a session");
+    let payload = vec![7; PAYLOAD_BYTES];
+    let mut in_flight = Vec::new();
+    for &id in &ids {
+        cluster.events(id);
+        cluster.send_batch(id, std::iter::repeat_n(payload.clone(), window)).unwrap();
+        in_flight.push(std::iter::repeat_n(Instant::now(), window).collect::<VecDeque<_>>());
+    }
+    let warm = Instant::now() + Duration::from_secs(1);
+    let end = warm + Duration::from_secs(secs);
+    let mut latencies = Vec::new();
+    while Instant::now() < end {
+        cluster.run_for(Duration::ZERO);
+        for (&id, sent) in ids.iter().zip(&mut in_flight) {
+            let (now, mut answered) = (Instant::now(), 0);
+            for event in cluster.events(id) {
+                let Event::Message(_) = event else { panic!("unexpected {event:?}") };
+                let at = sent.pop_front().unwrap();
+                if at >= warm {
+                    latencies.push(u64::try_from((now - at).as_nanos()).unwrap());
+                }
+                answered += 1;
+            }
+            sent.extend(std::iter::repeat_n(Instant::now(), answered));
+            cluster.send_batch(id, std::iter::repeat_n(payload.clone(), answered)).unwrap();
+        }
+    }
+    latencies
 }
 
 /// `clients` sessions, each keeping `window` queries in flight, for a warm-up second then `secs`:

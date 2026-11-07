@@ -670,6 +670,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "turbofan",
  "turbofan-sbe",
 ]
 

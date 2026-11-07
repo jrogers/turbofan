@@ -61,6 +61,14 @@ log. A second table splits the messages' time between persisted, committed and a
 `BENCH_SECS` sets how long each run measures (10 s by default), and
 `BENCH_THROUGHPUT=<clients>x<in flight>` the throughput run's shape (`8x256` by default).
 
+First come the messages' two runs on the core alone, `in memory`: the cluster a service's tests
+use (`turbofan::testing`), its nodes and clients on one thread, no sockets or files, its network
+and writes taking none of its time, timed by the wall's clock. That's what openraft's benchmark
+measures, and the gap to the runs over TCP is what the driver costs: the system calls, the
+loopback and the tasks' wake-ups. The in-memory cluster hands its nodes each input on its own,
+where the driver hands them a batch, so it's measured with the same clients sending batches, not
+with many clients sending one each.
+
 Three nodes on one machine share its disk and CPUs, and talk over loopback, so the numbers are
 for comparing changes and configurations, not a promise for a real cluster: measure your own.
 CI runs it on every push, and its summary has each run's table.
@@ -91,6 +99,13 @@ buffered as plain TCP's are. With fsync, the disk is what limits it: on macOS a 
 throughput with fsync is still over 100,000 a second: each sync covers every message that arrived
 during the one before. A Linux server's NVMe drive, with power-loss protection, syncs much faster;
 measure yours.
+
+The core alone, on an Apple M3 (8 cores, 16 GB, macOS 27.2, Rust 1.99.0, November 2026), the
+median of three runs of 10 s: 304,763 messages a second one at a time, a commit through all three
+nodes in 3 µs at p50, and 369,868 a second at 8 × 256, on its one thread (openraft's benchmark,
+on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without fsync,
+nearly all of a message's 65 µs on its own over TCP is the driver's and the loopback's, not the
+core's.
 
 [clients]: clients.md
 [operations]: operations.md
