@@ -102,7 +102,7 @@ fn a_failover_loses_nothing_and_applies_nothing_twice() {
     cluster.run_for(MS / 4);
     let old = cluster.leader().unwrap();
     cluster.crash(old);
-    assert!(cluster.node(old).is_none());
+    assert!(cluster.metrics(old).is_none());
     assert!(cluster.run_until(Duration::from_secs(2), |c| c.leader().is_some_and(|l| l != old)));
     cluster.send_batch(alice, numbered(10, 20)).unwrap();
     assert!(cluster.run_until(Duration::from_secs(2), |c| c.client(alice).unacked() == 0));
@@ -131,7 +131,7 @@ fn nodes_behind_catch_up_from_snapshots() {
     cluster.send_batch(alice, numbered(0, 25)).unwrap();
     assert!(cluster.run_until(Duration::from_secs(1), |c| applied_everywhere(c, 25)));
     cluster.run_for(10 * MS);
-    assert!(cluster.node(crashed).unwrap().raft().snapshot_index() > 0, "it snapshotted");
+    assert!(cluster.metrics(crashed).unwrap().snapshot_index > 0, "it snapshotted");
 
     cluster.crash(crashed);
     cluster.restart(crashed);
@@ -141,11 +141,11 @@ fn nodes_behind_catch_up_from_snapshots() {
     cluster.send_batch(alice, numbered(25, 60)).unwrap();
     assert!(cluster.run_until(Duration::from_secs(1), |c| c.service(leader).unwrap().messages.len() == 60));
     cluster.run_for(10 * MS);
-    let behind = cluster.node(cut_off).unwrap().raft().last_index();
-    assert!(cluster.node(leader).unwrap().raft().snapshot_index() > behind, "compacted past it");
+    let behind = cluster.metrics(cut_off).unwrap().last_index;
+    assert!(cluster.metrics(leader).unwrap().snapshot_index > behind, "compacted past it");
     cluster.heal();
     assert!(cluster.run_until(Duration::from_secs(2), |c| applied_everywhere(c, 60)));
-    assert!(cluster.node(cut_off).unwrap().raft().snapshot_index() > behind, "sent the leader's");
+    assert!(cluster.metrics(cut_off).unwrap().snapshot_index > behind, "sent the leader's");
     assert_eq!(cluster.service(cut_off), cluster.service(leader));
 }
 

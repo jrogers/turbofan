@@ -64,7 +64,7 @@ pub use node::{
     Config as NodeConfig, Ctx, Effect, MAX_EGRESS_RING, MAX_PRINCIPAL_BYTES, MAX_SESSIONS, PROTOCOL, PayloadTooLong,
     Service, SessionId, SnapshotWriter,
 };
-pub use raft::{Config as RaftConfig, MAX_MEMBERS, Member, NodeId};
+pub use raft::{Config as RaftConfig, MAX_MEMBERS, Member, NodeId, Role};
 pub use remote::{Admin, AdminError, Captured, ClusterClient, ClusterStatus, MemberStatus};
 pub use wire::CloseReason;
 

@@ -4,6 +4,19 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Added
+
+- `Role`, the type of `Metrics::role`, is exported, as `turbofan::Role`.
+
+### Breaking
+
+- `testing::Cluster::node` is gone: it handed out the core's `Node`, which isn't part of the API.
+  `Cluster::metrics` says what a test needs of a node, as its metrics endpoint does
+  (`last_index`, `snapshot_index`, `role` and the rest), or `None` while it's down;
+  `Cluster::service` is as it was.
+
 ## 0.8.0 (2026-11-07)
 
 ### Added

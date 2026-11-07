@@ -4,7 +4,7 @@
 //! a disk, so a test of a failover takes milliseconds, and a run is the same every time: the
 //! seed ([`Builder::seed`]) varies the election timeouts, and nothing else varies at all.
 //!
-//! The nodes run the same [`Node`] and [`Pipeline`] the driver does, and the clients the same
+//! The nodes run the same core and write pipeline the driver does, and the clients the same
 //! sans-IO [`Client`] a gateway does, so sessions, resends after a failover, timers, snapshots
 //! and restarts behave as they do over TCP:
 //!
@@ -31,6 +31,7 @@ use std::time::Duration;
 use crate::client::{self, Client, ClientConfigError, Event, Reconnect, SendError};
 use crate::codec::{self, Record};
 use crate::meta::Meta;
+use crate::metrics::Metrics;
 use crate::node::{ConnId, Node, SaveSnapshot, Service, SessionId};
 use crate::pipeline::{Batch, Pipeline};
 use crate::raft::{self, Entries, MAX_MEMBERS, MAX_READ_BYTES, Member, NodeId, Persist, Snapshot, SnapshotRead};
@@ -210,7 +211,7 @@ impl<S: Service> Cluster<S> {
         true
     }
 
-    /// The node leading and taking clients ([`Node::is_ready`]), if one is: of the highest term,
+    /// The node leading and taking clients, if one is: of the highest term,
     /// if a leader cut off from the others hasn't yet seen it's been replaced.
     #[must_use]
     pub fn leader(&self) -> Option<NodeId> {
@@ -225,13 +226,17 @@ impl<S: Service> Cluster<S> {
         self.members.iter().map(|m| m.id).collect()
     }
 
-    /// Node `id`, unless it's down.
+    /// Node `id`'s state, as its metrics endpoint has it, unless the node is down.
     ///
     /// # Panics
     ///
     /// If there's no node `id`.
     #[must_use]
-    pub fn node(&self, id: NodeId) -> Option<&Node<S>> {
+    pub fn metrics(&self, id: NodeId) -> Option<Metrics> {
+        self.node(id).map(|n| n.metrics(self.now))
+    }
+
+    fn node(&self, id: NodeId) -> Option<&Node<S>> {
         self.nodes.get(&id).expect("a member").node.as_ref()
     }
 
