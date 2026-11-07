@@ -18,6 +18,15 @@ a patch version (0.1.1) doesn't.
   for clients, `Opened`'s `queries`, and `readRound` on `AppendEntries` and `AppendAck`.
 - `Role`, the type of `Metrics::role`, is exported, as `turbofan::Role`.
 
+### Fixed
+
+- A client whose session a leader deposed without knowing it yet reattached, from less of the
+  session than the client had seen from the new leader, closed the session as `Diverged`, as
+  if the cluster had been lost: telling the gateway its messages not yet applied never would
+  be, when the cluster could still apply them. A cluster recovered from a loss has an epoch of
+  its own, so the client now takes an `Opened` behind what it saw, of the epoch its session was
+  opened in, for a stale node, and goes elsewhere.
+
 ### Breaking
 
 - `testing::Cluster::node` is gone: it handed out the core's `Node`, which isn't part of the API.

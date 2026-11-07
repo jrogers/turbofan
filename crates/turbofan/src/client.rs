@@ -297,22 +297,16 @@ impl Client {
                     None => ((self.target + 1) % self.addrs.len(), Some(Reconnect::Later)),
                 };
             }
-            // Has less of the session than it saw: a standby promoted without all of it (a leader
-            // of the same cluster takes clients only once it has all its predecessors applied).
-            // Messages it lost can't be resent (they're let go of once applied), and later ones
-            // would wait on them for ever; responses would be dropped as seen. The session's
-            // guarantees are over, so it's closed. An older node doesn't say its last response.
-            wire::Decoded::Opened(m)
-                if m.applied_seq() < self.applied || m.last_egress_seq().is_some_and(|e| e < self.last_egress) =>
-            {
-                self.frame(&wire::Close { session: m.session() });
+            // Has less of the session than it saw, and of the epoch the session was opened in: a
+            // leader of this cluster deposed without knowing it yet, answering from what it has (a
+            // lost cluster recovered has an epoch of its own). The session is whole: elsewhere.
+            wire::Decoded::Opened(m) if self.behind(m) && self.epoch != 0 && m.epoch() == Some(self.epoch) => {
                 self.open = false;
-                self.closed = true;
-                self.unacked.clear();
-                self.fail_queries(QueryError::Closed);
-                let unapplied = usize::try_from(self.next_seq - 1 - m.applied_seq()).unwrap_or(usize::MAX);
-                self.events.push_back(Event::Closed { reason: CloseReason::Diverged, unapplied });
+                self.frames.clear();
+                self.target = (self.target + 1) % self.addrs.len();
+                self.reconnect = Some(Reconnect::Later);
             }
+            wire::Decoded::Opened(m) if self.behind(m) => self.diverged(m),
             wire::Decoded::Opened(m) => {
                 self.session = Some(SessionId(m.session()));
                 self.epoch = m.epoch().unwrap_or(0);
@@ -469,6 +463,26 @@ impl Client {
         if self.queries.remove(&query).is_some() {
             self.answers.push_back(Answer { query, answer });
         }
+    }
+
+    /// The `Opened` has less of the session than the client saw: messages applied, or responses
+    /// (which an older node doesn't say).
+    fn behind(&self, m: &wire::OpenedRef<'_>) -> bool {
+        m.applied_seq() < self.applied || m.last_egress_seq().is_some_and(|e| e < self.last_egress)
+    }
+
+    /// Reattached to a cluster with less of the session than it saw, of another epoch (or one
+    /// unknown): a standby promoted without all of it. Messages it lost can't be resent (they're
+    /// let go of once applied), and later ones would wait on them for ever; responses would be
+    /// dropped as seen. The session's guarantees are over, so it's closed.
+    fn diverged(&mut self, m: &wire::OpenedRef<'_>) {
+        self.frame(&wire::Close { session: m.session() });
+        self.open = false;
+        self.closed = true;
+        self.unacked.clear();
+        self.fail_queries(QueryError::Closed);
+        let unapplied = usize::try_from(self.next_seq - 1 - m.applied_seq()).unwrap_or(usize::MAX);
+        self.events.push_back(Event::Closed { reason: CloseReason::Diverged, unapplied });
     }
 
     /// Every query waiting is answered with `error`.
@@ -904,5 +918,33 @@ mod tests {
         assert_eq!(answers.len(), MAX_QUERIES);
         assert!(answers.iter().all(|a| a.answer == Err(QueryError::Closed)));
         assert_eq!(client.query(b"q".to_vec()), Err(QueryError::Closed));
+    }
+
+    /// A leader deposed without knowing it yet, which reattaches the session from what it has,
+    /// less than the client saw, of the epoch it was opened in, isn't taken for a lost cluster:
+    /// the client goes elsewhere, the session whole. Of another epoch, it is.
+    #[test]
+    fn a_stale_leader_of_the_same_epoch_is_left_not_diverged_from() {
+        let opened = |applied_seq, epoch| {
+            frame(&wire::Opened { session: 9, applied_seq, last_egress_seq: 2, epoch, queries: 0 })
+        };
+        let mut client = Client::new(["a", "b"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
+        client.on_connected(0);
+        deliver(&mut client, &opened(0, 5));
+        for _ in 0..4 {
+            client.send(b"order".to_vec()).unwrap();
+        }
+        deliver(&mut client, &frame(&wire::Egress { session: 9, egress_seq: 1, applied_seq: 3, payload: b"fill" }));
+        client.on_disconnected();
+        client.on_connected(1);
+        while client.poll_event().is_some() {}
+        deliver(&mut client, &opened(1, 5));
+        assert_eq!(client.poll_event(), None, "not closed");
+        assert!(!client.is_closed());
+        assert_eq!(client.take_reconnect(), Some(Reconnect::Later));
+        assert_eq!(client.target(), "b");
+        client.on_connected(2);
+        deliver(&mut client, &opened(1, 6));
+        assert_eq!(client.poll_event(), Some(Event::Closed { reason: CloseReason::Diverged, unapplied: 3 }));
     }
 }
