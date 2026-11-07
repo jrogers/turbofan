@@ -1746,7 +1746,7 @@ impl Sim {
     }
 
     fn check_client_event(&mut self, c: usize, event: client::Event) {
-        if let client::Event::Closed { reason: CloseReason::Diverged, unapplied } = event {
+        if let client::Event::Closed { reason: CloseReason::Diverged, unapplied, .. } = event {
             return self.diverged(c, unapplied);
         }
         let seed = self.seed;

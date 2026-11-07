@@ -39,6 +39,7 @@ pub enum Event {
     /// A response, exactly once and in order.
     Message(Vec<u8>),
     /// Responses were lost: the client was away longer than the cluster keeps them for.
+    #[non_exhaustive]
     Lost {
         /// The first `egress_seq` missed.
         from: u64,
@@ -46,6 +47,7 @@ pub enum Event {
         to: u64,
     },
     /// The session closed. Messages not yet applied (`unapplied` of them) never will be.
+    #[non_exhaustive]
     Closed {
         /// Why. [`CloseReason::Diverged`] is the client's own: it reattached to a cluster that has
         /// less of the session than it saw, messages applied or responses (a standby promoted

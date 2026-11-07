@@ -22,8 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match event {
             Event::Opened(id) => println!("session {id} open"),
             Event::Message(response) => println!("{} bytes", response.len()),
-            Event::Lost { from, to } => println!("missed responses {from} to {}", to - 1),
-            Event::Closed { reason, unapplied } => {
+            Event::Lost { from, to, .. } => println!("missed responses {from} to {}", to - 1),
+            Event::Closed { reason, unapplied, .. } => {
                 println!("closed: {reason:?}, {unapplied} messages never applied");
                 break;
             }

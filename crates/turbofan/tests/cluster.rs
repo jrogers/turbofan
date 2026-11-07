@@ -400,7 +400,7 @@ async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
 
     // The client saw 150 applied, the restored cluster has at most 100 of them: it can't go on.
     let closed = tokio::time::timeout(Duration::from_secs(20), client.recv()).await.unwrap();
-    let Some(Event::Closed { reason: CloseReason::Diverged, unapplied }) = closed else { panic!("{closed:?}") };
+    let Some(Event::Closed { reason: CloseReason::Diverged, unapplied, .. }) = closed else { panic!("{closed:?}") };
     assert!((50..=150).contains(&unapplied), "{unapplied} the restored cluster never applied");
     let restored = vec![cluster.configs[0].client_listen.to_string()];
     let mut client = ClusterClient::connect(restored, SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();

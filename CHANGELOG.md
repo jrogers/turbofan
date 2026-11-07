@@ -17,7 +17,8 @@ The API made ready to freeze for 1.0 (#8): what may grow can, without breaking a
 - Enums that may gain variants are `#[non_exhaustive]`, so a `match` on one needs a `_` arm:
   `client::Event`, `Reconnect`, `SendError`, `QueryError` and `ClientConfigError`; `Effect`;
   `Role`; and `CloseReason`, as is every enum `turbofan-sbe` generates (the crate the code is
-  generated into matches its own as before).
+  generated into matches its own as before). So are `Event::Closed` and `Event::Lost`, which may
+  say more: a pattern on one ends in `..`.
 - Structs that may gain fields are `#[non_exhaustive]`, so another crate can't build one with a
   struct expression: `Metrics`, `MemberStatus`, `client::Answer` and `PayloadTooLong`, which only
   the cluster makes, and `Member`, made with `Member::new(id, peer, client, admin)` (set
