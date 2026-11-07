@@ -43,16 +43,7 @@ async fn busy_clients_lose_nothing_through_failovers() {
         cluster.start(i);
         kills += 1;
     }
-    let mut answered = 0;
-    for client in clients {
-        let Ok(done) = tokio::time::timeout(Duration::from_secs(30), client).await else {
-            panic!("a client not done in time; stopped on their own: {:?}", cluster.stopped().await);
-        };
-        let (sent, reattached) = done.expect("answered once each, in order");
-        assert!(sent > IN_FLIGHT, "it went on sending: {sent}");
-        answered += sent;
-        eprintln!("a client: {sent} answered, reattached {reattached} times");
-    }
+    let answered = finish(&mut cluster, clients, IN_FLIGHT).await;
     assert!(kills >= 3, "every node killed: {kills}");
     eprintln!("{answered} answered through {kills} kills");
 }
@@ -97,16 +88,7 @@ async fn busy_clients_lose_nothing_through_partitions_and_stalls() {
         tokio::time::sleep(Duration::from_millis(600)).await;
         faults += 1;
     }
-    let mut answered = 0;
-    for client in clients {
-        let Ok(done) = tokio::time::timeout(Duration::from_secs(30), client).await else {
-            panic!("a client not done in time; stopped on their own: {:?}", cluster.stopped().await);
-        };
-        let (sent, reattached) = done.expect("answered once each, in order");
-        assert!(sent > IN_FLIGHT, "it went on sending: {sent}");
-        answered += sent;
-        eprintln!("a client: {sent} answered, reattached {reattached} times");
-    }
+    let answered = finish(&mut cluster, clients, IN_FLIGHT).await;
     assert!(faults >= 4, "every kind of fault: {faults}");
     eprintln!("{answered} answered through {faults} faults");
 }
@@ -144,16 +126,7 @@ async fn busy_clients_lose_nothing_through_pauses() {
         replaced += usize::from(leader(&admins).await.is_some_and(|now| now != paused));
         pauses += 1;
     }
-    let mut answered = 0;
-    for client in clients {
-        let Ok(done) = tokio::time::timeout(Duration::from_secs(30), client).await else {
-            panic!("a client not done in time; stopped on their own: {:?}", cluster.stopped().await);
-        };
-        let (sent, reattached) = done.expect("answered once each, in order");
-        assert!(sent > IN_FLIGHT, "it went on sending: {sent}");
-        answered += sent;
-        eprintln!("a client: {sent} answered, reattached {reattached} times");
-    }
+    let answered = finish(&mut cluster, clients, IN_FLIGHT).await;
     assert!(pauses >= 3, "every length of pause: {pauses}");
     assert!(replaced >= 1, "a leader paused long is replaced: {replaced} of {pauses}");
     eprintln!("{answered} answered through {pauses} pauses of the leader, {replaced} replaced meanwhile");
@@ -213,30 +186,21 @@ async fn busy_clients_lose_nothing_through_faults_between_them_and_the_leader() 
         tokio::time::sleep(Duration::from_millis(600)).await;
         faults += 1;
     }
-    let mut answered = 0;
-    for client in clients {
-        let Ok(done) = tokio::time::timeout(Duration::from_secs(30), client).await else {
-            panic!("a client not done in time; stopped on their own: {:?}", cluster.stopped().await);
-        };
-        let (sent, reattached) = done.expect("answered once each, in order");
-        assert!(sent > IN_FLIGHT, "it went on sending: {sent}");
-        answered += sent;
-        eprintln!("a client: {sent} answered, reattached {reattached} times");
-    }
+    let answered = finish(&mut cluster, clients, IN_FLIGHT).await;
     assert!(faults >= 4, "every kind of fault: {faults}");
     eprintln!("{answered} answered through {faults} faults between clients and the leader");
 }
 
 /// The same busy clients over TLS, peers' links and clients' and operators', while every fault
 /// above comes in turn to the leader, about once a second for `SOAK_SECS`: killed and restarted,
-/// paused, cut off from what the others send it or that stalled, its clients cut off or their
-/// responses stalled. (Over TLS the proxy can't tell which peer dialled, so it faults every
-/// peer's link into the leader at once, not one.) TLS's handshakes, as connections drop and are
-/// made again, and its reads and writes under load, must lose nothing either.
+/// paused, cut off from what the others send it or that stalled, cut off from what one follower
+/// sends it, its appends to one follower stalled, its clients cut off or their responses stalled.
+/// TLS's handshakes, as connections drop and are made again, and its reads and writes under load,
+/// must lose nothing either.
 #[cfg(feature = "tls")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn busy_clients_lose_nothing_over_tls_through_every_fault() {
-    use common::proxy::{CLIENTS as C, PEERS};
+    use common::proxy::CLIENTS as C;
     const CLIENTS: usize = 8;
     const IN_FLIGHT: u64 = 64;
     let secs = std::env::var("SOAK_SECS").map_or(6, |s| s.parse().expect("SOAK_SECS is a number"));
@@ -266,11 +230,13 @@ async fn busy_clients_lose_nothing_over_tls_through_every_fault() {
     // Every kind of fault, however long that takes on a busy machine: past `until`, through the
     // answers to what the clients sent last.
     let mut faults = 0;
-    while tokio::time::Instant::now() < until || faults < 6 {
+    while tokio::time::Instant::now() < until || faults < 8 {
         let Some(id) = leader(&admins).await else { continue };
         let i = usize::from(id) - 1;
         let proxy = cluster.proxy.as_ref().expect("proxied");
-        match faults % 6 {
+        let others: Vec<NodeId> = [1, 2, 3].map(NodeId).into_iter().filter(|&o| o != id).collect();
+        let into: Vec<Link> = others.iter().map(|&o| (o, id)).collect();
+        match faults % 8 {
             0 => {
                 cluster.kill(i).await;
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -283,9 +249,11 @@ async fn busy_clients_lose_nothing_over_tls_through_every_fault() {
             }
             kind => {
                 proxy.fault(|f| match kind {
-                    2 => drop(f.cut.insert((PEERS, id))),
-                    3 => drop(f.stalled.insert((PEERS, id))),
-                    4 => f.cut.extend([(C, id), (id, C)]),
+                    2 => f.cut.extend(into),
+                    3 => f.stalled.extend(into),
+                    4 => drop(f.cut.insert((others[0], id))),
+                    5 => drop(f.stalled.insert((id, others[1]))),
+                    6 => f.cut.extend([(C, id), (id, C)]),
                     _ => drop(f.stalled.insert((id, C))),
                 });
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -295,18 +263,25 @@ async fn busy_clients_lose_nothing_over_tls_through_every_fault() {
         tokio::time::sleep(Duration::from_millis(600)).await;
         faults += 1;
     }
+    let answered = finish(&mut cluster, clients, IN_FLIGHT).await;
+    assert!(faults >= 8, "every kind of fault: {faults}");
+    eprintln!("{answered} answered over TLS through {faults} faults of the leader");
+}
+
+/// Waits for each of `clients` ([`keep_busy`]) to be done, within 30 s, having sent more than its
+/// first `in_flight`: how many they sent, all answered.
+async fn finish(cluster: &mut Cluster, clients: Vec<tokio::task::JoinHandle<(u64, usize)>>, in_flight: u64) -> u64 {
     let mut answered = 0;
     for client in clients {
         let Ok(done) = tokio::time::timeout(Duration::from_secs(30), client).await else {
             panic!("a client not done in time; stopped on their own: {:?}", cluster.stopped().await);
         };
         let (sent, reattached) = done.expect("answered once each, in order");
-        assert!(sent > IN_FLIGHT, "it went on sending: {sent}");
+        assert!(sent > in_flight, "it went on sending: {sent}");
         answered += sent;
         eprintln!("a client: {sent} answered, reattached {reattached} times");
     }
-    assert!(faults >= 6, "every kind of fault: {faults}");
-    eprintln!("{answered} answered over TLS through {faults} faults of the leader");
+    answered
 }
 
 /// Keeps `in_flight` messages in flight on `client` in batches, as each is answered, until

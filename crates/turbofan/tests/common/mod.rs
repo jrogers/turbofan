@@ -143,7 +143,7 @@ impl Cluster {
 
     /// As [`Cluster::new`], with a [`proxy::Proxy`] between the nodes, and between them and their
     /// clients: the members' peer and client addresses are the proxy's, which forwards to each
-    /// node's own. Over TLS, it faults only links from [`proxy::PEERS`] between the nodes.
+    /// node's own. Over TLS, every node's must be the same.
     pub fn proxied(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>) -> Self {
         Self::with(dir, tls, true)
     }
@@ -172,11 +172,10 @@ impl Cluster {
                 config
             })
             .collect();
-        let over_tls = configs.iter().any(|c| c.tls.is_some());
         let proxy = proxied.then(|| {
             let peers = ids.iter().map(|&id| (id, proxy::Listener::Peer, addr(0, id), addr(12, id)));
             let clients = ids.iter().map(|&id| (id, proxy::Listener::Client, addr(4, id), addr(16, id)));
-            proxy::Proxy::start(peers.chain(clients).collect(), over_tls)
+            proxy::Proxy::start(peers.chain(clients).collect(), configs[0].tls.as_ref())
         });
         let pauses = (0..4).map(|_| Arc::default()).collect();
         let mut cluster = Self { addrs, configs, nodes: vec![None, None, None, None], proxy, pauses };
