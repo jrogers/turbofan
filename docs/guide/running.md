@@ -146,13 +146,7 @@ use turbofan::{Member, NodeConfig, NodeId};
 async fn main() -> io::Result<()> {
     let ip = |n: u8| format!("10.0.0.{n}");
     let members: Vec<Member> = (1..=3)
-        .map(|n| Member {
-            id: NodeId(n),
-            peer: format!("{}:7001", ip(n)),
-            client: format!("{}:7101", ip(n)),
-            admin: format!("{}:7201", ip(n)),
-            learner: false,
-        })
+        .map(|n| Member::new(NodeId(n), format!("{}:7001", ip(n)), format!("{}:7101", ip(n)), format!("{}:7201", ip(n))))
         .collect();
     let id = NodeId(1);
     let mut node = NodeConfig::new(id, members.clone());

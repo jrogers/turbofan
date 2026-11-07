@@ -28,6 +28,7 @@ use crate::raft::{NodeId, Role, Stage};
 
 /// A node's state, at a moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Metrics {
     /// Its role.
     pub role: Role,
@@ -63,7 +64,7 @@ impl Metrics {
         clippy::as_conversions,
         reason = "gauges are f64; indices that big don't happen"
     )]
-    pub fn publish(&self) {
+    pub(crate) fn publish(&self) {
         for (role, name) in [
             (Role::Follower, "follower"),
             (Role::PreCandidate, "pre_candidate"),
@@ -89,7 +90,7 @@ impl Metrics {
 }
 
 /// Records an entry's time from proposed to `stage`, in nanoseconds.
-pub fn record_latency(stage: Stage, ns: u64) {
+pub(crate) fn record_latency(stage: Stage, ns: u64) {
     let name = match stage {
         Stage::Persisted => "turbofan_persist_latency_seconds",
         Stage::Committed => "turbofan_commit_latency_seconds",

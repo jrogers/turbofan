@@ -27,6 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("closed: {reason:?}, {unapplied} messages never applied");
                 break;
             }
+            // A later version may tell a client more.
+            _ => {}
         }
     }
     Ok(())

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use turbofan::client::Event;
 use turbofan::driver;
-use turbofan::raft::{self, NodeId};
+use turbofan::raft::NodeId;
 #[cfg(feature = "tls")]
 use turbofan::tls::{ClientTls, NodeTls};
 use turbofan::{Admin, AdminError, CloseReason, ClusterClient, Effect, capture};
@@ -234,7 +234,8 @@ async fn a_member_joins_and_another_leaves() {
     // Elsewhere, refused.
     let again = admin.add_member(&fourth).await.unwrap();
     assert!(again >= added, "already a member: {again} from {added}");
-    let elsewhere = raft::Member { peer: "127.0.0.1:1".into(), ..fourth.clone() };
+    let mut elsewhere = fourth.clone();
+    elsewhere.peer = "127.0.0.1:1".into();
     let again = admin.add_member(&elsewhere).await.unwrap_err();
     assert!(matches!(again, AdminError::MembersRefused), "a member 4 elsewhere: {again:?}");
 
@@ -314,7 +315,8 @@ async fn a_promoted_learner_leads_a_cluster_of_its_own() {
     cluster.start(3);
     let addrs: Vec<String> = cluster.configs.iter().map(|c| c.admin_listen.to_string()).collect();
     let admin = |i: usize| Admin::new(&addrs[i], SERVICE_ID).with_token(TOKEN).with_timeout(Duration::from_secs(20));
-    let learner = raft::Member { learner: true, ..member(&cluster.addrs, NodeId(4)) };
+    let mut learner = member(&cluster.addrs, NodeId(4));
+    learner.learner = true;
     admin(1).add_member(&learner).await.unwrap();
     exchange(&mut cluster, &mut client, 101, 200).await;
     // Commits don't wait on a learner: wait for it to catch up, as an operator would, before the

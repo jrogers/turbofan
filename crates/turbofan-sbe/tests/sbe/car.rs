@@ -7,6 +7,7 @@ pub const SCHEMA_VERSION: u16 = 0;
 
 /// `BoostType`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum BoostType {
     /// `TURBO` (b'T').
     Turbo,
@@ -62,6 +63,7 @@ impl std::hash::Hash for BoostType {
 
 /// `BooleanType`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum BooleanType {
     /// `F` (0).
     F,
@@ -109,6 +111,7 @@ impl std::hash::Hash for BooleanType {
 
 /// `Model`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Model {
     /// `A` (b'A').
     A,

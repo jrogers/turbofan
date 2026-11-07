@@ -2,7 +2,7 @@
 //! across failovers, resends what the cluster hasn't applied, and drops responses it has seen.
 //!
 //! The caller connects to [`Client::target`], calls [`Client::on_connected`], feeds it every
-//! frame with [`Client::on_frame`], writes what [`Client::take_frames`] returns, and reconnects
+//! frame read with [`Client::on_frame`] (dropping the connection on a malformed one), writes what [`Client::take_frames`] returns, and reconnects
 //! to the new target whenever [`Client::take_reconnect`] says so or the connection drops.
 //! Messages are applied exactly once and in order, and responses arrive exactly once and in
 //! order, while the session lasts.
@@ -32,6 +32,7 @@ const SILENT_KEEPALIVES: u32 = 3;
 
 /// What the cluster told the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// The session is open (again, after a failover).
     Opened(SessionId),
@@ -58,6 +59,7 @@ pub enum Event {
 
 /// Where to reconnect, after a redirect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Reconnect {
     /// To the leader, now.
     ToLeader,
@@ -68,6 +70,7 @@ pub enum Reconnect {
 
 /// Why [`Client::send`] refused a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SendError {
     /// [`MAX_UNACKED`] messages are waiting to be applied: wait for responses.
     Full,
@@ -91,6 +94,7 @@ impl std::error::Error for SendError {}
 
 /// A query's answer, by the ID [`Client::query`] gave it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Answer {
     /// Which query.
     pub query: u64,
@@ -100,6 +104,7 @@ pub struct Answer {
 
 /// Why a query wasn't answered, or wasn't sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QueryError {
     /// [`MAX_QUERIES`] are waiting: take their answers.
     Full,
@@ -127,8 +132,23 @@ impl std::fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
+/// A frame [`Client::on_frame`] couldn't read: the connection is unusable, as there's no telling
+/// where the next frame starts. Drop it, and call [`Client::on_disconnected`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MalformedFrame;
+
+impl std::fmt::Display for MalformedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a malformed frame from the cluster")
+    }
+}
+
+impl std::error::Error for MalformedFrame {}
+
 /// Why a [`Client`] or [`ClusterClient`](crate::ClusterClient) couldn't be made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ClientConfigError {
     /// No members' addresses were given.
     NoAddresses,
@@ -279,8 +299,25 @@ impl Client {
         self.frames.clear();
     }
 
-    /// A frame from the cluster.
-    pub fn on_frame(&mut self, message: &wire::Decoded<'_>) {
+    /// A frame from the cluster, whole: its length, then its message, as read off the
+    /// connection. A message of a type this client doesn't know (from a newer cluster) is skipped.
+    ///
+    /// # Errors
+    ///
+    /// If the frame is malformed: drop the connection.
+    pub fn on_frame(&mut self, frame: &[u8]) -> Result<(), MalformedFrame> {
+        match codec::decode_frame(frame) {
+            Ok(Some((message, len))) if len == frame.len() => {
+                self.on_message(&message);
+                Ok(())
+            }
+            Err(e) if e.is_unknown_message() => Ok(()),
+            _ => Err(MalformedFrame),
+        }
+    }
+
+    /// A message from the cluster.
+    pub(crate) fn on_message(&mut self, message: &wire::Decoded<'_>) {
         self.silent = 0;
         match message {
             wire::Decoded::Redirect(m) => {
@@ -574,8 +611,7 @@ mod tests {
     }
 
     fn deliver(client: &mut Client, frame: &[u8]) {
-        let (decoded, _) = codec::decode_frame(frame).unwrap().unwrap();
-        client.on_frame(&decoded);
+        client.on_frame(frame).unwrap();
     }
 
     /// A client with session 9 open, four messages sent, three of them applied and two responses

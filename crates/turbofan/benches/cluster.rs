@@ -307,13 +307,7 @@ fn start(dir: &Path, tls: bool, fsync: driver::Fsync) -> (Vec<String>, Option<Cl
     let ids: [NodeId; 3] = [1, 2, 3].map(NodeId);
     let members: Vec<raft::Member> = ids
         .iter()
-        .map(|&id| raft::Member {
-            id,
-            peer: addr(0, id).to_string(),
-            client: addr(3, id).to_string(),
-            admin: addr(6, id).to_string(),
-            learner: false,
-        })
+        .map(|&id| raft::Member::new(id, addr(0, id).to_string(), addr(3, id).to_string(), addr(6, id).to_string()))
         .collect();
     for id in ids {
         let mut node = node::Config::new(id, members.clone());

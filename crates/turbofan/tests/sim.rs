@@ -1621,7 +1621,7 @@ impl Sim {
             self.clients[c].opened_with =
                 self.conns.get_mut(&conn).unwrap().opened.pop_front().expect("recorded as sent");
         }
-        self.clients[c].client.on_frame(&message);
+        self.clients[c].client.on_frame(frame).expect("the cluster's frames are whole");
         self.flush_client(c);
     }
 
@@ -2681,5 +2681,5 @@ impl Sim {
 
 /// Node `id`'s addresses, which the simulation names rather than uses.
 fn member(id: NodeId) -> Member {
-    Member { id, peer: format!("p{id}"), client: format!("n{id}"), admin: format!("a{id}"), learner: false }
+    Member::new(id, format!("p{id}"), format!("n{id}"), format!("a{id}"))
 }

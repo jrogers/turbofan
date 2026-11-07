@@ -143,13 +143,7 @@ fn local_addr() -> io::Result<SocketAddr> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (peer, client, admin) = (local_addr()?, local_addr()?, local_addr()?);
     let id = NodeId(1);
-    let member = Member {
-        id,
-        peer: peer.to_string(),
-        client: client.to_string(),
-        admin: admin.to_string(),
-        learner: false,
-    };
+    let member = Member::new(id, peer.to_string(), client.to_string(), admin.to_string());
     let data = tempfile::tempdir()?;
     let node = NodeConfig::new(id, vec![member]);
     let config = driver::Config::new(node, SERVICE_ID, data.path(), vec![(id, peer)], client, admin);

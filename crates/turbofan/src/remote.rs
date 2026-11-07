@@ -234,15 +234,9 @@ async fn run(
                     Some(command) => carry_out(&mut client, &mut queries, command),
                 },
                 frame = conn.frames.recv() => {
-                    let decoded = frame.as_deref().map(codec::decode_frame);
-                    match decoded {
-                        Some(Ok(Some((message, _)))) => client.on_frame(&message),
-                        // From a newer cluster: nothing this client knows to act on.
-                        Some(Err(e)) if e.is_unknown_message() => {}
-                        _ => {
-                            client.on_disconnected();
-                            break;
-                        }
+                    if frame.is_none_or(|frame| client.on_frame(&frame).is_err()) {
+                        client.on_disconnected();
+                        break;
                     }
                 }
                 () = &mut sleep => client.on_tick(now()),
@@ -707,6 +701,7 @@ impl ClusterStatus {
 
 /// A member, as the leader knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MemberStatus {
     /// Its ID.
     pub id: NodeId,

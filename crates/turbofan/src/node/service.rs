@@ -134,6 +134,7 @@ pub struct Ctx {
 
 /// Something a [`Service`] callback did.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Effect {
     /// [`Ctx::send`]: a payload for a session.
     Send(SessionId, Vec<u8>),
@@ -234,6 +235,7 @@ impl Ctx {
 
 /// A payload over [`MAX_PAYLOAD_BYTES`], which [`Ctx::send`] or [`Ctx::propose`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PayloadTooLong {
     /// Its length.
     pub len: usize,

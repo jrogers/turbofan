@@ -114,13 +114,7 @@ fn drive(node: &mut Node<Checker>) {
 }
 
 fuzz_target!(|steps: Vec<Step>| {
-    let me = raft::Member {
-        id: raft::NodeId(1),
-        peer: "p1".into(),
-        client: "n1".into(),
-        admin: "a1".into(),
-        learner: false,
-    };
+    let me = raft::Member::new(raft::NodeId(1), "p1", "n1", "a1");
     let mut config = node::Config::new(raft::NodeId(1), vec![me]);
     config.raft.election_timeout = Duration::from_millis(150);
     config.raft.log_window_bytes = usize::MAX;

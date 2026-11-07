@@ -4,6 +4,26 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+The API made ready to freeze for 1.0 (#8): what may grow can, without breaking a caller.
+
+### Breaking
+
+- `wire` (the codecs generated from the cluster's schema) and `codec` (its framing) are no longer
+  part of the API, hidden from the docs: a message or field added to the schema then breaks no
+  one. `CloseReason` stays, at the crate root. `client::Client::on_frame` takes a frame's bytes,
+  as read, and returns `Result<(), MalformedFrame>`: drop the connection on an error.
+- Enums that may gain variants are `#[non_exhaustive]`, so a `match` on one needs a `_` arm:
+  `client::Event`, `Reconnect`, `SendError`, `QueryError` and `ClientConfigError`; `Effect`;
+  `Role`; and `CloseReason`, as is every enum `turbofan-sbe` generates (the crate the code is
+  generated into matches its own as before).
+- Structs that may gain fields are `#[non_exhaustive]`, so another crate can't build one with a
+  struct expression: `Metrics`, `MemberStatus`, `client::Answer` and `PayloadTooLong`, which only
+  the cluster makes, and `Member`, made with `Member::new(id, peer, client, admin)` (set
+  `learner` after).
+- `Metrics::publish` and `metrics::record_latency` are the driver's own.
+
 ## 0.9.0 (2026-11-07)
 
 ### Added

@@ -213,6 +213,7 @@ pub struct SnapshotRead {
 
 /// A node's part in the current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Role {
     /// Following a leader, or waiting for one.
     Follower,
@@ -226,6 +227,7 @@ pub enum Role {
 
 /// A cluster member: its ID, and where it's reached, which Raft carries without using.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Member {
     /// Its ID.
     pub id: NodeId,
@@ -846,6 +848,13 @@ impl Raft {
 }
 
 impl Member {
+    /// Voter `id`, reached at these addresses. Make it a learner by setting
+    /// [`Member::learner`].
+    #[must_use]
+    pub fn new(id: NodeId, peer: impl Into<String>, client: impl Into<String>, admin: impl Into<String>) -> Self {
+        Self { id, peer: peer.into(), client: client.into(), admin: admin.into(), learner: false }
+    }
+
     /// From the wire, where an address that isn't UTF-8 is mangled, not refused: it only
     /// fails to connect.
     fn read(id: NodeId, learner: u8, peer: &[u8], client: &[u8], admin: &[u8]) -> Self {

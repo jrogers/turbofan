@@ -574,7 +574,7 @@ impl<S: Service> Cluster<S> {
 
     fn deliver_to_client(&mut self, conn: ConnId, frame: &[u8]) {
         let Some(&Conn { client: Some(c), up: true, .. }) = self.conns.get(&conn) else { return };
-        self.clients[c].client.on_frame(&decode(frame));
+        self.clients[c].client.on_frame(frame).expect("the cluster's frames are whole");
         self.flush_client(c);
     }
 

@@ -36,6 +36,8 @@ pub mod guide;
 pub mod capture;
 mod cli;
 pub mod client;
+// The cluster's framing, for the simulation, the fuzz targets and the tests: not part of the API.
+#[doc(hidden)]
 pub mod codec;
 pub mod driver;
 pub mod metrics;
@@ -68,7 +70,10 @@ pub use raft::{Config as RaftConfig, MAX_MEMBERS, Member, NodeId, Role};
 pub use remote::{Admin, AdminError, Captured, ClusterClient, ClusterStatus, MemberStatus};
 pub use wire::CloseReason;
 
-/// The codecs generated from `schema/cluster.xml`.
+/// The codecs generated from `schema/cluster.xml`: public for the simulation, the fuzz targets and
+/// the tests, but not part of the API, so that a message added, or a field, breaks no one.
+/// [`CloseReason`] is re-exported above.
+#[doc(hidden)]
 #[allow(
     dead_code,
     missing_docs,

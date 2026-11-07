@@ -215,13 +215,7 @@ async fn write_this_versions_golden_files() {
     let listeners: Vec<TcpListener> = (0..3).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
     let ports: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
     drop(listeners);
-    let me = raft::Member {
-        id: NodeId(1),
-        peer: ports[0].to_string(),
-        client: ports[1].to_string(),
-        admin: ports[2].to_string(),
-        learner: false,
-    };
+    let me = raft::Member::new(NodeId(1), ports[0].to_string(), ports[1].to_string(), ports[2].to_string());
     let data = tempfile::tempdir().unwrap();
     let config = driver_config(me, data.path(), &ports);
     tokio::spawn(driver::serve(config, Tally::default()));

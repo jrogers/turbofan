@@ -106,7 +106,10 @@ impl<'s> Renderer<'s> {
             variants.push((variant, literal));
         }
         let out = &mut self.out;
-        writeln!(out, "\n/// `{}`.\n#[derive(Debug, Clone, Copy)]\npub enum {name} {{", e.name).expect(INFALLIBLE);
+        // Non-exhaustive: a schema may list more values, which mustn't break another crate's
+        // `match` on one (in the crate the code's generated into, nothing changes).
+        writeln!(out, "\n/// `{}`.\n#[derive(Debug, Clone, Copy)]\n#[non_exhaustive]\npub enum {name} {{", e.name)
+            .expect(INFALLIBLE);
         for ((variant, literal), (value, _)) in variants.iter().zip(&e.values) {
             writeln!(out, "    /// `{value}` ({literal}).\n    {variant},").expect(INFALLIBLE);
         }
