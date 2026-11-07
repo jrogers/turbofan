@@ -13,7 +13,9 @@
 //! handled meanwhile; slow disks, what waits for a write late; and log records and snapshot files
 //! rotting on disk; nodes paused, as a long garbage collection or a stalled VM pauses a process, the
 //! leader often, then resumed to everything that reached them meanwhile, a leader by then perhaps
-//! replaced without knowing it, its clock jumped; clocks of each node's own, the wall clock off by
+//! replaced without knowing it, its clock jumped, or with clients asking it, one of which has
+//! meanwhile found the leader elected since, the others' frames taken first as it resumes;
+//! clocks of each node's own, the wall clock off by
 //! milliseconds or by half a second and stepped now and then, the monotonic clock fast or slow by
 //! up to 200 parts per million, and on them cluster time, as the driver keeps it; a crash tearing a record with the rest of its append whole after it, as a disk
 //! keeping a later page and losing an earlier does. A node that finds its disk damaged as it runs
@@ -54,6 +56,12 @@
 //! clients: each `a<k>` says where in the log's order its message was applied, and a message is
 //! applied after every message answered, any client's, before it was sent, each place in the order
 //! answered for one message only. Cluster time never goes back, whichever leader logged an entry.
+//!
+//! Clients query too, once the new version has activated queries, never logged: each answer says
+//! how far in the log's order the leader had applied. At least as far as any node had applied as
+//! the query was sent, all of it committed by then (ReadIndex's promise, more than
+//! linearizability's: every message answered before); and a message sent after an answer is applied
+//! after it. A leader deposed without knowing it, paused or cut off, must not answer.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
@@ -79,6 +87,9 @@ const FAULT_PHASE: u64 = 20_000 * MS;
 const CRASH_EVERY: u64 = 1000 * MS;
 const CRASH_LEADER_EVERY: u64 = 3000 * MS;
 const QUIET_PHASE: u64 = 10_000 * MS;
+/// The last a leader is deposed ([`Sim::depose`]), into the quiet phase: its pause over before
+/// the shutdown, at 3500 ms into it or later.
+const DEPOSE_UNTIL: u64 = FAULT_PHASE + 2000 * MS;
 /// After the cluster is recovered from its loss and the clients stop sending, for it to settle.
 const DISASTER_QUIET: u64 = 3000 * MS;
 const CLIENTS: usize = 3;
@@ -143,6 +154,8 @@ fn simulate() {
         assert!(covered.diverged > 0, "no client's session diverged");
         assert!(covered.carried_on > 0, "no client carried on through a recovery");
         assert!(covered.lost_responses > 0, "no client's session diverged by its responses alone");
+        assert!(covered.queries_answered > 0, "no query was answered");
+        assert!(covered.deposed_queries > 0, "no query reached a deposed leader behind another node");
     }
 }
 
@@ -184,6 +197,10 @@ struct Coverage {
     /// Of those that diverged, ones whose cluster had all their messages, but not all the
     /// responses they saw.
     lost_responses: u64,
+    queries_answered: u64,
+    /// Queries that reached a leader deposed without knowing it, sent once another node had
+    /// applied more than it had: one it answered alone would be stale.
+    deposed_queries: u64,
 }
 
 impl Coverage {
@@ -208,6 +225,8 @@ impl Coverage {
         self.diverged += other.diverged;
         self.carried_on += other.carried_on;
         self.lost_responses += other.lost_responses;
+        self.queries_answered += other.queries_answered;
+        self.deposed_queries += other.deposed_queries;
     }
 }
 
@@ -283,6 +302,11 @@ impl Service for Echo {
         let text = std::str::from_utf8(payload).unwrap();
         let (session, k) = text.split_once(' ').unwrap();
         self.send(ctx, SessionId(session.parse().unwrap()), format!("p{k}"));
+    }
+
+    /// How far in the log's order it has applied messages.
+    fn on_query(&self, _session: SessionId, _query: &[u8]) -> Option<Vec<u8>> {
+        Some(self.applied.to_string().into_bytes())
     }
 
     fn on_timer(&mut self, ctx: &mut Ctx, id: u64) {
@@ -374,6 +398,11 @@ enum Event {
     Heal,
     /// A node is paused: it takes nothing, its writes done or not, until it resumes.
     Pause,
+    /// The leader, with clients asking it, is paused, and one of them finds the leader elected
+    /// meanwhile: see [`Sim::depose`].
+    Depose,
+    /// A client of a deposed leader leaves it for the one elected meanwhile, once there is one.
+    Escape(usize, NodeId),
     Resume(NodeId),
     Crash {
         leader: bool,
@@ -748,6 +777,9 @@ struct SimNode {
     stalled_until: u64,
     /// Paused until then: it isn't crashed meanwhile, so it resumes.
     paused_until: u64,
+    /// Paused, it takes its clients' frames first as it resumes, before its ticks and its peers'
+    /// messages: a leader deposed meanwhile then hears from clients before it learns it.
+    clients_first: bool,
     /// Its batches between taken and durable, by the driver's rules.
     pipeline: Pipeline,
     /// The batches being written, until `written_at`: not yet on disk.
@@ -783,6 +815,7 @@ impl SimNode {
             upgraded,
             stalled_until,
             paused_until: 0,
+            clients_first: false,
             pipeline: Pipeline::default(),
             writing: Vec::new(),
             written_at: None,
@@ -817,6 +850,9 @@ struct SimClient {
     opened_with: (u64, u64),
     /// Its session is the lost cluster's, and it hasn't opened it on the recovered one yet.
     of_lost: bool,
+    /// Each query waiting, by ID: the furthest in the log's order any node had applied as it was
+    /// sent, which its answer must reach.
+    queries: BTreeMap<u64, u64>,
 }
 
 /// A client connection: in order each way, like TCP.
@@ -857,6 +893,9 @@ struct Sim {
     /// it's lost), and which client's message each place answered was.
     answered: u64,
     answered_at: BTreeMap<u64, (usize, u64)>,
+    /// The furthest in the log's order a query's answer said the leader had applied, of this
+    /// cluster's: a message sent after it is applied after.
+    queried: u64,
     leaders: BTreeMap<u64, NodeId>,
     crashes: u64,
     /// The bytes of every snapshot taken, by index: every node's must match.
@@ -934,6 +973,7 @@ fn new_client(c: usize, again: bool) -> SimClient {
         proposals: BTreeSet::new(),
         opened_with: (0, 0),
         of_lost: false,
+        queries: BTreeMap::new(),
     }
 }
 
@@ -965,6 +1005,7 @@ impl Sim {
             commit_terms: Vec::new(),
             answered: 0,
             answered_at: BTreeMap::new(),
+            queried: 0,
             leaders: BTreeMap::new(),
             crashes: 0,
             snapshots: BTreeMap::new(),
@@ -1012,6 +1053,7 @@ impl Sim {
     fn schedule_operator(&mut self) {
         self.schedule(1000 * MS, Event::Partition);
         self.schedule(1500 * MS, Event::Pause);
+        self.schedule(2000 * MS, Event::Depose);
         self.schedule(CRASH_EVERY, Event::Crash { leader: false });
         self.schedule(CRASH_LEADER_EVERY, Event::Crash { leader: true });
         self.schedule(1700 * MS, Event::StepClock);
@@ -1080,6 +1122,8 @@ impl Sim {
             Event::Restart(id) => self.start(id),
             Event::Partition => self.partition(),
             Event::Pause => self.pause(),
+            Event::Depose => self.depose(),
+            Event::Escape(c, from) => self.escape(c, from),
             Event::Crash { leader } => self.crash_some(leader),
             Event::StepClock => self.step_clock(),
             Event::Resume(id) => self.resume(id),
@@ -1507,8 +1551,21 @@ impl Sim {
             return;
         }
         let now = self.clock(id);
+        let message = codec::decode_frame(frame).unwrap().unwrap().0;
+        // What its answer must reach, as the query was sent.
+        let floor = match &message {
+            turbofan::wire::Decoded::Query(m) => {
+                self.clients[self.conns[&conn].client].queries.get(&m.query_id()).copied()
+            }
+            _ => None,
+        };
         let node = self.nodes.get_mut(&id).unwrap().node.as_mut().expect("a crash resets its connections");
-        node.on_client(conn, &codec::decode_frame(frame).unwrap().unwrap().0, now);
+        let latest = self.leaders.keys().next_back().copied().unwrap_or(0);
+        let deposed = node.raft().role() == Role::Leader
+            && node.raft().term() < latest
+            && floor.is_some_and(|f| node.service().applied < f);
+        self.covered.deposed_queries += u64::from(deposed);
+        node.on_client(conn, &message, now);
         self.flush(id);
     }
 
@@ -1632,10 +1689,20 @@ impl Sim {
         match self.clients[c].client.send(k.to_string().as_bytes()) {
             Ok(_) => {
                 self.clients[c].sent = k;
-                self.clients[c].after.push(self.answered);
+                self.clients[c].after.push(self.answered.max(self.queried));
             }
             Err(client::SendError::Full) => {}
             Err(error) => panic!("seed {}: client {c} can't send: {error}", self.seed),
+        }
+        if self.rng.one_in(2) {
+            match self.clients[c].client.query(b"applied".to_vec()) {
+                Ok(id) => {
+                    let floor = self.applied_anywhere();
+                    self.clients[c].queries.insert(id, floor);
+                }
+                Err(client::QueryError::Full) => {}
+                Err(error) => panic!("seed {}: client {c} can't query: {error}", self.seed),
+            }
         }
         self.flush_client(c);
         let after = MS + self.rng.below(15 * MS);
@@ -1655,6 +1722,9 @@ impl Sim {
         }
         while let Some(event) = self.clients[c].client.poll_event() {
             self.check_client_event(c, event);
+        }
+        while let Some(answer) = self.clients[c].client.poll_answer() {
+            self.check_answer(c, answer);
         }
         let deadline = self.clients[c].client.next_deadline().max(self.now + 1);
         if self.clients[c].tick_at.is_none_or(|at| deadline < at) {
@@ -1694,7 +1764,8 @@ impl Sim {
                     let after = sim_client.after[usize::try_from(k - 1).unwrap()];
                     assert!(
                         at > after,
-                        "seed {seed}: client {c}'s message {k} applied at {at}, sent once one at {after} was answered"
+                        "seed {seed}: client {c}'s message {k} applied at {at}, sent once one at {after} was answered \
+                         or queried"
                     );
                     let other = self.answered_at.insert(at, (c, k));
                     assert!(
@@ -1715,6 +1786,31 @@ impl Sim {
                 }
             }
             event => panic!("seed {seed}: client {c}: {event:?}"),
+        }
+    }
+
+    /// The furthest in the log's order any node has applied: all of it committed.
+    fn applied_anywhere(&self) -> u64 {
+        self.nodes.values().filter_map(|n| n.node.as_ref()).map(|n| n.service().applied).max().unwrap_or(0)
+    }
+
+    /// A query's answer reaches as far in the log as any node had applied as it was sent.
+    fn check_answer(&mut self, c: usize, answer: client::Answer) {
+        let seed = self.seed;
+        let floor = self.clients[c].queries.remove(&answer.query).expect("a query it asked");
+        match answer.answer {
+            Ok(bytes) => {
+                let at: u64 = String::from_utf8(bytes).unwrap().parse().unwrap();
+                assert!(
+                    at >= floor,
+                    "seed {seed}: client {c}'s query answered as of {at}, sent once {floor} was applied"
+                );
+                self.queried = self.queried.max(at);
+                self.covered.queries_answered += 1;
+            }
+            // Before the new version is activated, or from a node of the old; or a busy leader.
+            Err(client::QueryError::Unsupported | client::QueryError::Busy) => {}
+            Err(error) => panic!("seed {seed}: client {c}'s query: {error}"),
         }
     }
 
@@ -1885,11 +1981,57 @@ impl Sim {
             let sim_node = self.nodes.get_mut(&id).unwrap();
             sim_node.stalled_until = sim_node.stalled_until.max(self.now + length);
             sim_node.paused_until = self.now + length;
+            sim_node.clients_first = false;
             self.pauses += 1;
             self.schedule(length, Event::Resume(id));
         }
         let after = 1000 * MS + self.rng.below(3000 * MS);
         self.schedule(after, Event::Pause);
+    }
+
+    /// The leader, once it has two clients attached or more, is paused for longer than an
+    /// election, and takes their frames first as it resumes. Once another leads, one of them
+    /// leaves it for that one; the others go on asking this one, and what they've seen answered
+    /// outruns it. Not so long that they give up on it first. Into the quiet too, where a leader is
+    /// elected and serves soon enough for that, till [`DEPOSE_UNTIL`]: resumed before the shutdown.
+    fn depose(&mut self) {
+        if self.now > DEPOSE_UNTIL {
+            return;
+        }
+        let leader = self.leader();
+        let attached: Vec<ConnId> =
+            self.clients.iter().filter_map(|c| c.conn).filter(|conn| Some(self.conns[conn].node) == leader).collect();
+        let (Some(id), 2..) = (leader, attached.len()) else {
+            self.schedule(50 * MS, Event::Depose);
+            return;
+        };
+        let length = 1000 * MS + self.rng.below(400 * MS);
+        let sim_node = self.nodes.get_mut(&id).unwrap();
+        sim_node.stalled_until = sim_node.stalled_until.max(self.now + length);
+        sim_node.paused_until = self.now + length;
+        sim_node.clients_first = true;
+        self.pauses += 1;
+        self.schedule(length, Event::Resume(id));
+        let conn = self.rng.pick(&attached);
+        self.schedule(300 * MS, Event::Escape(self.conns[&conn].client, id));
+        let after = 2000 * MS + self.rng.below(3000 * MS);
+        self.schedule(after, Event::Depose);
+    }
+
+    /// Client `c` leaves the paused leader `from` once another leads: its connection drops, and its
+    /// dial back too (as one to a stalled VM's does), so it tries the next member.
+    fn escape(&mut self, c: usize, from: NodeId) {
+        if self.nodes[&from].paused_until <= self.now {
+            return;
+        }
+        let Some(conn) = self.clients[c].conn.filter(|conn| self.conns[conn].node == from) else { return };
+        let other = self.nodes.iter().any(|(&id, n)| id != from && n.node.as_ref().is_some_and(Node::is_ready));
+        if !other {
+            self.schedule(50 * MS, Event::Escape(c, from));
+            return;
+        }
+        self.reset(conn);
+        self.clients[c].client.on_disconnected();
     }
 
     /// A paused node resumes, before what waited for it: a leader, unless another has been elected.
@@ -1909,8 +2051,12 @@ impl Sim {
             Event::ToNode { conn, .. } => Some(self.conns[conn].node),
             _ => None,
         };
-        if let Some(until) = target.map(|id| self.nodes[&id].stalled_until).filter(|&t| t > self.now) {
-            self.schedule(until - self.now, event);
+        if let Some(id) = target.filter(|id| self.nodes[id].stalled_until > self.now) {
+            let sim_node = &self.nodes[&id];
+            // A nanosecond behind what its clients sent, which keeps its order.
+            let behind =
+                sim_node.clients_first && sim_node.paused_until > self.now && !matches!(event, Event::ToNode { .. });
+            self.schedule(sim_node.stalled_until - self.now + u64::from(behind), event);
             return None;
         }
         Some(event)
@@ -1923,7 +2069,7 @@ impl Sim {
             self.schedule(after, Event::Activate);
         }
         let request_id = self.rng.next();
-        self.admin(&turbofan::wire::Activate { request_id, protocol: 1, service_version: 1 });
+        self.admin(&turbofan::wire::Activate { request_id, protocol: node::PROTOCOL, service_version: 1 });
     }
 
     /// The operator hands the leadership over: to the member most caught up, or a given one
@@ -2156,7 +2302,7 @@ impl Sim {
         config.snapshot_every_entries = 300;
         // Covers a client's messages in flight, each with its response and some a timer's.
         config.egress_ring_entries = 2 * client::MAX_UNACKED;
-        config.protocol = u32::from(sim_node.upgraded);
+        config.protocol = if sim_node.upgraded { node::PROTOCOL } else { 0 };
         // Its log or snapshot is damaged: it refuses to start.
         let log = match sim_node.disk.open(self.window) {
             Ok((log, cut)) => {
@@ -2313,9 +2459,10 @@ impl Sim {
         self.cut = [[false; 8]; 8];
         // The new cluster's order is its own: it may have lost what the old one applied, and not
         // apply it in the same places. What was sent before is not held to what was answered.
-        (self.answered, self.answered_at) = (0, BTreeMap::new());
+        (self.answered, self.answered_at, self.queried) = (0, BTreeMap::new(), 0);
         for client in &mut self.clients {
             client.after.fill(0);
+            client.queries.values_mut().for_each(|floor| *floor = 0);
         }
     }
 
@@ -2456,6 +2603,7 @@ impl Sim {
             assert_eq!(sim_client.timers, expected, "seed {seed}: client {c} timers");
             let expected: BTreeSet<u64> = (1..=sim_client.sent).filter(|k| k.is_multiple_of(PROPOSE_EVERY)).collect();
             assert_eq!(sim_client.proposals, expected, "seed {seed}: client {c} proposals");
+            assert_eq!(sim_client.queries.len(), 0, "seed {seed}: client {c}'s queries unanswered");
         }
     }
 
