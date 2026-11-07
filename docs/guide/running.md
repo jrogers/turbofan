@@ -78,10 +78,23 @@ The log isn't synced to disk before an entry is acknowledged, by default. The ot
 are the redundancy: a process that crashes loses nothing (the operating system still has the
 writes), and a machine that's lost is caught up from the others. It's still synced behind the
 writes, every 4 MiB, on a thread nothing waits for, so that unwritten data doesn't pile up and
-stall the disk. What it doesn't survive is a majority of nodes losing power at
-once, which may lose entries already committed. Spread the nodes over power domains, or run with
-`serve --fsync`, which syncs the log once a batch before acknowledging it, at a cost in latency
-(see [Performance][performance]). The term and vote, and snapshots, are always synced.
+stall the disk. The term and vote, and snapshots, are always synced.
+
+What it doesn't survive is a majority of the voters losing power together, before the operating
+system has written out what they acknowledged: entries already committed, and answered, may be
+lost. Cover it one of three ways:
+
+- **Spread the voters over power domains**, so that none holds a majority of them: racks with
+  power of their own, or zones (on Kubernetes, a topology spread constraint). A domain losing
+  power then loses a minority, which loses nothing. It costs nothing either, if the domains are
+  close: a commit waits only for the nearest follower.
+- **Keep a standby in another region** for a whole site losing power: a learner, which commits
+  don't wait for, to `promote` if the site is lost (see [Members][membership]). What it hadn't
+  yet received, usually the last few milliseconds' worth, is lost with the site.
+- **Run with `serve --fsync`**, which syncs the log once a batch before acknowledging it, so even
+  the whole cluster losing power loses nothing committed: at a cost in latency and throughput,
+  small on a server's NVMe drive with power-loss protection, large on network storage (see
+  [Performance][performance]).
 
 ## Configuration
 

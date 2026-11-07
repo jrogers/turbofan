@@ -65,8 +65,10 @@
 //! printing every effect it makes, a line each: run it with two versions and diff them.
 //!
 //! The log isn't synced to disk: the other nodes' copies are the redundancy, and a crashed
-//! process loses nothing, but a majority losing power together may lose committed entries.
-//! `serve --fsync` syncs it once a batch, before acknowledging it.
+//! process loses nothing, but a majority of the voters losing power together may lose committed
+//! entries. Spread the voters so that no power domain holds a majority of them, cover a whole
+//! site with a standby (a learner in another region, to `promote`), or run `serve --fsync`, which
+//! syncs the log once a batch, before acknowledging it: see the guide's Running a cluster.
 //!
 //! TLS is optional. `serve --tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca
 //! <pem>` puts it on all three listeners and to peers (see [`crate::tls`]), and without
@@ -115,6 +117,8 @@ const USAGE: &str = "usage:
         [--listen <ip>] [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
         (an address is <host>:<port>; with a host name for this node's, --listen is the
         interface its listeners bind, on those ports: 0.0.0.0, say)
+        (without --fsync, the log isn't synced before acknowledging: a majority of the voters
+        losing power together may lose committed entries)
         [--election-timeout <ms>] [--heartbeat <ms>]
         [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]
          [--tls-reload <secs>]] (the files reread every 60 seconds, or --tls-reload's)
