@@ -446,7 +446,8 @@ struct Disk {
     snapshots: tempfile::TempDir,
     /// The latest snapshot, as [`snapshot::load`] finds it.
     snapshot: Option<Snapshot>,
-    /// The index of a snapshot of its that rotted, while it's the latest.
+    /// The index of a snapshot of its that rotted, while its file is kept: once it's no longer the
+    /// latest, the node may still be sending it to a follower.
     rotten: Option<u64>,
     /// The index of a record that rotted, while the log holds it.
     rotten_record: Option<u64>,
@@ -577,8 +578,8 @@ impl Disk {
                 self.snapshot = Some(snapshot.clone());
             }
         }
-        // A newer snapshot: the rotten one is no longer read. A record compacted or truncated away.
-        self.rotten = self.rotten.filter(|&r| self.snapshot.as_ref().is_some_and(|s| s.index == r));
+        // A record compacted or truncated away.
+        self.keep_rot();
         let end = self.first + self.log.len() as u64;
         self.rotten_record = self.rotten_record.filter(|r| (self.first..end).contains(r));
         Ok(())
@@ -602,7 +603,7 @@ impl Disk {
         } else if let Some(&(first, _)) = segments.get(kept) {
             self.log.truncate(usize::try_from(first - self.first).unwrap());
         }
-        self.rotten = self.rotten.filter(|&r| r == snapshot.index);
+        self.keep_rot();
         let end = self.first + self.log.len() as u64;
         self.rotten_record = self.rotten_record.filter(|r| (self.first..end).contains(r));
         Ok(())
@@ -684,11 +685,21 @@ impl Disk {
         Ok(loaded)
     }
 
+    /// The file of the snapshot of `index`.
+    fn snapshot_path(&self, index: u64) -> std::path::PathBuf {
+        self.snapshots.path().join(format!("{index:020}.snapshot"))
+    }
+
+    /// Forgets a rotten snapshot once its file is removed.
+    fn keep_rot(&mut self) {
+        self.rotten = self.rotten.filter(|&r| self.snapshot_path(r).exists());
+    }
+
     /// Flips a bit of the latest snapshot's file, as bit rot would.
     fn rot(&mut self, rng: &mut Rng) {
         let Some(snapshot) = &self.snapshot else { return };
         self.rotten = Some(snapshot.index);
-        let path = self.snapshots.path().join(format!("{:020}.snapshot", snapshot.index));
+        let path = self.snapshot_path(snapshot.index);
         let mut bytes = std::fs::read(&path).unwrap();
         let at = usize::try_from(rng.below(bytes.len() as u64)).unwrap();
         bytes[at] ^= 1 << rng.below(8);
@@ -1416,7 +1427,6 @@ impl Sim {
         // A newer one, from the leader, may have overtaken it: the node then ignores it.
         if sim_node.disk.snapshot.as_ref().is_none_or(|s| s.index < snapshot.index) {
             sim_node.disk.snapshot = Some(snapshot.clone());
-            sim_node.disk.rotten = None;
         }
         sim_node.node.as_mut().unwrap().on_snapshot_saved(snapshot);
         self.flush(id);
