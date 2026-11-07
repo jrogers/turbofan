@@ -71,21 +71,26 @@ fn frames() -> Vec<u8> {
     put(&mut out, &wire::Message { session: 9, client_seq: 5, payload: b"order" });
     put(&mut out, &wire::KeepAlive { session: 9 });
     put(&mut out, &wire::Close { session: 9 });
+    put(&mut out, &wire::Query { session: 9, query_id: 6, payload: b"book" });
     put(&mut out, &wire::Redirect { leader: 2, addr: b"10.0.0.2:7101" });
-    put(&mut out, &wire::Opened { session: 9, applied_seq: 5, last_egress_seq: 4, epoch: 3 });
+    put(&mut out, &wire::Opened { session: 9, applied_seq: 5, last_egress_seq: 4, epoch: 3, queries: 1 });
     put(&mut out, &wire::Egress { session: 9, egress_seq: 5, applied_seq: 5, payload: b"fill" });
     put(&mut out, &wire::KeepAliveAck { applied_seq: 5 });
     put(&mut out, &wire::Closed { session: 9, reason: CloseReason::Timeout });
+    put(&mut out, &wire::QueryAnswer { session: 9, query_id: 6, payload: b"bids" });
+    put(&mut out, &wire::QueryRefused { session: 9, query_id: 7, unsupported: 1 });
     out
 }
 
 /// What [`frames`] wrote, as this version reads it. A version before 0.2.0 (schema version 4)
 /// didn't say the session's last response in `Opened`, nor one before 0.4.0 (schema version 5)
-/// the epoch in `Opened` and `Reattach`.
+/// the epoch in `Opened` and `Reattach`, nor one before 0.9.0 (schema version 8) queries.
 fn expected(version: &str) -> Vec<String> {
-    let last_egress = if version.starts_with("0.1.") { "None" } else { "Some(4)" };
-    let epoch = if ["0.1.", "0.2.", "0.3."].iter().any(|v| version.starts_with(v)) { "None" } else { "Some(3)" };
-    [
+    let minor: u32 = version.split('.').nth(1).unwrap().parse().unwrap();
+    let last_egress = if minor < 2 { "None" } else { "Some(4)" };
+    let epoch = if minor < 4 { "None" } else { "Some(3)" };
+    let queries = minor >= 9;
+    let mut expected: Vec<String> = vec![
         // Secrets are kept out of debug output: they're checked apart.
         "Hello(HelloRef { magic: 1414745155, service_id: 7, role: Client, node_id: 0, epoch: 0, token: *** })".into(),
         "Connect(ConnectRef { credentials: *** })".into(),
@@ -93,13 +98,22 @@ fn expected(version: &str) -> Vec<String> {
         "Message(MessageRef { session: 9, client_seq: 5, payload: [111, 114, 100, 101, 114] })".into(),
         "KeepAlive(KeepAliveRef { session: 9 })".into(),
         "Close(CloseRef { session: 9 })".into(),
+        "Query(QueryRef { session: 9, query_id: 6, payload: [98, 111, 111, 107] })".into(),
         "Redirect(RedirectRef { leader: 2, addr: [49, 48, 46, 48, 46, 48, 46, 50, 58, 55, 49, 48, 49] })".into(),
-        format!("Opened(OpenedRef {{ session: 9, applied_seq: 5, last_egress_seq: {last_egress}, epoch: {epoch} }})"),
+        format!(
+            "Opened(OpenedRef {{ session: 9, applied_seq: 5, last_egress_seq: {last_egress}, epoch: {epoch}, queries: {} }})",
+            if queries { "Some(1)" } else { "None" }
+        ),
         "Egress(EgressRef { session: 9, egress_seq: 5, applied_seq: 5, payload: [102, 105, 108, 108] })".into(),
         "KeepAliveAck(KeepAliveAckRef { applied_seq: 5 })".into(),
         "Closed(ClosedRef { session: 9, reason: Timeout })".into(),
-    ]
-    .into()
+        "QueryAnswer(QueryAnswerRef { session: 9, query_id: 6, payload: [98, 105, 100, 115] })".into(),
+        "QueryRefused(QueryRefusedRef { session: 9, query_id: 7, unsupported: 1 })".into(),
+    ];
+    if !queries {
+        expected.retain(|m| !m.starts_with("Query"));
+    }
+    expected
 }
 
 /// Every version's golden files: its version and directory.

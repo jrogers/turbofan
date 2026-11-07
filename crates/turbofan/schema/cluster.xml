@@ -188,6 +188,14 @@
     <sbe:message name="Close" id="24">
         <field name="session" id="1" type="uint64"/>
     </sbe:message>
+    <!-- A query of the state as applied, never logged (`Service::on_query`), only to a node whose
+         `Opened` said it takes them: an older one skips it unanswered. `queryId`: the client's,
+         for the answer to name. -->
+    <sbe:message name="Query" id="25">
+        <field name="session" id="1" type="uint64"/>
+        <field name="queryId" id="2" type="uint64"/>
+        <data name="payload" id="3" type="payloadData"/>
+    </sbe:message>
 
     <!-- Cluster to client (and admin, for Redirect). An empty addr: no leader yet, retry. -->
     <sbe:message name="Redirect" id="30">
@@ -196,12 +204,14 @@
     </sbe:message>
     <!-- `lastEgressSeq`: the session's last response. A client that knows of more applied than
          `appliedSeq`, or has seen more responses, has seen what this cluster lost. `epoch`: the
-         cluster's, for a `Reattach` to name. Absent from an older node. -->
+         cluster's, for a `Reattach` to name. `queries`: 1 if this node takes a `Query`, which it
+         answers or refuses. Absent from an older node. -->
     <sbe:message name="Opened" id="31">
         <field name="session" id="1" type="uint64"/>
         <field name="appliedSeq" id="2" type="uint64"/>
         <field name="lastEgressSeq" id="3" type="uint64" sinceVersion="4"/>
         <field name="epoch" id="4" type="uint64" sinceVersion="5"/>
+        <field name="queries" id="5" type="uint8" sinceVersion="8"/>
     </sbe:message>
     <sbe:message name="Egress" id="32">
         <field name="session" id="1" type="uint64"/>
@@ -215,6 +225,18 @@
     <sbe:message name="Closed" id="34">
         <field name="session" id="1" type="uint64"/>
         <field name="reason" id="2" type="CloseReason"/>
+    </sbe:message>
+    <sbe:message name="QueryAnswer" id="35">
+        <field name="session" id="1" type="uint64"/>
+        <field name="queryId" id="2" type="uint64"/>
+        <data name="payload" id="3" type="payloadData"/>
+    </sbe:message>
+    <!-- `unsupported`: 1 if the cluster takes no such query (it hasn't activated protocol 2, or
+         the service answers none), so asking again won't help; 0 if it's busy: ask again. -->
+    <sbe:message name="QueryRefused" id="36">
+        <field name="session" id="1" type="uint64"/>
+        <field name="queryId" id="2" type="uint64"/>
+        <field name="unsupported" id="3" type="uint8"/>
     </sbe:message>
 
     <!-- Admin. -->

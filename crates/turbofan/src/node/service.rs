@@ -69,6 +69,18 @@ pub trait Service: Send {
     fn on_timer(&mut self, _ctx: &mut Ctx, _id: u64) {}
     /// A payload from [`Ctx::propose`], back through the log: each once, in the order proposed.
     fn on_proposal(&mut self, _ctx: &mut Ctx, _payload: &[u8]) {}
+    /// A query from a session, answered from the state as applied, without logging it: the
+    /// answer, at most [`MAX_PAYLOAD_BYTES`], or `None` if the service takes no such query
+    /// (the client is told it's unsupported). Takes none by default.
+    ///
+    /// Only the leader answers, once it has confirmed it still leads and applied what was
+    /// committed when the query came in: the answer reflects every message the cluster had
+    /// applied when the client sent it, as of one moment between then and the answer. Not a
+    /// message the client sent before it but that's still on its way. It can't change the state
+    /// nor send, and isn't kept for a failover: the client asks again.
+    fn on_query(&self, _session: SessionId, _query: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
     /// The highest version of its behaviour this code has. An operator's `activate` switches the
     /// cluster to a version once every member has it ([`Ctx::service_version`]): so a rolling
     /// upgrade ships code with the old behaviour and the new, then activates the new.

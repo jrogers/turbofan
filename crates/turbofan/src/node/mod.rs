@@ -35,10 +35,12 @@ use crate::wire::{self, CloseReason};
 
 mod admin;
 mod apply;
+mod queries;
 mod service;
 mod sessions;
 mod state;
 
+pub use queries::{MAX_WAITING_QUERY_BYTES, QUERY_PROTOCOL};
 pub use service::{Ctx, Effect, PayloadTooLong, Service, SessionId};
 pub(crate) use state::with_epoch;
 use state::{Session, State, decode_state, encode_state};
@@ -53,7 +55,9 @@ pub const MAX_EGRESS_RING: usize = 65_536;
 pub const MAX_SESSIONS: usize = 10_000;
 /// The highest protocol version this code supports: see `WIRE.md`, and [`Config::protocol`].
 /// 1: an activation logs the leader's [`Config::egress_ring_entries`] for every node.
-pub const PROTOCOL: u32 = 1;
+/// 2: a leader takes queries ([`Service::on_query`]), every member echoing the rounds that
+/// confirm them.
+pub const PROTOCOL: u32 = QUERY_PROTOCOL;
 /// The longest principal [`Service::authenticate`] can give.
 pub const MAX_PRINCIPAL_BYTES: usize = 255;
 
@@ -224,6 +228,11 @@ struct Local {
     /// client waiting on its messages being applied (to release what it forwarded) needn't wait
     /// for its next keepalive.
     unacked: BTreeSet<SessionId>,
+    /// Queries waiting, by their read's ID ([`Raft::read_index`]), and their bytes summed; and
+    /// those Raft confirmed, in order, with the index to apply up to before answering.
+    queries: BTreeMap<u64, queries::Waiting>,
+    query_bytes: usize,
+    answerable: VecDeque<(u64, u64)>,
     sends: Vec<(ConnId, Vec<u8>)>,
 }
 
@@ -258,6 +267,8 @@ pub struct Node<S> {
     replayed: Option<Vec<Effect>>,
     /// When the latest snapshot was taken or installed, or the node started.
     snapshot_at: u64,
+    /// The next query's read ID: never the same twice, across terms too.
+    next_read: u64,
 }
 
 impl<S: Service> Node<S> {
@@ -291,6 +302,7 @@ impl<S: Service> Node<S> {
             captures: Vec::new(),
             replayed: None,
             snapshot_at: now,
+            next_read: 0,
         }
     }
 
@@ -458,6 +470,7 @@ impl<S: Service> Node<S> {
         self.detach(conn);
         // A session it asked for opens all the same, but not on it.
         self.local.opening.retain(|_, &mut c| c != conn);
+        self.drop_queries(conn);
     }
 
     /// A client's message on connection `conn`.
@@ -489,6 +502,11 @@ impl<S: Service> Node<S> {
                     self.send_client(conn, &wire::KeepAliveAck { applied_seq });
                 }
             }
+            wire::Decoded::Query(m) => {
+                if let Some(session) = self.check_attached(conn, SessionId(m.session())) {
+                    self.query(conn, session, m.query_id(), m.payload());
+                }
+            }
             wire::Decoded::Close(m) => {
                 if let Some(session) = self.check_attached(conn, SessionId(m.session())) {
                     self.propose_close(session, CloseReason::Client);
@@ -511,7 +529,10 @@ impl<S: Service> Node<S> {
             out.sends.extend(more.sends);
             out.peers = more.peers.or(out.peers);
             out.latencies.extend(more.latencies);
+            out.confirmed_reads.extend(more.confirmed_reads);
         }
+        // Dropped reads went with the leader state as it stepped down, their queries with them.
+        self.on_confirmed_reads(&out.confirmed_reads);
         if let (Some(index), Some((_, _, at))) = (out.change_proposed, self.local.changing.as_mut()) {
             *at = Some(index);
         }

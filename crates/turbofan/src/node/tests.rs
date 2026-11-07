@@ -39,6 +39,10 @@ impl Service for Recorder {
     fn on_proposal(&mut self, _ctx: &mut Ctx, payload: &[u8]) {
         self.0.push(format!("proposal {}", std::str::from_utf8(payload).unwrap()));
     }
+    /// The query, and how many callbacks it has logged; none for `none`.
+    fn on_query(&self, _session: SessionId, query: &[u8]) -> Option<Vec<u8>> {
+        (query != b"none").then(|| format!("{} {}", std::str::from_utf8(query).unwrap(), self.0.len()).into_bytes())
+    }
     fn version(&self) -> u32 {
         1
     }
@@ -855,4 +859,71 @@ fn a_connection_holds_one_session_and_a_closed_one_none() {
     node.on_disconnect(8);
     assert!(drive(&mut node).is_empty(), "nothing sent to it");
     assert!(!node.local.conns.contains_key(&8) && !node.local.attached.values().any(|&c| c == 8));
+}
+
+/// Activates `protocol`, as an operator would.
+fn activate_protocol(node: &mut Node<Recorder>, protocol: u32) {
+    let mut frame = Vec::new();
+    codec::encode_frame(&wire::Activate { request_id: 1, protocol, service_version: 0 }, &mut frame).unwrap();
+    // Its leader silent an election timeout since it started.
+    node.on_admin(99, &codec::decode_frame(&frame).unwrap().unwrap().0, 1_000_000_000);
+    drive(node);
+}
+
+/// A node says it takes queries, but refuses them as unsupported until the cluster activates
+/// their protocol; then answers each from the state as applied, logging nothing.
+#[test]
+fn a_query_is_answered_once_its_protocol_is_activated_and_never_logged() {
+    let mut node = leader();
+    let sent = client(&mut node, 7, &wire::Connect { credentials: b"" }, 0);
+    assert!(sent[0].contains("queries: Some(1)"), "{sent:?}");
+    let session = node.local.attached.iter().find(|&(_, &c)| c == 7).map(|(&s, _)| s).unwrap();
+    let query = |query_id, payload| wire::Query { session: session.0, query_id, payload };
+    let refused = client(&mut node, 7, &query(1, b"count"), 0);
+    assert_eq!(
+        refused,
+        [format!("7: QueryRefused(QueryRefusedRef {{ session: {}, query_id: 1, unsupported: 1 }})", session.0)]
+    );
+
+    activate_protocol(&mut node, QUERY_PROTOCOL);
+    let (last, ring) = (node.raft().last_index(), node.state.sessions[&session].ring.len());
+    let answered = client(&mut node, 7, &query(2, b"count"), 0);
+    let logged = node.service.0.len();
+    let answer: Vec<u8> = format!("count {logged}").into_bytes();
+    assert_eq!(
+        answered,
+        [format!("7: QueryAnswer(QueryAnswerRef {{ session: {}, query_id: 2, payload: {answer:?} }})", session.0)]
+    );
+    assert_eq!(node.raft().last_index(), last, "nothing logged");
+    assert_eq!(node.state.sessions[&session].ring.len(), ring, "nor kept for a replay");
+    assert_eq!(node.service.0.len(), logged, "nor applied");
+}
+
+/// A query the service takes none of is refused as unsupported; one past the bytes waiting, as
+/// busy, for the client to ask again.
+#[test]
+fn a_query_is_refused_as_unsupported_or_busy() {
+    let mut node = leader();
+    let session = open(&mut node, 7, 0);
+    activate_protocol(&mut node, QUERY_PROTOCOL);
+    let query = |payload| wire::Query { session: session.0, query_id: 1, payload };
+    assert!(client(&mut node, 7, &query(b"none"), 0)[0].contains("unsupported: 1"));
+    node.local.query_bytes = MAX_WAITING_QUERY_BYTES;
+    assert!(client(&mut node, 7, &query(b"count"), 0)[0].contains("unsupported: 0"));
+}
+
+/// A query waiting as its connection closes is dropped, unanswered, and its bytes freed: the
+/// client asks again on its next.
+#[test]
+fn a_query_waiting_as_its_connection_closes_is_dropped() {
+    let mut node = leader();
+    let session = open(&mut node, 7, 0);
+    activate_protocol(&mut node, QUERY_PROTOCOL);
+    let mut frame = Vec::new();
+    codec::encode_frame(&wire::Query { session: session.0, query_id: 1, payload: b"count" }, &mut frame).unwrap();
+    node.on_client(7, &codec::decode_frame(&frame).unwrap().unwrap().0, 0);
+    assert_eq!(node.local.query_bytes, 5, "waiting");
+    node.on_disconnect(7);
+    assert_eq!(node.local.query_bytes, 0);
+    assert_eq!(drive(&mut node), Vec::<String>::new(), "unanswered");
 }
