@@ -190,11 +190,12 @@ impl Cluster {
         let config = self.configs[i].clone();
         self.pauses[i].set(false);
         self.nodes[i] = Some(tokio::spawn(self.pauses[i].clone().hold(async move {
-            // A killed node's blocking write may still hold the directory's lock for a moment.
+            // A killed node's blocking write may still hold the directory's lock for a moment, and
+            // its listeners their ports: their tasks, aborted with it, are dropped after it is.
             let mut stop = Box::pin(stop);
             for _ in 0..100 {
                 match serve_until(config.clone(), Echo::default(), &mut stop).await {
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AddrInUse) => {
                         tokio::time::sleep(Duration::from_millis(20)).await
                     }
                     other => return other,
