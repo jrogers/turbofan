@@ -60,6 +60,12 @@ scripts/fuzz.sh    # fuzz the cluster's network inputs (nightly and cargo-fuzz)
 
 A simulation failure prints `SIM_SEED=<n>`; setting it replays that run exactly.
 
+## Releases and security
+
+Releases and what changed in each are in [CHANGELOG.md](CHANGELOG.md). Report security problems
+privately, as [SECURITY.md](SECURITY.md) describes, not in a public issue. CI checks every
+dependency's licence and known advisories with `cargo deny` ([deny.toml](deny.toml)).
+
 ## License
 
 Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or
