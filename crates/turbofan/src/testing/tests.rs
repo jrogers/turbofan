@@ -30,6 +30,11 @@ impl Service for Tally {
         ctx.send(session, "fired").expect("a short answer");
     }
 
+    /// How many messages it has.
+    fn on_query(&self, _session: SessionId, _query: &[u8]) -> Option<Vec<u8>> {
+        Some(self.messages.len().to_string().into_bytes())
+    }
+
     fn snapshot(&self) -> SnapshotWriter {
         let messages = self.messages.clone();
         Box::new(move |out| {
@@ -193,4 +198,49 @@ fn a_seed_replays_a_run() {
     };
     assert_eq!(run(7), run(7));
     assert_eq!(run(8), run(8));
+}
+
+/// Waits for `client`'s next answer.
+fn answer(cluster: &mut Cluster<Tally>, client: ClientId) -> Answer {
+    let mut answers = Vec::new();
+    let answered = cluster.run_until(Duration::from_secs(5), |c| c.client(client).queries() == 0);
+    assert!(answered, "a query answered in time");
+    answers.extend(cluster.answers(client));
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    answers.remove(0)
+}
+
+/// A query is refused as unsupported until the cluster activates queries; then the leader answers
+/// it from the messages applied, logging nothing.
+#[test]
+fn a_query_is_answered_once_activated_from_what_is_applied() {
+    let mut cluster = Cluster::new(3, |_| Tally::default());
+    let alice = cluster.connect(b"alice").unwrap();
+    assert!(cluster.run_until(Duration::from_secs(1), |c| c.session(alice).is_some()));
+    let id = cluster.query(alice, b"count").unwrap();
+    assert_eq!(answer(&mut cluster, alice), Answer { query: id, answer: Err(QueryError::Unsupported) });
+
+    assert!(cluster.activate(crate::node::QUERY_PROTOCOL, 0));
+    cluster.send_batch(alice, [b"a", b"b", b"c"]).unwrap();
+    assert!(cluster.run_until(Duration::from_secs(1), |c| c.client(alice).applied() == 3));
+    let leader = cluster.leader().unwrap();
+    let last = cluster.metrics(leader).unwrap().last_index;
+    let id = cluster.query(alice, b"count").unwrap();
+    assert_eq!(answer(&mut cluster, alice), Answer { query: id, answer: Ok(b"3".to_vec()) });
+    assert_eq!(cluster.metrics(leader).unwrap().last_index, last, "nothing logged");
+}
+
+/// A query in flight as the leader crashes is asked again of the new one, which answers it.
+#[test]
+fn a_query_in_flight_through_a_failover_is_answered_by_the_new_leader() {
+    let mut cluster = Cluster::new(3, |_| Tally::default());
+    let alice = cluster.connect(b"alice").unwrap();
+    cluster.activate(crate::node::QUERY_PROTOCOL, 0);
+    cluster.send_batch(alice, [b"a", b"b"]).unwrap();
+    assert!(cluster.run_until(Duration::from_secs(1), |c| c.client(alice).applied() == 2));
+    let old = cluster.leader().unwrap();
+    let id = cluster.query(alice, b"count").unwrap();
+    cluster.crash(old);
+    assert_eq!(answer(&mut cluster, alice), Answer { query: id, answer: Ok(b"2".to_vec()) });
+    assert_ne!(cluster.leader(), Some(old));
 }

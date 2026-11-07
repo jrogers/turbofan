@@ -28,7 +28,7 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
-use crate::client::{self, Client, ClientConfigError, Event, Reconnect, SendError};
+use crate::client::{self, Answer, Client, ClientConfigError, Event, QueryError, Reconnect, SendError};
 use crate::codec::{self, Record};
 use crate::meta::Meta;
 use crate::metrics::Metrics;
@@ -292,6 +292,23 @@ impl<S: Service> Cluster<S> {
         sent
     }
 
+    /// Queries `payload` of the state from `client`: see [`Client::query`]. Its answer comes in
+    /// [`Cluster::answers`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::query`].
+    pub fn query(&mut self, client: ClientId, payload: impl Into<Vec<u8>>) -> Result<u64, QueryError> {
+        let sent = self.clients[client.0].client.query(payload);
+        self.flush_client(client.0);
+        sent
+    }
+
+    /// The queries `client` has had answered, or refused, since this was last asked.
+    pub fn answers(&mut self, client: ClientId) -> Vec<Answer> {
+        std::iter::from_fn(|| self.clients[client.0].client.poll_answer()).collect()
+    }
+
     /// Closes `client`'s session: see [`Client::close`].
     pub fn close(&mut self, client: ClientId) {
         self.clients[client.0].client.close();
@@ -367,6 +384,16 @@ impl<S: Service> Cluster<S> {
     /// was a leader to ask.
     pub fn take_snapshot(&mut self) -> bool {
         self.admin(&wire::SnapshotRequest { request_id: 1 })
+    }
+
+    /// An operator's `activate` of `protocol` and `service_version` ([`Admin::activate`]), sent to
+    /// the leader: whether there was one to send it to. Queries ([`Cluster::query`]) need protocol
+    /// [`QUERY_PROTOCOL`]. The leader refuses versions a member doesn't have, or a step back.
+    ///
+    /// [`Admin::activate`]: crate::Admin::activate
+    /// [`QUERY_PROTOCOL`]: crate::node::QUERY_PROTOCOL
+    pub fn activate(&mut self, protocol: u32, service_version: u32) -> bool {
+        self.admin(&wire::Activate { request_id: 1, protocol, service_version })
     }
 
     fn admin(&mut self, request: &impl turbofan_sbe::Encode) -> bool {

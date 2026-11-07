@@ -46,6 +46,11 @@ impl Service for Echo {
         ctx.send(session, payload).expect("echoes a client payload");
     }
 
+    /// The session's last message applied.
+    fn on_query(&self, session: SessionId, _query: &[u8]) -> Option<Vec<u8>> {
+        Some(self.last.get(&session).copied().unwrap_or(0).to_string().into_bytes())
+    }
+
     fn snapshot(&self) -> SnapshotWriter {
         let last = self.last.clone();
         Box::new(move |out| {

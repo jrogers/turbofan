@@ -6,8 +6,11 @@
 //! to the new target whenever [`Client::take_reconnect`] says so or the connection drops.
 //! Messages are applied exactly once and in order, and responses arrive exactly once and in
 //! order, while the session lasts.
+//!
+//! Queries ([`Client::query`]) go beside them, never logged, each answered once
+//! ([`Client::poll_answer`]) in any order: see [`crate::Service::on_query`].
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -18,6 +21,10 @@ use crate::wire::{self, CloseReason};
 
 /// The most messages sent but not yet known applied. [`Client::send`] refuses more.
 pub const MAX_UNACKED: usize = 4096;
+
+/// The most queries waiting for their answer, or answered and not yet taken
+/// ([`Client::poll_answer`]). [`Client::query`] refuses more.
+pub const MAX_QUERIES: usize = 4096;
 
 /// Keepalives in a row that the cluster may leave unanswered before the connection is taken for
 /// dead: a leader answers each at once, and one that lost power leaves a socket that never errs.
@@ -82,6 +89,46 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+/// A query's answer, by the ID [`Client::query`] gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    /// Which query.
+    pub query: u64,
+    /// The service's answer, or why there's none.
+    pub answer: Result<Vec<u8>, QueryError>,
+}
+
+/// Why a query wasn't answered, or wasn't sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryError {
+    /// [`MAX_QUERIES`] are waiting: take their answers.
+    Full,
+    /// The session closed.
+    Closed,
+    /// The payload is over [`MAX_PAYLOAD_BYTES`].
+    TooLong,
+    /// The leader had too many waiting: ask again.
+    Busy,
+    /// The cluster takes no such query: it hasn't activated queries (protocol 2), the service
+    /// answers none, or the leader is of a version without them. Asking again won't help, unless
+    /// that changes.
+    Unsupported,
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Full => "too many queries waiting",
+            Self::Closed => "the session is closed",
+            Self::TooLong => "payload over MAX_PAYLOAD_BYTES",
+            Self::Busy => "the leader is busy",
+            Self::Unsupported => "the cluster takes no such query",
+        })
+    }
+}
+
+impl std::error::Error for QueryError {}
+
 /// Why a [`Client`] or [`ClusterClient`](crate::ClusterClient) couldn't be made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientConfigError {
@@ -128,6 +175,12 @@ pub struct Client {
     reconnect: Option<Reconnect>,
     frames: Vec<Vec<u8>>,
     events: VecDeque<Event>,
+    /// The node connected to takes queries, as its `Opened` said.
+    takes_queries: bool,
+    next_query: u64,
+    /// Queries sent and not yet answered, by ID: sent again on each `Opened`.
+    queries: BTreeMap<u64, Vec<u8>>,
+    answers: VecDeque<Answer>,
 }
 
 impl Client {
@@ -170,6 +223,10 @@ impl Client {
             reconnect: None,
             frames: Vec::new(),
             events: VecDeque::new(),
+            takes_queries: false,
+            next_query: 1,
+            queries: BTreeMap::new(),
+            answers: VecDeque::new(),
         })
     }
 
@@ -252,6 +309,7 @@ impl Client {
                 self.open = false;
                 self.closed = true;
                 self.unacked.clear();
+                self.fail_queries(QueryError::Closed);
                 let unapplied = usize::try_from(self.next_seq - 1 - m.applied_seq()).unwrap_or(usize::MAX);
                 self.events.push_back(Event::Closed { reason: CloseReason::Diverged, unapplied });
             }
@@ -265,6 +323,14 @@ impl Client {
                 for (client_seq, payload) in resend {
                     self.frame(&wire::Message { session: m.session(), client_seq, payload: &payload });
                 }
+                self.resend_queries(m.session(), m.queries() == Some(1));
+            }
+            wire::Decoded::QueryAnswer(m) if Some(SessionId(m.session())) == self.session => {
+                self.answered(m.query_id(), Ok(m.payload().to_vec()));
+            }
+            wire::Decoded::QueryRefused(m) if Some(SessionId(m.session())) == self.session => {
+                let error = if m.unsupported() == 1 { QueryError::Unsupported } else { QueryError::Busy };
+                self.answered(m.query_id(), Err(error));
             }
             wire::Decoded::Egress(m) if Some(SessionId(m.session())) == self.session => {
                 self.trim(m.applied_seq());
@@ -283,6 +349,7 @@ impl Client {
                 self.closed = true;
                 let unapplied = self.unacked.len();
                 self.unacked.clear();
+                self.fail_queries(QueryError::Closed);
                 self.events.push_back(Event::Closed { reason: m.reason(), unapplied });
             }
             _ => {}
@@ -337,6 +404,78 @@ impl Client {
             self.push(payload);
         }
         Ok(first..self.next_seq)
+    }
+
+    /// Queries `payload` of the state, returning its ID, which its [`Answer`] has
+    /// ([`Client::poll_answer`]): once, in any order, and never logged. It's sent again after a
+    /// failover until it's answered. It sees every message the cluster had applied when it was
+    /// sent, not one still on its way: wait for [`Client::applied`] to pass one first to see it.
+    ///
+    /// # Errors
+    ///
+    /// If [`MAX_QUERIES`] are waiting or answered and not yet taken, the session closed, or the
+    /// payload is too long.
+    pub fn query(&mut self, payload: impl Into<Vec<u8>>) -> Result<u64, QueryError> {
+        let payload = payload.into();
+        if self.closed {
+            return Err(QueryError::Closed);
+        }
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(QueryError::TooLong);
+        }
+        if self.queries.len() + self.answers.len() >= MAX_QUERIES {
+            return Err(QueryError::Full);
+        }
+        let query_id = self.next_query;
+        self.next_query += 1;
+        if let (true, Some(session)) = (self.open, self.session) {
+            if !self.takes_queries {
+                self.answers.push_back(Answer { query: query_id, answer: Err(QueryError::Unsupported) });
+                return Ok(query_id);
+            }
+            self.frame(&wire::Query { session: session.0, query_id, payload: &payload });
+        }
+        self.queries.insert(query_id, payload);
+        Ok(query_id)
+    }
+
+    /// The next query answered, or refused.
+    pub fn poll_answer(&mut self) -> Option<Answer> {
+        self.answers.pop_front()
+    }
+
+    /// Queries waiting for their answer.
+    #[must_use]
+    pub fn queries(&self) -> usize {
+        self.queries.len()
+    }
+
+    /// The session opened on a node that `takes` queries, or not: the queries waiting are sent
+    /// it, or refused, since an older node would leave them unanswered.
+    fn resend_queries(&mut self, session: u64, takes: bool) {
+        self.takes_queries = takes;
+        if !takes {
+            self.fail_queries(QueryError::Unsupported);
+            return;
+        }
+        let resend: Vec<(u64, Vec<u8>)> = self.queries.iter().map(|(&id, q)| (id, q.clone())).collect();
+        for (query_id, payload) in resend {
+            self.frame(&wire::Query { session, query_id, payload: &payload });
+        }
+    }
+
+    /// A query's answer, unless it was answered already (sent again, and answered twice).
+    fn answered(&mut self, query: u64, answer: Result<Vec<u8>, QueryError>) {
+        if self.queries.remove(&query).is_some() {
+            self.answers.push_back(Answer { query, answer });
+        }
+    }
+
+    /// Every query waiting is answered with `error`.
+    fn fail_queries(&mut self, error: QueryError) {
+        for query in std::mem::take(&mut self.queries).into_keys() {
+            self.answers.push_back(Answer { query, answer: Err(error) });
+        }
     }
 
     /// Holds `payload`, sent, as the next message, and frames it if the session is open here.
@@ -699,5 +838,71 @@ mod tests {
         older[10..12].copy_from_slice(&3_u16.to_le_bytes());
         let mut client = reattached_to(&older);
         assert_eq!(client.poll_event(), Some(Event::Opened(SessionId(9))), "a lost response it can't tell");
+    }
+
+    /// A client with session 9 open on a node that takes queries, or not.
+    fn queried(takes: u8) -> Client {
+        let mut client = Client::new(["a"], b"me".to_vec(), Duration::from_secs(1)).unwrap();
+        client.on_connected(0);
+        let opened = wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0, queries: takes };
+        deliver(&mut client, &frame(&opened));
+        client.take_frames();
+        client
+    }
+
+    /// A query is sent at once, answered once though it's answered twice (sent again after a
+    /// failover, say), and a refusal says whether asking again would help.
+    #[test]
+    fn a_query_is_answered_once() {
+        let mut client = queried(1);
+        let id = client.query(b"book".to_vec()).unwrap();
+        let sent = client.take_frames();
+        assert!(format!("{:?}", codec::decode_frame(&sent[0]).unwrap().unwrap().0).starts_with("Query("));
+        let answer = wire::QueryAnswer { session: 9, query_id: id, payload: b"bids" };
+        deliver(&mut client, &frame(&answer));
+        deliver(&mut client, &frame(&answer));
+        assert_eq!(client.poll_answer(), Some(Answer { query: id, answer: Ok(b"bids".to_vec()) }));
+        assert_eq!(client.poll_answer(), None, "once");
+
+        let busy = client.query(b"book".to_vec()).unwrap();
+        deliver(&mut client, &frame(&wire::QueryRefused { session: 9, query_id: busy, unsupported: 0 }));
+        assert_eq!(client.poll_answer(), Some(Answer { query: busy, answer: Err(QueryError::Busy) }));
+    }
+
+    /// An older node, which would leave a query unanswered, isn't sent one: each waiting, and each
+    /// asked while it's connected to, is refused as unsupported.
+    #[test]
+    fn an_older_node_is_sent_no_query() {
+        let mut client = queried(1);
+        let waiting = client.query(b"book".to_vec()).unwrap();
+        client.on_disconnected();
+        client.on_connected(0);
+        deliver(&mut client, &opened(0, 0));
+        let asked = client.query(b"book".to_vec()).unwrap();
+        assert!(
+            client
+                .take_frames()
+                .iter()
+                .all(|f| !format!("{:?}", codec::decode_frame(f).unwrap().unwrap().0).starts_with("Query("))
+        );
+        let refused = |query| Some(Answer { query, answer: Err(QueryError::Unsupported) });
+        assert_eq!(client.poll_answer(), refused(waiting));
+        assert_eq!(client.poll_answer(), refused(asked));
+    }
+
+    /// The session closing answers each query waiting as closed; queries, and answers not yet
+    /// taken, are bounded.
+    #[test]
+    fn queries_end_with_the_session_and_are_bounded() {
+        let mut client = queried(1);
+        for _ in 0..MAX_QUERIES {
+            client.query(b"q".to_vec()).unwrap();
+        }
+        assert_eq!(client.query(b"q".to_vec()), Err(QueryError::Full));
+        deliver(&mut client, &frame(&wire::Closed { session: 9, reason: CloseReason::Timeout }));
+        let answers: Vec<Answer> = std::iter::from_fn(|| client.poll_answer()).collect();
+        assert_eq!(answers.len(), MAX_QUERIES);
+        assert!(answers.iter().all(|a| a.answer == Err(QueryError::Closed)));
+        assert_eq!(client.query(b"q".to_vec()), Err(QueryError::Closed));
     }
 }

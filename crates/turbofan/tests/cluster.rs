@@ -9,7 +9,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use turbofan::client::Event;
+use turbofan::client::{Event, QueryError};
 use turbofan::driver;
 use turbofan::raft::{self, NodeId};
 #[cfg(feature = "tls")]
@@ -197,6 +197,24 @@ async fn a_batch_is_answered_in_order() {
         }
     }
     exchange(&mut cluster, &mut client, 1001, 1010).await;
+}
+
+/// Once an operator activates queries, a gateway's query sees every message it has had answered,
+/// without logging it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_query_sees_what_was_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new(dir.path(), |_| None);
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 10).await;
+    assert_eq!(client.query(b"last".to_vec()).await, Err(QueryError::Unsupported), "not yet activated");
+    let admin = Admin::new(cluster.configs[0].admin_listen.to_string(), SERVICE_ID)
+        .with_token(TOKEN)
+        .with_timeout(Duration::from_secs(10));
+    admin.activate(turbofan::node::QUERY_PROTOCOL, 0).await.unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), client.query(b"last".to_vec())).await;
+    assert_eq!(answer.expect("answered in time"), Ok(b"10".to_vec()));
 }
 
 /// A fourth node joins, and the first leaves, while a client's messages are answered once each.

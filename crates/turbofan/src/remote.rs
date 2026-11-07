@@ -1,6 +1,7 @@
 //! Talking to a cluster over TCP: [`ClusterClient`] for gateways, [`Admin`] for operators. Each
 //! goes over TLS when given a [`ClientTls`].
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::ops::Range;
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::client::{Client, ClientConfigError, Event, Reconnect, SendError};
+use crate::client::{Client, ClientConfigError, Event, QueryError, Reconnect, SendError};
 use crate::codec;
 use crate::driver::{Hello, MAX_TOKEN_BYTES, read_frame, write_frames};
 use crate::raft::{Member, NodeId};
@@ -28,6 +29,7 @@ const MAX_QUEUED_EVENTS: usize = 4096;
 enum Command {
     Send(Vec<u8>, oneshot::Sender<Result<u64, SendError>>),
     SendBatch(Vec<Vec<u8>>, oneshot::Sender<Result<Range<u64>, SendError>>),
+    Query(Vec<u8>, oneshot::Sender<Result<Vec<u8>, QueryError>>),
     Close,
 }
 
@@ -152,6 +154,20 @@ impl ClusterClient {
         rx.await.map_err(|_| SendError::Closed)?
     }
 
+    /// Queries `payload` of the state, as [`Client::query`]: the service's answer, never logged,
+    /// once the leader has confirmed it leads, asked again of a new one after a failover. Queries
+    /// may be in flight together, from tasks of their own, up to [`crate::client::MAX_QUERIES`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::query`], or as its [`crate::client::Answer`]: the leader was busy (ask again),
+    /// the cluster takes no such query, or the session closed.
+    pub async fn query(&self, payload: impl Into<Vec<u8>>) -> Result<Vec<u8>, QueryError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands.send(Command::Query(payload.into(), reply)).await.map_err(|_| QueryError::Closed)?;
+        rx.await.map_err(|_| QueryError::Closed)?
+    }
+
     /// The highest `client_seq` (as [`ClusterClient::send`] returned) the cluster has applied,
     /// as [`Client::applied`]: watch it to know when what was sent is in the cluster, to let go
     /// of a message a gateway is forwarding, say.
@@ -197,6 +213,7 @@ async fn run(
     let now = || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let hello = Hello { service_id, node_id: None, epoch: Arc::default() };
     let mut redirected_at: Option<Instant> = None;
+    let mut queries = Queries::new();
     loop {
         let Ok(stream) = handshake(client.target(), &hello, wire::Role::Client, &[], tls.as_ref()).await else {
             client.on_disconnected();
@@ -214,9 +231,7 @@ async fn run(
             tokio::select! {
                 command = commands.recv() => match command {
                     None => return,
-                    Some(Command::Send(payload, reply)) => { let _ = reply.send(client.send(payload)); }
-                    Some(Command::SendBatch(payloads, reply)) => { let _ = reply.send(client.send_batch(payloads)); }
-                    Some(Command::Close) => client.close(),
+                    Some(command) => carry_out(&mut client, &mut queries, command),
                 },
                 frame = conn.frames.recv() => {
                     let decoded = frame.as_deref().map(codec::decode_frame);
@@ -237,6 +252,7 @@ async fn run(
                 }
             }
             applied.send_if_modified(|seq| std::mem::replace(seq, client.applied()) != client.applied());
+            hand_answers(&mut client, &mut queries);
             while let Some(event) = client.poll_event() {
                 if events.send(event).await.is_err() {
                     return;
@@ -264,6 +280,41 @@ async fn run(
                 }
                 None => {}
             }
+        }
+    }
+}
+
+/// A query's caller, by the query's ID until it's answered: dropped with the client's task, which
+/// answers it as closed.
+type Queries = BTreeMap<u64, oneshot::Sender<Result<Vec<u8>, QueryError>>>;
+
+/// A command from the [`ClusterClient`], to its client: a query kept for its caller's reply
+/// once it's answered, or refused at once.
+fn carry_out(client: &mut Client, queries: &mut Queries, command: Command) {
+    match command {
+        Command::Send(payload, reply) => {
+            let _ = reply.send(client.send(payload));
+        }
+        Command::SendBatch(payloads, reply) => {
+            let _ = reply.send(client.send_batch(payloads));
+        }
+        Command::Query(payload, reply) => match client.query(payload) {
+            Ok(id) => {
+                queries.insert(id, reply);
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        },
+        Command::Close => client.close(),
+    }
+}
+
+/// Hands each query answered to its caller, who may have stopped waiting.
+fn hand_answers(client: &mut Client, queries: &mut Queries) {
+    while let Some(answer) = client.poll_answer() {
+        if let Some(reply) = queries.remove(&answer.query) {
+            let _ = reply.send(answer.answer);
         }
     }
 }
