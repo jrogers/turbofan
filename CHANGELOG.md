@@ -4,7 +4,7 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
-## Unreleased
+## 0.8.0 (2026-11-07)
 
 ### Added
 
