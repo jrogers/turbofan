@@ -1,6 +1,6 @@
 name: Fuzz
 
-# Fuzzes every target in crates/turbofan-cluster/fuzz for a while each night, rather than on every
+# Fuzzes every target in crates/turbofan/fuzz for a while each night, rather than on every
 # push; CI only checks that they build. Run it by hand for a longer or shorter session.
 on:
   schedule:
@@ -28,14 +28,14 @@ jobs:
           tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/turbofan-cluster/fuzz
+          workspaces: crates/turbofan/fuzz
       - run: scripts/fuzz.sh ${{ inputs.seconds || 600 }}
       # The inputs that failed, to replay locally: see scripts/fuzz.sh.
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-artifacts
-          path: crates/turbofan-cluster/fuzz/artifacts/
+          path: crates/turbofan/fuzz/artifacts/
 
   # Opens an issue when a scheduled run fails (or comments on the open one), and closes it when one
   # passes, so a failure doesn't go unnoticed for days. Manual runs are watched by whoever ran them.

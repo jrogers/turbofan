@@ -5,7 +5,7 @@
 #   scripts/github-release.sh 0.1.0             # the release at HEAD
 #   scripts/github-release.sh 0.2.0 88dc140     # an earlier one, at the commit it was published from
 #   scripts/github-release.sh --dry-run 0.1.0   # say what it would do, changing nothing
-# It refuses a version crates.io doesn't have for `turbofan-cluster`, or one the changelog has no section
+# It refuses a version crates.io doesn't have for `turbofan`, or one the changelog has no section
 # for. Only the newest version in the changelog is marked GitHub's latest release.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -19,7 +19,7 @@ version=${1:?usage: scripts/github-release.sh [--dry-run] VERSION [COMMIT]}
 commit=$(git rev-parse --verify "${2:-HEAD}^{commit}")
 tag="v$version"
 
-# The version's heading: "## 0.1.0 (2026-11-03)", or "## `turbofan-cluster` 0.1.1 (...)" for one crate's.
+# The version's heading: "## 0.1.0 (2026-11-03)", or "## `turbofan` 0.1.1 (...)" for one crate's.
 heading=$(grep -E "^## (\`[a-z-]+\` )?${version//./\\.} \(" CHANGELOG.md | head -1 || true)
 if [[ -z $heading ]]; then
     echo "CHANGELOG.md has no section for $version" >&2
@@ -30,8 +30,8 @@ title=$(sed -E 's/^## //; s/ \(.*\)$//; s/`//g' <<<"$heading")
 newest=$(grep -E '^## (`[a-z-]+` )?[0-9]+\.[0-9]+\.[0-9]+ \(' CHANGELOG.md | head -1)
 latest=$([[ $heading == "$newest" ]] && echo true || echo false)
 
-if ! curl -sf -A "turbofan github-release.sh" "https://crates.io/api/v1/crates/turbofan-cluster/$version" >/dev/null; then
-    echo "crates.io has no turbofan-cluster $version: publish it first" >&2
+if ! curl -sf -A "turbofan github-release.sh" "https://crates.io/api/v1/crates/turbofan/$version" >/dev/null; then
+    echo "crates.io has no turbofan $version: publish it first" >&2
     exit 1
 fi
 

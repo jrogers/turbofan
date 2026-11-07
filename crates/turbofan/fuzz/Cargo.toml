@@ -1,0 +1,39 @@
+[package]
+name = "turbofan-fuzz"
+description = "cargo-fuzz targets for what turbofan reads from the network"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Kept out of the main workspace: fuzzing needs nightly and cargo fuzz.
+[workspace]
+members = ["."]
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+turbofan = { path = ".." }
+# For `Encode`, which the generated messages implement.
+turbofan-sbe = { path = "../../turbofan-sbe" }
+
+# Symbols in stack traces.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client"
+path = "fuzz_targets/client.rs"
+test = false
+doc = false
+bench = false

@@ -1,6 +1,6 @@
 # Changelog
 
-Notable changes to the published crates, `turbofan-cluster` and `turbofan-sbe`, which are released
+Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which are released
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
@@ -45,6 +45,9 @@ a patch version (0.1.1) doesn't.
 
 ### Breaking
 
+- `turbofan-cluster` is now `turbofan`: depend on `turbofan` and `use turbofan::...` in place of
+  `turbofan_cluster::...`; nothing else in the API changes for it. The sections below for 0.7.0
+  and before name it as it was.
 - `driver::Config::peer_addrs` holds `host:port` strings, not `SocketAddr`s. `Config::new`
   takes `SocketAddr`s as before.
 

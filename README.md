@@ -3,8 +3,8 @@
 <h1 align="center">turbofan</h1>
 
 <p align="center">
-  <a href="https://crates.io/crates/turbofan-cluster"><img src="https://img.shields.io/crates/v/turbofan-cluster" alt="crates.io"></a>
-  <a href="https://docs.rs/turbofan-cluster"><img src="https://img.shields.io/docsrs/turbofan-cluster" alt="docs.rs"></a>
+  <a href="https://crates.io/crates/turbofan"><img src="https://img.shields.io/crates/v/turbofan" alt="crates.io"></a>
+  <a href="https://docs.rs/turbofan"><img src="https://img.shields.io/docsrs/turbofan" alt="docs.rs"></a>
   <a href="https://github.com/jrogers/turbofan/actions/workflows/ci.yml"><img src="https://github.com/jrogers/turbofan/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
 </p>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://jrogers.github.io/turbofan/">Website</a> ·
   <a href="https://jrogers.github.io/turbofan/guide/">Guide</a> ·
-  <a href="https://docs.rs/turbofan-cluster">API</a>
+  <a href="https://docs.rs/turbofan">API</a>
 </p>
 
 > [!WARNING]
@@ -36,25 +36,25 @@ every machine agrees on, and quickly:
 - **Ledgers, reservations, quotas and schedulers**: a balance checked and debited in one step,
   the last seat won by one request, a timer fired once though the node that set it fails.
 
-[What it's for](crates/turbofan-cluster/docs/guide/use-cases.md), the guide's first chapter,
+[What it's for](crates/turbofan/docs/guide/use-cases.md), the guide's first chapter,
 goes into each, and when it isn't the right tool.
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
-| [`turbofan-cluster`](crates/turbofan-cluster) | A Raft-replicated state machine framework. A leader orders client input into a log, a quorum makes it durable, and every node applies it to the same deterministic service, so the service survives node failures without losing or repeating a message. |
+| [`turbofan`](crates/turbofan) | A Raft-replicated state machine framework. A leader orders client input into a log, a quorum makes it durable, and every node applies it to the same deterministic service, so the service survives node failures without losing or repeating a message. |
 | [`turbofan-sbe`](crates/turbofan-sbe) | SBE (Simple Binary Encoding): codecs generated from message schemas in a `build.rs`, and a schemaless API for reading and writing fields one at a time. |
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is an overview of how they fit
-together, and [the guide](crates/turbofan-cluster/docs/guide/README.md) goes from a first service to
+together, and [the guide](crates/turbofan/docs/guide/README.md) goes from a first service to
 running a cluster in production.
 
 ## Building and testing
 
 ```sh
 scripts/check.sh   # fmt, clippy -D warnings, tests, rustdoc, cargo deny
-SIM_SEEDS=1000 cargo test -p turbofan-cluster --release --test sim   # a longer simulation
+SIM_SEEDS=1000 cargo test -p turbofan --release --test sim   # a longer simulation
 scripts/fuzz.sh    # fuzz the cluster's network inputs (nightly and cargo-fuzz)
 ```
 

@@ -21,4 +21,4 @@ if [[ ! -s $diff ]]; then
     echo "no Rust changed since $base"
     exit 0
 fi
-cargo mutants --in-diff "$diff" --features turbofan-cluster/tls --jobs "${MUTANTS_JOBS:-2}" --no-shuffle -- --tests
+cargo mutants --in-diff "$diff" --features turbofan/tls --jobs "${MUTANTS_JOBS:-2}" --no-shuffle -- --tests

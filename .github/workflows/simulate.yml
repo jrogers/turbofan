@@ -1,6 +1,6 @@
 name: Simulate
 
-# Runs the simulation (crates/turbofan-cluster/tests/sim.rs) on fresh seeds each night, beyond the
+# Runs the simulation (crates/turbofan/tests/sim.rs) on fresh seeds each night, beyond the
 # fixed seeds every push runs, and the cluster test of busy clients through failovers for ten
 # minutes, beyond the seconds every push runs: the simulation doesn't drive the driver, the client
 # or TLS, which that test does over real TCP. Run it by hand for more or fewer.
@@ -30,11 +30,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Seeds from the run's ID, new each run. Stops at the first failure, which prints
-      # SIM_SEED=<n>: replay it locally with `SIM_SEED=<n> cargo test -p turbofan-cluster --release
+      # SIM_SEED=<n>: replay it locally with `SIM_SEED=<n> cargo test -p turbofan --release
       # --test sim`. `shell: bash` sets pipefail, so a failure survives the tee.
       - name: Fresh seeds
         shell: bash
-        run: cargo test -p turbofan-cluster --release --test sim -- --nocapture 2>&1 | tee sim.log
+        run: cargo test -p turbofan --release --test sim -- --nocapture 2>&1 | tee sim.log
         env:
           SIM_SEEDS: ${{ inputs.seeds || 1000 }}
           SIM_BASE: ${{ github.run_id }}0000
@@ -58,7 +58,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Soak
         shell: bash
-        run: cargo test -p turbofan-cluster --release --features tls --test soak -- --nocapture 2>&1 | tee soak.log
+        run: cargo test -p turbofan --release --features tls --test soak -- --nocapture 2>&1 | tee soak.log
         env:
           SOAK_SECS: ${{ inputs.soak_secs || 600 }}
       - uses: actions/upload-artifact@v7

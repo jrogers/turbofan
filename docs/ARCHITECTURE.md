@@ -3,15 +3,15 @@
 An overview of how Turbofan fits together, for working on it. Each crate's README says how to use
 it, [WIRE.md](WIRE.md) how the wire protocol may change, and
 [STYLE.md](STYLE.md) the house style. Paths are in
-`crates/turbofan-cluster` unless they name another crate.
+`crates/turbofan` unless they name another crate.
 
 ## The crates
 
 ```mermaid
 flowchart LR
     sbe[turbofan-sbe<br/>SBE codegen and runtime]
-    cluster[turbofan-cluster<br/>the framework]
-    fuzz[turbofan-cluster/fuzz]
+    cluster[turbofan<br/>the framework]
+    fuzz[turbofan/fuzz]
     service[a service, in its own repository:<br/>an order book, say]
 
     sbe -- "build.rs: cluster.xml" --> cluster
@@ -21,7 +21,7 @@ flowchart LR
 ```
 
 An arrow points from a crate to one that depends on it. `turbofan-sbe` generates codecs from SBE
-schemas in a `build.rs`, and is also the runtime those codecs call. `turbofan-cluster` is the
+schemas in a `build.rs`, and is also the runtime those codecs call. `turbofan` is the
 reusable core: Raft, client sessions, the disk and the network. It knows nothing of what a
 service does: a service's messages are opaque bytes to it. Services live in repositories of their
 own, depending on both crates. Here, `examples/counter.rs` is a service small enough to read whole. The fuzz crate sits
@@ -293,5 +293,5 @@ later term.
 
 `scripts/check.sh` runs fmt, clippy (the fuzz crate's too), the tests (16 simulation seeds),
 rustdoc and `cargo deny`. CI runs the same on every push, less the fuzz build and the
-simulation, and runs the benchmark too. `SIM_SEEDS=1000 cargo test -p turbofan-cluster
+simulation, and runs the benchmark too. `SIM_SEEDS=1000 cargo test -p turbofan
 --release --test sim` runs more seeds.

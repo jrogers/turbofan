@@ -3,7 +3,7 @@
     "allow": [
       "Bash(scripts/check.sh)",
       "Bash(cargo test)",
-      "Bash(SIM_SEEDS=1000 cargo test -p turbofan-cluster --release --test sim)",
+      "Bash(SIM_SEEDS=1000 cargo test -p turbofan --release --test sim)",
       "Bash(cargo build --workspace --all-features --all-targets)",
       "Bash(cargo check)",
       "Bash(cargo test --workspace --all-features)",
@@ -11,9 +11,9 @@
       "Bash(gh run watch *)",
       "Bash(cargo deny check)",
       "Bash(cargo tree *)",
-      "Bash(cargo test -p turbofan-cluster --lib)",
-      "Bash(cargo bench -p turbofan-cluster --bench cluster)",
-      "Bash(cargo bench -p turbofan-cluster --bench cluster --features tls)",
+      "Bash(cargo test -p turbofan --lib)",
+      "Bash(cargo bench -p turbofan --bench cluster)",
+      "Bash(cargo bench -p turbofan --bench cluster --features tls)",
       "Bash(cargo test -p turbofan-sbe)"
     ]
   }

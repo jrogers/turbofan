@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the website into target/site: the landing page (site/index.html) and, under guide/, a
-# book of turbofan-cluster's guide and architecture overview made with mdBook, with each page's
+# book of turbofan's guide and architecture overview made with mdBook, with each page's
 # markdown and llms.txt for language models. Needs mdbook and mdbook-mermaid,
 # at the versions .github/workflows/site.yml installs.
 #   scripts/site.sh            # build; links to files outside the book go to main on GitHub

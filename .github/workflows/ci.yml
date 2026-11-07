@@ -27,7 +27,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # The simulation's fixed seeds (crates/turbofan-cluster/tests/sim.rs), a release build: a failure
+  # The simulation's fixed seeds (crates/turbofan/tests/sim.rs), a release build: a failure
   # prints SIM_SEED=<n>, which replays it.
   simulate:
     runs-on: ubuntu-latest
@@ -35,9 +35,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p turbofan-cluster --release --test sim
+      - run: cargo test -p turbofan --release --test sim
 
-  # The fuzz targets (crates/turbofan-cluster/fuzz) still build against the current API. They're
+  # The fuzz targets (crates/turbofan/fuzz) still build against the current API. They're
   # outside the workspace, so the check job doesn't see them; fuzzing itself runs nightly (fuzz.yml).
   fuzz-build:
     runs-on: ubuntu-latest
@@ -48,9 +48,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/turbofan-cluster/fuzz
-      - run: cargo fmt --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --check
-      - run: cargo clippy --manifest-path crates/turbofan-cluster/fuzz/Cargo.toml --bins --locked -- -D warnings
+          workspaces: crates/turbofan/fuzz
+      - run: cargo fmt --manifest-path crates/turbofan/fuzz/Cargo.toml --check
+      - run: cargo clippy --manifest-path crates/turbofan/fuzz/Cargo.toml --bins --locked -- -D warnings
 
   # Mutation testing of what the push or pull request changed (scripts/mutants.sh). A mutant the
   # tests miss is a warning on its line, not a failure: some can't be caught, being the same as
@@ -108,7 +108,7 @@ jobs:
           restore-keys: bench-main-
       # Absolute paths: cargo runs the bench in the crate's directory. To the log too, so what ran
       # before a failure shows; `shell: bash` sets pipefail, so a failure still fails the step.
-      - run: cargo bench -p turbofan-cluster --bench cluster --features tls | tee bench.md
+      - run: cargo bench -p turbofan --bench cluster --features tls | tee bench.md
         shell: bash
         env:
           BENCH_BASELINE: ${{ github.workspace }}/bench-main.tsv

@@ -661,7 +661,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "turbofan-cluster"
+name = "turbofan"
 version = "0.7.0"
 dependencies = [
  "crc32c",

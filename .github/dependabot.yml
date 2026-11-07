@@ -14,7 +14,7 @@ updates:
 
   # The workspace, and the fuzz crate, which has its own Cargo.lock outside it.
   - package-ecosystem: cargo
-    directories: ["/", "/crates/turbofan-cluster/fuzz"]
+    directories: ["/", "/crates/turbofan/fuzz"]
     schedule:
       interval: monthly
     # Releases at least two weeks old, so a broken one is usually yanked or fixed first.

@@ -25,7 +25,7 @@ replay() {
             [ -f "$input" ] || continue
             local target
             target=$(basename "$(dirname "$input")")
-            echo "    (cd crates/turbofan-cluster && cargo +nightly fuzz run $target $PWD/$input)"
+            echo "    (cd crates/turbofan && cargo +nightly fuzz run $target $PWD/$input)"
         done
         ;;
     Simulate)
@@ -34,7 +34,7 @@ replay() {
         if [ -f "$log" ]; then
             seed=$(grep -oE 'SIM_SEED=[0-9]+' "$log" | head -1 | cut -d= -f2 || true)
             if [ -n "$seed" ]; then
-                echo "    SIM_SEED=$seed cargo test -p turbofan-cluster --release --test sim -- --nocapture"
+                echo "    SIM_SEED=$seed cargo test -p turbofan --release --test sim -- --nocapture"
             else
                 echo "    no failing seed in $log"
             fi
@@ -42,7 +42,7 @@ replay() {
         # The soak has no seed: its log says what went wrong, and it runs again as long.
         if [ -f "$dir/soak-log/soak.log" ]; then
             echo "    soak failed: see $dir/soak-log/soak.log, and run it again:"
-            echo "    SOAK_SECS=600 cargo test -p turbofan-cluster --release --test soak -- --nocapture"
+            echo "    SOAK_SECS=600 cargo test -p turbofan --release --test soak -- --nocapture"
         fi
         ;;
     esac

@@ -29,7 +29,7 @@ tested without sockets, and a simulated failure replays from its seed.
 
 - Keep it that way. A change that wants IO or the time inside the core wants a new input or
   output instead.
-- `turbofan-cluster` never depends on a service, or mentions what one does. A service's messages
+- `turbofan` never depends on a service, or mentions what one does. A service's messages
   are opaque bytes to it.
 - **Run at your own pace.** The driver takes what has arrived, hands it to the node as a batch
   (at most `MAX_BATCH_INPUTS`), and carries out the outputs together. Outside events never drive
@@ -122,7 +122,7 @@ next version. Change `schema/cluster.xml`, never the generated code, and only in
   append to each follower for everything that arrived together.
 - **Keep hot loops simple.** Put a hot loop in a function that takes plain values rather than
   `&self`, so both the compiler and the reader can see what it touches.
-- **Measure what you change.** `cargo bench -p turbofan-cluster --bench cluster` measures
+- **Measure what you change.** `cargo bench -p turbofan --bench cluster` measures
   throughput and latency of three nodes over real TCP and disks. Record before and after numbers
   in the commit message.
 

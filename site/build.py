@@ -2,12 +2,12 @@
 
 Called by scripts/site.sh, which runs mdBook after it:
 
-- the book's sources, in BOOK/src: the guide's chapters (crates/turbofan-cluster/docs/guide/*.md),
+- the book's sources, in BOOK/src: the guide's chapters (crates/turbofan/docs/guide/*.md),
   with a contents page made from the guide's own index, and the architecture overview
   (docs/ARCHITECTURE.md). A link to a file outside the book (WIRE.md, say)
   goes to it on GitHub, at REF.
 - the landing page, OUT/index.html: site/index.html with the version, and the counter example
-  (crates/turbofan-cluster/examples/counter.rs) and the command line that runs it, filled in, and
+  (crates/turbofan/examples/counter.rs) and the command line that runs it, filled in, and
   the benchmark's figures, from the results in the guide's performance chapter.
 
 Then, with --finish, after mdBook has built the book into OUT/guide:
@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 REPO = "https://github.com/jrogers/turbofan"
 SITE = "https://jrogers.github.io/turbofan"
-CLUSTER_DOCS = "crates/turbofan-cluster/docs"
+CLUSTER_DOCS = "crates/turbofan/docs"
 
 
 def main(book: Path, out: Path, ref: str) -> None:
@@ -44,7 +44,7 @@ def main(book: Path, out: Path, ref: str) -> None:
     shutil.copy(ROOT / "docs" / "assets" / "logo-512.png", book / "theme" / "favicon.png")
     shutil.copy(ROOT / "site" / "theme.css", book / "theme" / "turbofan.css")
 
-    guide = ROOT / "crates" / "turbofan-cluster" / "docs" / "guide"
+    guide = ROOT / "crates" / "turbofan" / "docs" / "guide"
     chapters = []
     # The guide's index is the book's first page, index.html: mdBook would render a README.md
     # there but leave links to it pointing at README.html.
@@ -54,7 +54,7 @@ def main(book: Path, out: Path, ref: str) -> None:
         (src / names[path.name]).write_text(text)
         chapters.append(names[path.name])
     architecture = (ROOT / "docs" / "ARCHITECTURE.md").read_text()
-    architecture = architecture.replace("](../crates/turbofan-cluster/docs/guide/README.md)", "](index.md)")
+    architecture = architecture.replace("](../crates/turbofan/docs/guide/README.md)", "](index.md)")
     (src / "architecture.md").write_text(relink(architecture, "docs", {"index.md"}, ref))
     (src / "SUMMARY.md").write_text(summary((guide / "README.md").read_text(), chapters))
 
@@ -135,7 +135,7 @@ def llms(chapters: list[tuple[str, str, str]], ref: str) -> str:
     lines += [
         "", "## Reference", "",
         f"- [Architecture]({SITE}/guide/architecture.md): how its crates and layers fit together",
-        "- [API reference](https://docs.rs/turbofan-cluster): every public type, on docs.rs",
+        "- [API reference](https://docs.rs/turbofan): every public type, on docs.rs",
         f"- [Wire protocol]({REPO}/blob/{ref}/docs/WIRE.md): how the protocol may change, with old and new nodes side by side",
         f"- [Changelog]({REPO}/blob/{ref}/CHANGELOG.md)",
         "", "## Optional", "",
@@ -188,13 +188,13 @@ def version() -> str:
 
 def counter() -> str:
     """The counter service, from examples/counter.rs: its state, its Service and its main."""
-    example = (ROOT / "crates" / "turbofan-cluster" / "examples" / "counter.rs").read_text()
+    example = (ROOT / "crates" / "turbofan" / "examples" / "counter.rs").read_text()
     return example[example.index("#[derive(Debug, Default)]") :]
 
 
 def serve() -> str:
     """The command line that starts the counter's first node, from examples/counter.rs's docs."""
-    example = (ROOT / "crates" / "turbofan-cluster" / "examples" / "counter.rs").read_text()
+    example = (ROOT / "crates" / "turbofan" / "examples" / "counter.rs").read_text()
     match = re.search(r"^//! ```sh\n((?://!.*\n)+?)//! ```", example, re.M)
     assert match, "examples/counter.rs no longer shows its command line: update site/build.py's serve"
     return "".join(line[4:] + "\n" for line in match.group(1).splitlines())
