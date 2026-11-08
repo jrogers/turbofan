@@ -14,6 +14,16 @@ a patch version (0.1.1) doesn't.
   Every node to `dial`, then to `accept`, then to TLS only, a restart each; off is the same
   backwards. `turbofan_plain_connections{listener}` counts the connections still plain. Not on
   the admin listener, nor with `peer_ids`.
+- `testing::Cluster` changes its members and upgrades its nodes (#10): `add_member` (starting a
+  node to join, IDs 1 to `MAX_MEMBERS`), `remove_member`, `set_role` and `members`; `upgrade`
+  restarts a node on a newer service, and `activate` switches the cluster to its version. Its
+  clients know every ID's address, as a gateway configured for the cluster's growth.
+
+### Fixed
+
+- A leader deposed without knowing it yet no longer closes a session it hasn't applied as
+  `NoSession` when its client reattaches: it redirects the client, which finds the session
+  elsewhere (#21).
 
 ## 0.10.0 (2026-11-07)
 
