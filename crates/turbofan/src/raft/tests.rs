@@ -1566,3 +1566,16 @@ fn records_read_back_are_found_each_whole() {
     assert_eq!(run.record(0), None);
     assert_eq!(run.record(4), None);
 }
+
+/// A log trimmed to a snapshot keeps the terms of what's left, down to its last entry; trimmed
+/// whole, it holds none.
+#[test]
+fn a_trimmed_log_keeps_the_terms_of_what_is_left() {
+    let mut log = entries(&[1, 1, 2, 3]);
+    log.trim_to(2);
+    assert_eq!((log.term_at(3), log.term_at(4)), (Some(2), Some(3)));
+    log.trim_to(3);
+    assert_eq!(log.term_at(4), Some(3), "the last entry alone");
+    log.trim_to(4);
+    assert!(log.terms.is_empty());
+}
