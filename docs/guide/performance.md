@@ -76,36 +76,44 @@ CI runs it on every push, and its summary has each run's table.
 ## Results
 
 On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2, Rust 1.98.1, at
-commit `cf027a9` (after 0.6.1), November 2026. Each figure is the median of three runs of 10 s,
+commit `41fa28e` (0.10.0), November 2026. Each figure is the median of three runs of 10 s,
 `--features tls`.
 
 | run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
 |---|---|---:|---:|---:|---:|
-| latency | 1 × 1 | 14,792 | 65 µs | 102 µs | 133 µs |
-| throughput | 8 × 256 | 1,113,781 | 1.03 ms | 7.14 ms | 10.24 ms |
-| latency, fsync | 1 × 1 | 139 | 6.94 ms | 11.97 ms | 14.90 ms |
-| throughput, fsync | 8 × 256 | 126,891 | 16.03 ms | 27.63 ms | 31.72 ms |
-| latency, TLS | 1 × 1 | 14,245 | 68 µs | 106 µs | 139 µs |
-| throughput, TLS | 8 × 256 | 1,095,030 | 1.06 ms | 7.89 ms | 10.66 ms |
-| latency, TLS, fsync | 1 × 1 | 122 | 8.01 ms | 14.09 ms | 16.12 ms |
-| throughput, TLS, fsync | 8 × 256 | 112,290 | 18.09 ms | 30.68 ms | 37.97 ms |
+| latency, in memory | 1 × 1 | 345,211 | 2 µs | 3 µs | 3 µs |
+| throughput, in memory | 8 × 256 | 432,742 | 4.55 ms | 10.33 ms | 10.69 ms |
+| latency | 1 × 1 | 14,744 | 65 µs | 102 µs | 133 µs |
+| throughput | 8 × 256 | 1,110,195 | 1.03 ms | 7.16 ms | 10.22 ms |
+| query latency | 1 × 1 | 22,392 | 44 µs | 61 µs | 104 µs |
+| query throughput | 8 × 256 | 2,622,430 | 761 µs | 1.25 ms | 1.53 ms |
+| latency, fsync | 1 × 1 | 127 | 7.97 ms | 12.98 ms | 15.77 ms |
+| throughput, fsync | 8 × 256 | 114,074 | 17.81 ms | 29.15 ms | 36.46 ms |
+| latency, TLS | 1 × 1 | 14,012 | 69 µs | 107 µs | 140 µs |
+| throughput, TLS | 8 × 256 | 1,110,337 | 1.04 ms | 7.73 ms | 11.13 ms |
+| query latency, TLS | 1 × 1 | 23,183 | 42 µs | 62 µs | 120 µs |
+| query throughput, TLS | 8 × 256 | 2,542,581 | 786 µs | 1.29 ms | 1.59 ms |
+| latency, TLS, fsync | 1 × 1 | 126 | 7.94 ms | 12.94 ms | 15.97 ms |
+| throughput, TLS, fsync | 8 × 256 | 111,047 | 18.09 ms | 30.98 ms | 38.58 ms |
 
 Without fsync, a message is committed in tens of microseconds, and no one task is busy: the
 throughput run is bound by its own window, 2,048 messages in flight over a round trip of about a
-millisecond. More in flight goes faster: 1,375,000 a second with 8 clients of 1,024
+millisecond. More in flight goes faster (at `cf027a9`): 1,375,000 a second with 8 clients of 1,024
 (`BENCH_THROUGHPUT=8x1024`), and 1,145,000 with 64 of 256. TLS costs little, its connections
 buffered as plain TCP's are. With fsync, the disk is what limits it: on macOS a sync is
-`F_FULLFSYNC`, which empties the drive's own cache, some milliseconds each. Group commit is why
-throughput with fsync is still over 100,000 a second: each sync covers every message that arrived
-during the one before. A Linux server's NVMe drive, with power-loss protection, syncs much faster;
-measure yours.
+`F_FULLFSYNC`, which empties the drive's own cache, some milliseconds each, and its runs vary
+the most from one to the next. Group commit is why throughput with fsync is still over 100,000 a
+second: each sync covers every message that arrived during the one before. A Linux server's NVMe
+drive, with power-loss protection, syncs much faster; measure yours.
 
-The core alone, on an Apple M3 (8 cores, 16 GB, macOS 27.2, Rust 1.99.0, November 2026), the
-median of three runs of 10 s: 304,763 messages a second one at a time, a commit through all three
-nodes in 3 µs at p50, and 369,868 a second at 8 × 256, on its one thread (openraft's benchmark,
-on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without fsync,
-nearly all of a message's 65 µs on its own over TCP is the driver's and the loopback's, not the
-core's.
+A query skips the write, so one on its own takes two thirds of a message's time, and with many in
+flight they go more than twice as fast as messages: 2.6 million a second.
+
+The core alone, the `in memory` runs: 345,211 messages a second one at a time, a commit through
+all three nodes in 2 µs at p50, and 432,742 a second at 8 × 256, on its one thread (openraft's
+benchmark, on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without
+fsync, nearly all of a message's 65 µs on its own over TCP is the driver's and the loopback's,
+not the core's.
 
 [clients]: clients.md
 [operations]: operations.md
