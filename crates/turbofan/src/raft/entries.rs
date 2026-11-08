@@ -134,9 +134,9 @@ impl Entries {
         self.window_first = self.window_first.max(index + 1);
         self.first = index + 1;
         self.configs.retain(|&(at, _)| at > index);
-        while self.terms.len() > 1 && self.terms[1].0 <= self.first {
-            self.terms.remove(0);
-        }
+        // The runs that start by `first`, but the last of them, which holds it.
+        let by_first = self.terms.partition_point(|&(start, _)| start <= self.first);
+        self.terms.drain(..by_first.saturating_sub(1));
         if self.first > self.last() {
             self.terms.clear();
         } else if let Some(run) = self.terms.first_mut() {
