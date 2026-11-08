@@ -358,6 +358,20 @@ fn reached(waiting: &mut VecDeque<(u64, u64)>, index: u64, stage: Stage, now: u6
     }
 }
 
+/// The highest of `values` that `quorum` of them reach (the `quorum`th highest), if there are that
+/// many, without allocating: it's taken on every ack. One per member, at most [`MAX_MEMBERS`]: past
+/// that, `None`, which holds back what waits for a quorum rather than panic on members off the wire.
+fn quorum_highest(values: impl IntoIterator<Item = u64>, quorum: usize) -> Option<u64> {
+    let mut all = [0; MAX_MEMBERS];
+    let mut len = 0;
+    for value in values {
+        *all.get_mut(len)? = value;
+        len += 1;
+    }
+    let nth = quorum.checked_sub(1).filter(|&nth| nth < len)?;
+    Some(*all[..len].select_nth_unstable_by(nth, |a, b| b.cmp(a)).1)
+}
+
 #[derive(Debug)]
 struct Peer {
     id: NodeId,
@@ -769,7 +783,6 @@ impl Raft {
         }
     }
 
-    /// A peer's message. Messages that aren't Raft's are ignored.
     /// A peer's message. Messages that aren't Raft's are ignored, as are acks from nodes this
     /// one isn't sending to. Any node may lead: a member this node hasn't heard was added.
     pub fn on_message(&mut self, from: NodeId, message: &wire::Decoded<'_>, now: u64) {

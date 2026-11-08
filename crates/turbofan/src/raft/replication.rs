@@ -263,12 +263,9 @@ impl Raft {
     }
 
     pub(super) fn advance_commit(&mut self) {
-        let mut matched: Vec<u64> = self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.matched).collect();
-        if self.is_voter(self.config.id) {
-            matched.push(self.durable);
-        }
-        matched.sort_unstable_by(|a, b| b.cmp(a));
-        let Some(&candidate) = matched.get(self.quorum() - 1) else { return };
+        let peers = self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.matched);
+        let mine = self.is_voter(self.config.id).then_some(self.durable);
+        let Some(candidate) = quorum_highest(peers.chain(mine), self.quorum()) else { return };
         // Only an entry of this term commits by counting; earlier ones commit beneath it.
         if candidate > self.commit && self.term_at(candidate) == Some(self.meta.term) {
             self.commit = candidate;

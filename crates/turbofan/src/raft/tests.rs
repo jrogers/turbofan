@@ -1498,3 +1498,16 @@ fn reads_are_a_leaders_and_bounded() {
     }
     assert!(!rafts[0].read_index(0), "past MAX_WAITING_READS");
 }
+
+/// The value a quorum reaches is the quorum's-th highest, in any order; with too few values, or
+/// more than a cluster has members, there's none.
+#[test]
+fn what_a_quorum_reaches_is_its_quorumth_highest() {
+    assert_eq!(quorum_highest([3, 9, 5], 2), Some(5));
+    assert_eq!(quorum_highest([9, 3, 5, 7, 1], 3), Some(5));
+    assert_eq!(quorum_highest([4], 1), Some(4));
+    assert_eq!(quorum_highest([4], 2), None, "too few");
+    assert_eq!(quorum_highest([], 1), None);
+    assert_eq!(quorum_highest([1; MAX_MEMBERS], MAX_MEMBERS), Some(1));
+    assert_eq!(quorum_highest([1; MAX_MEMBERS + 1], 1), None, "more than a cluster's members");
+}
