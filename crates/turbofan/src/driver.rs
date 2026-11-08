@@ -43,8 +43,7 @@ use crate::{snapshot, wire};
 /// Inputs waiting for the node, from clients and from the rest: past this, connections wait to
 /// hand theirs over.
 const MAX_QUEUED_INPUTS: usize = 4096;
-/// Inputs taken into one batch before persisting it, a client's or an operator's counted by its
-/// frames.
+/// Inputs taken into one batch before persisting it, a connection's counted by its frames.
 const MAX_BATCH_INPUTS: usize = 1024;
 /// The most frames a connection hands the node at once: those it has read whole, together.
 const MAX_FRAMES_AN_INPUT: usize = 256;
@@ -199,8 +198,8 @@ pub fn restore(from: &Path, config: &Config) -> io::Result<(u64, u64)> {
 }
 
 enum Input {
-    Peer(NodeId, Vec<u8>),
     /// Frames a connection read together: up to [`MAX_FRAMES_AN_INPUT`].
+    Peer(NodeId, Vec<Vec<u8>>),
     Client(ConnId, Vec<Vec<u8>>),
     Admin(ConnId, Vec<Vec<u8>>),
     Open(ConnId, mpsc::Sender<Vec<u8>>),
@@ -399,12 +398,17 @@ impl<S: Service + 'static> Core<S> {
         }
     }
 
-    /// Hands `input` to the node, returning how many inputs it counts as: a client's or an
-    /// operator's, its frames.
+    /// Hands `input` to the node, returning how many inputs it counts as: a connection's, its
+    /// frames.
     fn handle(&mut self, input: Input) -> io::Result<usize> {
         let now = self.clock.now();
         match input {
-            Input::Peer(from, frame) => self.node.on_peer(from, &decode(&frame), now),
+            Input::Peer(from, frames) => {
+                for frame in &frames {
+                    self.node.on_peer(from, &decode(frame), now);
+                }
+                return Ok(frames.len());
+            }
             Input::Client(conn, frames) => {
                 for frame in &frames {
                     self.node.on_client(conn, &decode(frame), now);
@@ -923,7 +927,7 @@ async fn accept_peers(
                 let first = read_frame(&mut stream).await?;
                 io::Result::Ok((stream, cert, first))
             };
-            let Ok(Ok((mut stream, cert, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else {
+            let Ok(Ok((stream, cert, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else {
                 return;
             };
             let theirs = hello.check(&first, wire::Role::Peer);
@@ -935,10 +939,17 @@ async fn accept_peers(
             if Some(from) == hello.node_id || (peer_ids && !tls::names(cert.as_ref(), from)) {
                 return;
             }
-            while let Ok(frame) = read_valid_frame(&mut stream).await {
+            // Only read, but its writing half kept: dropping it would close the dialler's way in.
+            let (mut reader, _writer) = stream.split();
+            while let Ok(frame) = read_valid_frame(&mut reader).await {
+                // With the rest read whole meanwhile, as a client's are: a leader's acks from a
+                // follower come many at once, each else an input of its own.
+                let mut frames = vec![frame];
+                let rest = read_buffered(&mut reader, &mut frames).await;
                 // Checked again as this node learns its epoch, or it changes: a connection from
                 // another cluster's node is dropped then.
-                if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frame)).await.is_err() {
+                if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frames)).await.is_err() || rest.is_err()
+                {
                     return;
                 }
             }
