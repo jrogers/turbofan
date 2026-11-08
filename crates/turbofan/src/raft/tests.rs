@@ -66,7 +66,7 @@ fn decode(frame: &[u8]) -> wire::Decoded<'_> {
 }
 
 /// Makes the batch durable and returns its appends and sends, as a driver would.
-fn flush(raft: &mut Raft) -> Vec<(NodeId, Vec<u8>)> {
+fn flush(raft: &mut Raft) -> Vec<(NodeId, Frame)> {
     let mut out = raft.take_outputs();
     raft.on_persisted(raft.log_end(), raft.now);
     out.appends.append(&mut out.sends);
@@ -75,7 +75,7 @@ fn flush(raft: &mut Raft) -> Vec<(NodeId, Vec<u8>)> {
 
 /// Delivers `sends` from `from`, and everything they cause, between the nodes in `up`. Returns
 /// the reads they confirmed, and dropped, on the way.
-fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Vec<u8>)>, now: u64) -> Reads {
+fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Frame)>, now: u64) -> Reads {
     /// Far more than any exchange here takes: past it, messages go back and forth for ever.
     const MAX_DELIVERED: usize = 100_000;
     let mut queue: Vec<_> = sends.into_iter().map(|(to, frame)| (NodeId(from), to, frame)).collect();
@@ -150,6 +150,33 @@ fn a_leader_counts_itself_towards_a_commit_only_once_durable() {
     let now = rafts[0].now;
     rafts[0].on_persisted(end, now);
     assert_eq!(rafts[0].commit_index(), index, "with node 1 durable, two of three");
+}
+
+/// Followers at the same index get one append, shared, not one encoded for each; one behind
+/// them gets its own, from where it is.
+#[test]
+fn followers_at_the_same_index_share_one_append() {
+    let mut rafts = cluster(3);
+    let now = 1000 * MS;
+    elect(&mut rafts, &[1, 2, 3], 1, now);
+    rafts[0].propose(b"x").unwrap();
+    let out = rafts[0].take_outputs();
+    let [(_, to_2), (_, to_3)] = <[_; 2]>::try_from(out.appends).unwrap();
+    assert!(Arc::ptr_eq(&to_2, &to_3), "one frame for both");
+    let wire::Decoded::AppendEntries(m) = decode(&to_2) else { panic!("an append") };
+    assert_eq!(m.count(), 1);
+
+    // Node 3 a record behind: its own, of two records, beside node 2's of one.
+    rafts[0].peers[1].next -= 1;
+    rafts[0].propose(b"y").unwrap();
+    let out = rafts[0].take_outputs();
+    let [(_, to_2), (_, to_3)] = <[_; 2]>::try_from(out.appends).unwrap();
+    assert!(!Arc::ptr_eq(&to_2, &to_3));
+    let counts = [&to_2, &to_3].map(|f| match decode(f) {
+        wire::Decoded::AppendEntries(m) => m.count(),
+        _ => panic!("an append"),
+    });
+    assert_eq!(counts, [1, 2]);
 }
 
 /// A leader is backlogged while its uncommitted proposals reach the limit, and not once a
@@ -408,7 +435,7 @@ fn a_vote_from_a_node_in_doubt_says_so() {
     assert_eq!((vote.granted(), vote.doubt()), (1, Some(1)));
 
     // As an older node sends it: version 0, without `doubt`.
-    let mut old = out.sends[0].1.clone();
+    let mut old = out.sends[0].1.to_vec();
     let len = old.len() - 1;
     old.truncate(len);
     old[..4].copy_from_slice(&u32::try_from(len - 4).unwrap().to_le_bytes());
@@ -534,7 +561,7 @@ fn heartbeats_to_a_peer_gone_carry_no_records() {
     let mut rafts = cluster(3);
     elect(&mut rafts, &[1, 2, 3], 1, 1000 * MS);
     let leader = &mut rafts[0];
-    let to_3 = |sends: &[(NodeId, Vec<u8>)]| -> Vec<u32> {
+    let to_3 = |sends: &[(NodeId, Frame)]| -> Vec<u32> {
         let appends = sends.iter().filter(|(to, _)| *to == NodeId(3));
         appends
             .filter_map(|(_, f)| if let wire::Decoded::AppendEntries(m) = decode(f) { Some(m.count()) } else { None })
@@ -762,7 +789,7 @@ fn snapshot_chunks_are_pipelined_and_a_lost_one_is_sent_again() {
     assert_eq!(reads, [0, CHUNK, 2 * CHUNK, 3 * CHUNK]);
     assert_eq!(chunks.len(), 4, "the whole snapshot in flight before an ack");
 
-    let deliver_chunks = |rafts: &mut [Raft], chunks: &[&Vec<u8>], now: u64| {
+    let deliver_chunks = |rafts: &mut [Raft], chunks: &[&Frame], now: u64| {
         for chunk in chunks {
             rafts[1].on_message(NodeId(1), &decode(chunk), now);
             for (_, ack) in flush(&mut rafts[1]) {
@@ -1258,7 +1285,7 @@ fn a_follower_that_lost_acknowledged_entries_is_sent_them_again() {
     // The next entry's append, and what follows, a bounded number of messages.
     let now = 2 * MS;
     rafts[0].propose(b"d");
-    let mut queue: Vec<(u8, NodeId, Vec<u8>)> = flush(&mut rafts[0]).into_iter().map(|(to, f)| (1, to, f)).collect();
+    let mut queue: Vec<(u8, NodeId, Frame)> = flush(&mut rafts[0]).into_iter().map(|(to, f)| (1, to, f)).collect();
     for _ in 0..50 {
         let Some((from, to, frame)) = queue.pop() else { break };
         if to.0 == 3 {
@@ -1324,7 +1351,8 @@ fn an_older_followers_refusal_is_answered_from_where_it_says() {
     rafts[0].propose(b"b");
     let (_, append) = flush(&mut rafts[0]).into_iter().find(|&(to, _)| to == NodeId(2)).unwrap();
     rafts[1].on_message(NodeId(1), &decode(&append), 2 * MS);
-    let Ok([(_, mut refusal)]) = <[_; 1]>::try_from(flush(&mut rafts[1])) else { panic!() };
+    let Ok([(_, refusal)]) = <[_; 1]>::try_from(flush(&mut rafts[1])) else { panic!() };
+    let mut refusal = refusal.to_vec();
     // Without `prevIndex`, the block 8 bytes shorter, and saying version 6.
     refusal.truncate(refusal.len() - 8);
     let len = u32::try_from(refusal.len() - 4).unwrap();
@@ -1389,7 +1417,7 @@ fn led_and_committed(now: u64) -> Vec<Raft> {
 }
 
 /// The read round each append carries, by whom it's to.
-fn read_rounds(sends: &[(NodeId, Vec<u8>)]) -> Vec<(NodeId, u64)> {
+fn read_rounds(sends: &[(NodeId, Frame)]) -> Vec<(NodeId, u64)> {
     let round = |frame| match decode(frame) {
         wire::Decoded::AppendEntries(m) => m.read_round(),
         _ => None,

@@ -17,7 +17,7 @@
 use std::io::{self, Read};
 
 use crate::node::{Capture, ConnId, Node, SaveSnapshot, Service};
-use crate::raft::{LogEnd, Member, NodeId, Persist, SnapshotRead};
+use crate::raft::{Frame, LogEnd, Member, NodeId, Persist, SnapshotRead};
 
 /// What a write does for one batch, in order: persist, then read.
 #[derive(Debug)]
@@ -36,7 +36,7 @@ pub struct Batch {
 #[derive(Debug)]
 struct Waiting {
     restore: Option<u64>,
-    peer_sends: Vec<(NodeId, Vec<u8>)>,
+    peer_sends: Vec<(NodeId, Frame)>,
     /// [`crate::raft::Raft::log_end`] as the batch was taken.
     log_end: LogEnd,
 }
@@ -45,11 +45,11 @@ struct Waiting {
 #[derive(Debug)]
 pub struct Taken {
     /// A leader's appends, for peers.
-    pub peer_appends: Vec<(NodeId, Vec<u8>)>,
+    pub peer_appends: Vec<(NodeId, Frame)>,
     /// Frames for clients.
     pub client_sends: Vec<(ConnId, Vec<u8>)>,
     /// Frames for peers that wait for nothing.
-    pub peer_sends: Vec<(NodeId, Vec<u8>)>,
+    pub peer_sends: Vec<(NodeId, Frame)>,
     /// See [`crate::node::Outputs::save`].
     pub save: Option<SaveSnapshot>,
     /// See [`crate::node::Outputs::peers`].
@@ -124,7 +124,7 @@ impl Pipeline {
         chunks: &[(u64, u64, Vec<u8>)],
         from: Option<&mut dyn Read>,
         now: u64,
-    ) -> io::Result<Vec<(NodeId, Vec<u8>)>> {
+    ) -> io::Result<Vec<(NodeId, Frame)>> {
         let waiting = self.writing.take().expect("a write is under way");
         for records in reads {
             node.on_read(records);

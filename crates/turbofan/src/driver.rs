@@ -36,7 +36,7 @@ use crate::meta::MetaFile;
 use crate::metrics;
 use crate::node::{self, ConnId, Node, Service};
 use crate::pipeline::{self, Pipeline};
-use crate::raft::{Entries, MAX_READ_BYTES, Member, NodeId, Persist, Role, SnapshotRead};
+use crate::raft::{Entries, Frame, MAX_READ_BYTES, Member, NodeId, Persist, Role, SnapshotRead};
 use crate::tls::{self, NodeTls};
 use crate::{snapshot, wire};
 
@@ -330,7 +330,7 @@ struct Core<S> {
     /// Peers to dial whatever the members are.
     contacts: Vec<(NodeId, String)>,
     /// The peers dialled: where, the frames for them, and the task dialling.
-    peers: HashMap<NodeId, (String, mpsc::Sender<Vec<u8>>, AbortHandle)>,
+    peers: HashMap<NodeId, (String, mpsc::Sender<Frame>, AbortHandle)>,
     dials: JoinSet<()>,
     conns: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
 }
@@ -524,7 +524,7 @@ impl<S: Service + 'static> Core<S> {
         }
     }
 
-    fn send_peers(&self, frames: Vec<(NodeId, Vec<u8>)>) {
+    fn send_peers(&self, frames: Vec<(NodeId, Frame)>) {
         for (to, frame) in frames {
             if let Some((_, tx, _)) = self.peers.get(&to) {
                 // Full or down: Raft resends.
@@ -1079,7 +1079,7 @@ async fn dial_peer(
     token: Arc<[u8]>,
     tls: tls::Current,
     node: Option<NodeId>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<Frame>,
 ) {
     let mut batch = Vec::new();
     let mut redial = REDIAL;
@@ -1116,7 +1116,13 @@ async fn dial_peer(
                 bytes += frame.len();
                 batch.push(frame);
             }
-            if write_frames(&mut stream, batch.iter().map(Vec::as_slice)).await.is_err() {
+            let written = async {
+                for frame in &batch {
+                    stream.write_all(frame).await?;
+                }
+                stream.flush().await
+            };
+            if written.await.is_err() {
                 break;
             }
         }

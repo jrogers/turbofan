@@ -30,7 +30,7 @@ use crate::client::MAX_UNACKED;
 use crate::codec::{self, MAX_PAYLOAD_BYTES};
 use crate::meta::Meta;
 use crate::metrics::Metrics;
-use crate::raft::{self, Entries, LogEnd, Member, NodeId, Persist, Raft, Role, Snapshot, SnapshotRead};
+use crate::raft::{self, Entries, Frame, LogEnd, Member, NodeId, Persist, Raft, Role, Snapshot, SnapshotRead};
 use crate::wire::{self, CloseReason};
 
 mod admin;
@@ -153,9 +153,9 @@ pub struct Outputs {
     pub reads: Vec<u64>,
     /// A leader's `AppendEntries`, for peers: send these at once, without waiting for `persist`
     /// (see [`crate::raft`]).
-    pub peer_appends: Vec<(NodeId, Vec<u8>)>,
+    pub peer_appends: Vec<(NodeId, Frame)>,
     /// Frames for peers, once `persist`, and every earlier batch's, is durable.
-    pub peer_sends: Vec<(NodeId, Vec<u8>)>,
+    pub peer_sends: Vec<(NodeId, Frame)>,
     /// Frames for clients, at once.
     pub client_sends: Vec<(ConnId, Vec<u8>)>,
     /// Read the latest snapshot from these offsets, after `persist`: see

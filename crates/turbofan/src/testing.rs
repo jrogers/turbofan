@@ -617,7 +617,7 @@ impl<S: Service> Cluster<S> {
         self.flush(id);
     }
 
-    fn send_peer(&mut self, from: NodeId, to: NodeId, frame: Vec<u8>) {
+    fn send_peer(&mut self, from: NodeId, to: NodeId, frame: raft::Frame) {
         if !self.cut.contains(&(from, to)) {
             self.schedule(self.network_latency, Scheduled::Deliver { from, to, frame });
         }
@@ -755,7 +755,7 @@ enum Scheduled {
     Deliver {
         from: NodeId,
         to: NodeId,
-        frame: Vec<u8>,
+        frame: raft::Frame,
     },
     Tick(NodeId),
     /// A node's write is durable, unless it crashed since.

@@ -134,7 +134,7 @@ impl Raft {
             let mut frame = Vec::new();
             codec::encode_frame(&message, &mut frame).expect("a chunk is within a frame");
             s.sent += crate::widen(chunk.len());
-            self.out.sends.push((self.peers[peer].id, frame));
+            self.out.sends.push((self.peers[peer].id, Arc::new(frame)));
         }
         self.peers[peer].sending = Some(s);
     }

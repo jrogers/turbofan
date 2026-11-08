@@ -71,6 +71,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec::{self, MAX_ENTRIES_PER_APPEND, Record};
@@ -129,6 +130,9 @@ impl std::str::FromStr for NodeId {
         s.parse().map(|id: std::num::NonZeroU8| Self(id.get()))
     }
 }
+
+/// A frame for a peer, shared: an append goes to every peer at the same index as one frame.
+pub type Frame = Arc<Vec<u8>>;
 
 /// The most members a cluster can have.
 pub const MAX_MEMBERS: usize = 7;
@@ -306,9 +310,9 @@ pub struct Outputs {
     /// Persist these first, in order.
     pub persist: Vec<Persist>,
     /// A leader's `AppendEntries`: send these at once, without waiting for `persist`.
-    pub appends: Vec<(NodeId, Vec<u8>)>,
+    pub appends: Vec<(NodeId, Frame)>,
     /// Once `persist` is durable, send these frames.
-    pub sends: Vec<(NodeId, Vec<u8>)>,
+    pub sends: Vec<(NodeId, Frame)>,
     /// Once `persist` is written, read the records from each of these indices on: at least one,
     /// up to [`MAX_READ_BYTES`] or the end of a log file. Give them to [`Raft::on_read`], then take
     /// outputs. A batch may ask again for a read an earlier one asked for and is still under way.
@@ -491,6 +495,9 @@ pub struct Raft {
     snapshot: Option<Snapshot>,
     /// Chunks of it read back from disk, by offset, until the next [`Raft::take_outputs`].
     fetched_chunks: Vec<(u64, Vec<u8>)>,
+    /// The latest append with records, by everything in it but its records, the index after its
+    /// last, and its frame: for the next peer at the same index, until [`Raft::take_outputs`].
+    shared_append: Option<([u64; 6], u64, Frame)>,
     /// A snapshot arriving from the leader, chunk by chunk, and how much of it has.
     incoming: Option<Snapshot>,
     /// The checksum of its bytes so far, to check against the leader's once they're all here.
@@ -573,6 +580,7 @@ impl Raft {
             out: Outputs::default(),
             snapshot,
             fetched_chunks: Vec::new(),
+            shared_append: None,
             incoming: None,
             incoming_sum: crate::codec::CHECKSUM_START,
             installed: false,
@@ -856,6 +864,7 @@ impl Raft {
         }
         self.fetched.clear();
         self.fetched_chunks.clear();
+        self.shared_append = None;
         std::mem::take(&mut self.out)
     }
 }
