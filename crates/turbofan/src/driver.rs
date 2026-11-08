@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -56,6 +56,9 @@ const MAX_QUEUED_FRAMES: usize = 4096;
 const REDIAL: Duration = Duration::from_millis(100);
 /// The longest wait before dialling an unreachable peer again.
 const MAX_REDIAL: Duration = Duration::from_secs(1);
+/// The buffer frames to a peer are written through: acks and heartbeats, tens of bytes, gather
+/// in it, a thousand to a write; an append bigger than it goes straight to the connection.
+const PEER_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 /// How long to wait to accept again after accepting failed.
 const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 /// How long a node that has stopped waits, for what it sent last to go out.
@@ -1083,11 +1086,14 @@ async fn dial_peer(
     loop {
         let dial = tls.borrow().as_ref().and_then(|t| t.dial.clone());
         let connected = tokio::time::timeout(HELLO_TIMEOUT, tls::connect(&addr, dial.as_ref(), node)).await;
-        let Ok(Ok(mut stream)) = connected else {
+        let Ok(Ok(stream)) = connected else {
             tokio::time::sleep(redial).await;
             redial = backoff(redial);
             continue;
         };
+        // Small frames gathered into fewer writes (over TLS, fewer records); an append with its
+        // records, past the buffer, goes straight through, not copied again.
+        let mut stream = BufWriter::with_capacity(PEER_WRITE_BUFFER_BYTES, stream);
         let epoch = hello.epoch();
         if write_frames(&mut stream, [&hello.frame(wire::Role::Peer, &token)[..]]).await.is_err() {
             tokio::time::sleep(redial).await;
@@ -1103,12 +1109,14 @@ async fn dial_peer(
                 break;
             }
             batch.clear();
-            batch.extend_from_slice(&frame);
-            while batch.len() < MAX_FRAME_BYTES {
+            let mut bytes = frame.len();
+            batch.push(frame);
+            while bytes < MAX_FRAME_BYTES {
                 let Ok(frame) = rx.try_recv() else { break };
-                batch.extend_from_slice(&frame);
+                bytes += frame.len();
+                batch.push(frame);
             }
-            if write_frames(&mut stream, [&batch[..]]).await.is_err() {
+            if write_frames(&mut stream, batch.iter().map(Vec::as_slice)).await.is_err() {
                 break;
             }
         }
