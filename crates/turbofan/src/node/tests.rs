@@ -241,6 +241,17 @@ fn the_service_closes_a_session() {
     assert!(client(&mut node, 8, &reattach, 0)[0].contains("NoSession"), "gone");
 }
 
+/// A session opened past what a leader has applied, as one deposed without knowing it yet
+/// hasn't: it sends the client elsewhere, not `NoSession`.
+#[test]
+fn a_session_past_what_is_applied_is_elsewhere() {
+    let mut node = leader();
+    let ahead = node.state.applied + 100;
+    let reattach = wire::Reattach { session: ahead, last_egress_seq: 0, epoch: 0, credentials: b"" };
+    let sent = client(&mut node, 7, &reattach, 0);
+    assert!(sent[0].contains("Redirect"), "{sent:?}");
+}
+
 /// Sessions open up to `MAX_SESSIONS`; past it, the next is refused, until one closes.
 #[test]
 fn sessions_open_up_to_the_limit() {
