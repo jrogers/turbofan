@@ -92,7 +92,11 @@ impl Entries {
         if self.terms.last().is_none_or(|&(_, term)| term != record.term) {
             self.terms.push((record.index, record.term));
         }
-        if let Ok((wire::Decoded::Members(m), _)) = wire::decode(record.payload) {
+        // Decoded only if it's a `Members` entry: nearly every one is a service's, for the node.
+        let header = record.payload.get(..wire::MessageHeader::SIZE).map(wire::MessageHeader::decode);
+        if header.is_some_and(|h| h.template_id == wire::Members::TEMPLATE_ID)
+            && let Ok((wire::Decoded::Members(m), _)) = wire::decode(record.payload)
+        {
             let members = m
                 .member()
                 .map(|a| Member::read(NodeId(a.id()), a.learner(), a.peer(), a.client(), a.admin()))
