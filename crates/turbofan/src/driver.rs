@@ -1238,7 +1238,64 @@ mod tests {
 
         let mut malformed = known.clone();
         malformed[8..10].copy_from_slice(&7_u16.to_le_bytes());
-        assert!(read_valid_frame(&mut &malformed[..]).await.is_err(), "another schema's");
+        // A frame after it, so a malformed one skipped would read that, not fail at the end.
+        let bytes = [malformed, known].concat();
+        let read = read_valid_frame(&mut &bytes[..]).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidData, "another schema's");
+    }
+
+    /// A frame up to `MAX_FRAME_BYTES` is read; one longer is refused by its length, before
+    /// anything is allocated for it.
+    #[tokio::test]
+    async fn a_frame_over_the_limit_is_refused() {
+        let at_limit = [&u32::try_from(MAX_FRAME_BYTES).unwrap().to_le_bytes()[..], &vec![0; MAX_FRAME_BYTES]].concat();
+        assert_eq!(read_frame(&mut &at_limit[..]).await.unwrap(), at_limit);
+        let over = u32::try_from(MAX_FRAME_BYTES + 1).unwrap().to_le_bytes();
+        let read = read_frame(&mut &over[..]).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidData, "by its length, not for want of bytes");
+    }
+
+    /// Tokens match only byte for byte: one of the same length a byte off doesn't, wherever it is.
+    #[test]
+    fn a_token_matches_only_byte_for_byte() {
+        assert!(same(b"secret", b"secret"));
+        assert!(!same(b"secret", b"secreT"));
+        assert!(!same(b"secret", b"Secret"));
+        assert!(!same(b"secret", b"secret!"));
+        assert!(!same(b"ab", b"ba"), "differences that cancel out");
+        assert!(same(b"", b""));
+    }
+
+    /// A hello is taken only with the magic, the service and the role expected.
+    #[test]
+    fn a_hello_is_taken_only_for_this_service_and_role() {
+        let ours = Hello { service_id: 7, node_id: None, epoch: Arc::new(AtomicU64::new(0)) };
+        let other_service = Hello { service_id: 8, ..ours.clone() };
+        assert!(ours.check(&ours.frame(wire::Role::Client, b""), wire::Role::Client).is_some());
+        assert!(ours.check(&ours.frame(wire::Role::Client, b""), wire::Role::Peer).is_none(), "another role");
+        assert!(ours.check(&other_service.frame(wire::Role::Client, b""), wire::Role::Client).is_none());
+        let mut frame = Vec::new();
+        let hello =
+            wire::Hello { magic: MAGIC ^ 1, service_id: 7, role: wire::Role::Client, node_id: 0, epoch: 0, token: b"" };
+        codec::encode_frame(&hello, &mut frame).unwrap();
+        assert!(ours.check(&frame, wire::Role::Client).is_none(), "another magic");
+    }
+
+    /// A token as long as a hello carries is taken; one longer is refused as the node starts.
+    #[test]
+    fn a_token_longer_than_a_hello_carries_is_refused() {
+        let unused = "127.0.0.1:1".parse().unwrap();
+        let node = node::Config::new(NodeId(1), Vec::new());
+        let config = |admin: usize, peer: usize| Config {
+            admin_token: Some(vec![b'a'; admin]),
+            peer_token: Some(vec![b'p'; peer]),
+            ..Config::new(node.clone(), 1, "unused", Vec::new(), unused, unused)
+        };
+        assert!(check_tokens(&config(MAX_TOKEN_BYTES, MAX_TOKEN_BYTES)).is_ok());
+        // The other at the limit, taken: the one over it is what's refused.
+        for (admin, peer) in [(MAX_TOKEN_BYTES + 1, MAX_TOKEN_BYTES), (MAX_TOKEN_BYTES, MAX_TOKEN_BYTES + 1)] {
+            assert_eq!(check_tokens(&config(admin, peer)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     /// A listener at its limit waits for a connection to close before it takes another.
