@@ -959,19 +959,24 @@ async fn accept_peers(
             }
             // Only read, but its writing half kept: dropping it would close the dialler's way in.
             let (mut reader, _writer) = stream.split();
-            while let Ok(frame) = read_valid_frame(&mut reader).await {
-                // With the rest read whole meanwhile, as a client's are: a leader's acks from a
-                // follower come many at once, each else an input of its own.
-                let mut frames = vec![frame];
-                let rest = read_buffered(&mut reader, &mut frames).await;
-                // Checked again as this node learns its epoch, or it changes: a connection from
-                // another cluster's node is dropped then.
-                if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frames)).await.is_err() || rest.is_err()
-                {
-                    return;
-                }
-            }
+            read_peer(&mut reader, from, epoch, &hello, &inputs).await;
         });
+    }
+}
+
+/// Hands the node what a peer sends, until it sends something malformed, the connection fails,
+/// or it's found of another cluster.
+async fn read_peer(reader: &mut tls::ReadHalf, from: NodeId, epoch: u64, hello: &Hello, inputs: &mpsc::Sender<Input>) {
+    while let Ok(frame) = read_valid_frame(reader).await {
+        // With the rest read whole meanwhile, as a client's are: a leader's acks from a
+        // follower come many at once, each else an input of its own.
+        let mut frames = vec![frame];
+        let rest = read_buffered(reader, &mut frames).await;
+        // Checked again as this node learns its epoch, or it changes: a connection from
+        // another cluster's node is dropped then.
+        if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frames)).await.is_err() || rest.is_err() {
+            return;
+        }
     }
 }
 
@@ -1095,6 +1100,18 @@ fn open_node<S: Service>(config: &Config, service: S) -> io::Result<(Node<S>, St
     Ok((node, storage, lock, clock))
 }
 
+/// Into `batch`, `first` and what else is queued, until they come to a frame's limit.
+fn gather(first: Frame, rx: &mut mpsc::Receiver<Frame>, batch: &mut Vec<Frame>) {
+    batch.clear();
+    let mut bytes = first.len();
+    batch.push(first);
+    while bytes < MAX_FRAME_BYTES {
+        let Ok(frame) = rx.try_recv() else { break };
+        bytes += frame.len();
+        batch.push(frame);
+    }
+}
+
 /// The wait before dialling again after one of `redial` failed.
 fn backoff(redial: Duration) -> Duration {
     (redial * 2).min(MAX_REDIAL)
@@ -1137,14 +1154,7 @@ async fn dial_peer(
             if hello.epoch() != epoch {
                 break;
             }
-            batch.clear();
-            let mut bytes = frame.len();
-            batch.push(frame);
-            while bytes < MAX_FRAME_BYTES {
-                let Ok(frame) = rx.try_recv() else { break };
-                bytes += frame.len();
-                batch.push(frame);
-            }
+            gather(frame, &mut rx, &mut batch);
             let written = async {
                 for frame in &batch {
                     stream.write_all(frame).await?;
@@ -1214,6 +1224,25 @@ mod tests {
         assert_eq!(waits, [ms(100), ms(200), ms(400), ms(800), ms(1000), ms(1000)]);
     }
 
+    /// Frames queued for a peer are written together up to a frame's limit, the rest left for the
+    /// next write; and a write is of whatever's queued, one frame or more.
+    #[test]
+    fn frames_to_a_peer_are_gathered_up_to_a_frames_limit() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let quarter = || Frame::new(vec![0; MAX_FRAME_BYTES / 4]);
+        for _ in 0..6 {
+            tx.try_send(quarter()).unwrap();
+        }
+        let mut batch = vec![quarter()];
+        gather(rx.try_recv().unwrap(), &mut rx, &mut batch);
+        assert_eq!(batch.len(), 4, "the one before, cleared");
+        gather(rx.try_recv().unwrap(), &mut rx, &mut batch);
+        assert_eq!(batch.len(), 2, "the rest");
+        tx.try_send(quarter()).unwrap();
+        gather(Frame::new(vec![0; 1]), &mut rx, &mut batch);
+        assert_eq!(batch.len(), 2);
+    }
+
     /// Peers are of one cluster unless both know its epoch, and they differ: a node that knows
     /// none yet (joining, or a new cluster's before its first leader names it) talks to any.
     #[test]
@@ -1265,6 +1294,30 @@ mod tests {
         let mut frames = vec![read_frame(&mut ours).await.unwrap()];
         assert!(read_buffered(&mut ours, &mut frames).await.is_err());
         assert_eq!(frames, [keepalive(1)], "those before it");
+    }
+
+    /// A peer's frames before a malformed one reach the node, and none after: it's dropped there.
+    /// None at all from a peer found of another cluster.
+    #[tokio::test]
+    async fn a_peer_is_read_up_to_a_malformed_frame() {
+        let keepalive = |session| {
+            let mut frame = Vec::new();
+            codec::encode_frame(&wire::KeepAlive { session }, &mut frame).unwrap();
+            frame
+        };
+        let mut malformed = keepalive(2);
+        malformed[8..10].copy_from_slice(&7_u16.to_le_bytes());
+        let bytes = [keepalive(1), malformed, keepalive(3)].concat();
+        let reader = || -> tls::ReadHalf { tokio::io::BufReader::new(Box::new(std::io::Cursor::new(bytes.clone()))) };
+        let hello = Hello { service_id: 1, node_id: Some(NodeId(1)), epoch: Arc::new(AtomicU64::new(7)) };
+        let (inputs, mut taken) = mpsc::channel(8);
+        read_peer(&mut reader(), NodeId(2), 7, &hello, &inputs).await;
+        let Ok(Input::Peer(NodeId(2), frames)) = taken.try_recv() else { panic!("the frame before it") };
+        assert_eq!(frames, [keepalive(1)]);
+        assert!(taken.try_recv().is_err(), "none after it");
+
+        read_peer(&mut reader(), NodeId(2), 8, &hello, &inputs).await;
+        assert!(taken.try_recv().is_err(), "another cluster's");
     }
 
     /// A connection from a newer node isn't dropped for a message this one doesn't know: it's

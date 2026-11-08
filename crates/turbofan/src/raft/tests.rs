@@ -572,7 +572,8 @@ fn heartbeats_to_a_peer_gone_carry_no_records() {
         leader.propose(b"x");
         sent += to_3(&flush(leader)).iter().map(|&n| u64::from(n)).sum::<u64>();
     }
-    assert!(sent <= MAX_IN_FLIGHT + crate::widen(MAX_ENTRIES_PER_APPEND), "{sent}");
+    // One record a proposal: up to `MAX_IN_FLIGHT` past what it acked exactly, none short.
+    assert_eq!(sent, MAX_IN_FLIGHT);
     for _ in 0..3 {
         let now = leader.next_deadline();
         leader.on_tick(now);
