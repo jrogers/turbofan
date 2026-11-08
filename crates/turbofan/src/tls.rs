@@ -403,9 +403,8 @@ pub(crate) async fn accept(
 const TLS_RECORD: (u8, u8, std::ops::RangeInclusive<u8>) = (22, 3, 1..=3);
 
 /// A plain connection begins with its hello's length, little-endian: a TLS record's first three
-/// bytes only if it's at least 0x01_0316 bytes long. A hello is a few fixed fields and its
-/// token, which a kilobyte covers with room for fields to come.
-const _: () = assert!(crate::driver::MAX_TOKEN_BYTES + 1024 < 0x01_0316);
+/// bytes only if it's at least 0x01_0316 bytes long, and a hello is far shorter.
+const _: () = assert!(crate::driver::MAX_HELLO_BYTES < 0x01_0316);
 
 /// Whether `stream` begins with a TLS handshake ([`TLS_RECORD`]), peeked, not read.
 async fn begins_tls(stream: &TcpStream) -> io::Result<bool> {

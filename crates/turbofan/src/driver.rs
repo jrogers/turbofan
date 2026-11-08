@@ -156,6 +156,10 @@ fn check_tokens(config: &Config) -> io::Result<()> {
 
 /// The longest token a hello carries.
 pub const MAX_TOKEN_BYTES: usize = 255;
+/// The longest hello taken: a few fixed fields and a token, with a kilobyte's room for fields to
+/// come. A connection's first frame is read before anything is known of it, so not up to
+/// [`MAX_FRAME_BYTES`]: else each stranger's connection may hold a megabyte.
+pub(crate) const MAX_HELLO_BYTES: usize = MAX_TOKEN_BYTES + 1024;
 
 /// Starts a new cluster from the snapshot file `from`: a copy of a node's, taken off it to back
 /// the cluster up. Writes `config.data_dir` for [`serve`] to run, with the same `config`, as the
@@ -814,10 +818,20 @@ pub(crate) async fn write_frames<'a>(
 ///
 /// If reading fails, the connection closes, or the frame is too long.
 pub(crate) async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+    read_frame_up_to(reader, MAX_FRAME_BYTES).await
+}
+
+/// Reads a connection's first frame, its hello, refusing one over [`MAX_HELLO_BYTES`].
+async fn read_hello(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+    read_frame_up_to(reader, MAX_HELLO_BYTES).await
+}
+
+/// [`read_frame`], refusing one over `max` bytes by its length, before anything is allocated.
+async fn read_frame_up_to(reader: &mut (impl AsyncRead + Unpin), max: usize) -> io::Result<Vec<u8>> {
     let len = reader.read_u32_le().await?;
     let len = usize::try_from(len).map_err(io::Error::other)?;
-    if len > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame over MAX_FRAME_BYTES"));
+    if len > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("a frame of {len} bytes, over {max}")));
     }
     let mut frame = vec![0; 4 + len];
     frame[..4].copy_from_slice(&u32::try_from(len).expect("checked").to_le_bytes());
@@ -924,7 +938,7 @@ async fn accept_peers(
         conns.spawn(async move {
             let handshake = async {
                 let (mut stream, cert) = tls::accept(stream, tls.as_ref(), plain_beside).await?;
-                let first = read_frame(&mut stream).await?;
+                let first = read_hello(&mut stream).await?;
                 io::Result::Ok((stream, cert, first))
             };
             let Ok(Ok((stream, cert, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else {
@@ -1009,7 +1023,7 @@ async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
     };
     let handshake = async {
         let (mut stream, _) = tls::accept(stream, tls.as_ref(), plain_beside).await?;
-        let first = read_frame(&mut stream).await?;
+        let first = read_hello(&mut stream).await?;
         io::Result::Ok((stream, first))
     };
     let Ok(Ok((stream, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else { return };
@@ -1277,6 +1291,19 @@ mod tests {
         assert_eq!(read_frame(&mut &at_limit[..]).await.unwrap(), at_limit);
         let over = u32::try_from(MAX_FRAME_BYTES + 1).unwrap().to_le_bytes();
         let read = read_frame(&mut &over[..]).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidData, "by its length, not for want of bytes");
+    }
+
+    /// A hello with the longest token is taken; a first frame longer than a hello can be is
+    /// refused by its length, before anything is allocated for it.
+    #[tokio::test]
+    async fn a_first_frame_longer_than_a_hello_is_refused() {
+        let hello = Hello { service_id: 7, node_id: None, epoch: Arc::new(AtomicU64::new(0)) };
+        let longest = hello.frame(wire::Role::Client, &[b't'; MAX_TOKEN_BYTES]);
+        assert!(longest.len() <= MAX_HELLO_BYTES, "{} bytes", longest.len());
+        assert_eq!(read_hello(&mut &longest[..]).await.unwrap(), longest);
+        let over = u32::try_from(MAX_HELLO_BYTES + 1).unwrap().to_le_bytes();
+        let read = read_hello(&mut &over[..]).await;
         assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidData, "by its length, not for want of bytes");
     }
 
