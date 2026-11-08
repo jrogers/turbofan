@@ -333,7 +333,7 @@ async fn reload(tls: NodeTls, current: watch::Sender<Option<Loaded>>) {
 /// [`io::ErrorKind::PermissionDenied`].
 pub(crate) async fn connect(addr: &str, tls: Option<&ClientTls>, node: Option<NodeId>) -> io::Result<Conn> {
     let stream = TcpStream::connect(addr).await?;
-    let _ = stream.set_nodelay(true);
+    tune(&stream);
     match tls {
         Some(tls) => imp::connect(&tls.0, addr, stream, node).await,
         None => Ok(plain(stream)),
@@ -346,6 +346,29 @@ pub(crate) type Cert = imp::Cert;
 /// Whether `cert` names node `id`.
 pub(crate) fn names(cert: Option<&Cert>, id: NodeId) -> bool {
     cert.is_some_and(|cert| imp::names(cert, id))
+}
+
+/// How long a connection's other end may leave what's sent it unacknowledged, or keepalive probes
+/// unanswered, before the connection is dropped: one that vanished without closing (its host gone,
+/// a firewall dropping its packets) is otherwise kept for the kernel's quarter of an hour. A peer's
+/// dialler only writes, so it would write into the void, and not dial again, all that time.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), expect(dead_code, reason = "Linux's alone"))]
+const DEAD_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection is idle before keepalive probes start, and the time between them: probes
+/// find a dead one that has nothing unacknowledged, such as a peer's, read from and never written.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(5);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Sets a new connection's options: no Nagle delay, and dropped once its other end is dead
+/// ([`DEAD_CONNECTION_TIMEOUT`]). Best effort: a connection without them still works.
+fn tune(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let socket = socket2::SockRef::from(stream);
+    let probes = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE).with_interval(KEEPALIVE_INTERVAL);
+    let _ = socket.set_tcp_keepalive(&probes);
+    // Linux's alone: elsewhere what's unacknowledged is given up on in the kernel's own time.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = socket.set_tcp_user_timeout(Some(DEAD_CONNECTION_TIMEOUT));
 }
 
 fn plain(stream: TcpStream) -> Conn {
@@ -361,7 +384,7 @@ pub(crate) async fn accept(
     tls: Option<&Acceptor>,
     plain_beside: Option<&'static str>,
 ) -> io::Result<(Conn, Option<Cert>)> {
-    let _ = stream.set_nodelay(true);
+    tune(&stream);
     match (tls, plain_beside) {
         (Some(tls), None) => imp::accept(tls, stream).await,
         (Some(tls), Some(listener)) => {
@@ -705,5 +728,23 @@ mod tests {
         let error = read.expect("closed, not left open").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
         drop(dialled);
+    }
+
+    /// A connection, dialled or accepted, probes its other end when idle, and on Linux gives up on
+    /// what goes unacknowledged in [`super::DEAD_CONNECTION_TIMEOUT`], not the kernel's own time.
+    #[tokio::test]
+    async fn a_connection_finds_its_other_end_dead() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (dialled, accepted) = tokio::join!(super::connect(&addr, None, None), listener.accept());
+        let super::Conn::Plain(dialled) = dialled.unwrap() else { panic!("plain TCP") };
+        let (accepted, _) = super::accept(accepted.unwrap().0, None, None).await.unwrap();
+        let super::Conn::Plain(accepted) = accepted else { panic!("plain TCP") };
+        for stream in [dialled.get_ref().get_ref(), accepted.get_ref().get_ref()] {
+            let socket = socket2::SockRef::from(stream);
+            assert!(socket.keepalive().unwrap());
+            #[cfg(target_os = "linux")]
+            assert_eq!(socket.tcp_user_timeout().unwrap(), Some(super::DEAD_CONNECTION_TIMEOUT));
+        }
     }
 }
