@@ -247,6 +247,37 @@ async fn a_member_joins_and_another_leaves() {
     exchange(&mut cluster, &mut client, 301, 400).await;
 }
 
+/// A member removed and added back at another peer address is dialled there, not where it was:
+/// once it's needed for a majority, the cluster still answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_back_at_another_address_is_dialled_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new(dir.path(), |_| None);
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 50).await;
+    let admin = Admin::new(cluster.configs[1].admin_listen.to_string(), SERVICE_ID)
+        .with_token(TOKEN)
+        .with_timeout(Duration::from_secs(20));
+    cluster.start(3);
+    let fourth = member(&cluster.addrs, NodeId(4));
+    admin.add_member(&fourth).await.unwrap();
+    exchange(&mut cluster, &mut client, 51, 100).await;
+
+    admin.remove_member(NodeId(4)).await.unwrap();
+    cluster.kill(3).await;
+    let moved = ports(1)[0];
+    cluster.configs[3].peer_listen = Some(moved);
+    cluster.start(3);
+    let mut elsewhere = fourth.clone();
+    elsewhere.peer = moved.to_string();
+    admin.add_member(&elsewhere).await.unwrap();
+    exchange(&mut cluster, &mut client, 101, 150).await;
+    // Three of the four left up: node 4, at its new address, is one of any majority.
+    cluster.kill(0).await;
+    exchange(&mut cluster, &mut client, 151, 200).await;
+}
+
 /// A node's capture of its log, from its snapshot to its commit index, replayed offline into the
 /// service, echoes what the cluster echoed after the snapshot, in order, and ends with the
 /// service as the cluster had it: each message once.
@@ -391,6 +422,8 @@ async fn a_lost_cluster_is_restored_from_a_copy_of_a_snapshot() {
 
     let mut restored = cluster.configs[0].clone();
     restored.data_dir = dir.path().join("restored");
+    // A learner in the members it's given: restored a voter, else a cluster of one couldn't lead.
+    restored.node.raft.members[0].learner = true;
     let (index, _) = driver::restore(&backup, &restored).unwrap();
     assert!(index >= asked, "the snapshot copied, {index}, is at least the one asked for, {asked}");
     let again = driver::restore(&backup, &restored).unwrap_err();

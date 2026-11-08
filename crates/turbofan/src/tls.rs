@@ -690,4 +690,20 @@ mod tests {
         let (read, _reader) = waiting.await.unwrap();
         assert_eq!(read, frame(4), "from the socket, after the buffer");
     }
+
+    /// A connection shut down is closed at the other end, which reads its end, though this end
+    /// is still held.
+    #[tokio::test]
+    async fn a_connection_shut_down_is_closed_at_the_other_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dialled = tokio::spawn(async move { connect(&addr, None, None).await.unwrap() });
+        let (mut accepted, _) = accept(listener.accept().await.unwrap().0, None, None).await.unwrap();
+        let mut dialled = dialled.await.unwrap();
+        dialled.shutdown().await.unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut accepted)).await;
+        let error = read.expect("closed, not left open").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        drop(dialled);
+    }
 }

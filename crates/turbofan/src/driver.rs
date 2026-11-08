@@ -1378,6 +1378,46 @@ mod tests {
         assert_eq!(at, base + 3 * SECOND + 1_000_000 - 500_000);
         // A monotonic reading behind the last changes nothing.
         assert_eq!(clock.advance(SECOND, base), at);
+        // A gap narrower than a second's slew is closed at once, either way.
+        let free = at + SECOND;
+        assert_eq!(clock.advance(4 * SECOND, free + 100), free + 100);
+        assert_eq!(clock.advance(5 * SECOND, free + SECOND - 100), free + SECOND - 100);
+    }
+
+    /// The driver's clock starts at the wall clock, and a cluster time ahead is due that far
+    /// ahead on the monotonic clock.
+    #[test]
+    fn the_drivers_clock_starts_at_the_wall_clock() {
+        let mut clock = Clock::new();
+        // Read here, not by `wall_ns`, which is what's checked.
+        let wall = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+        let gap = clock.now().abs_diff(wall);
+        assert!(gap < SECOND, "{gap} ns from the wall clock");
+        let ahead = Duration::from_millis(500);
+        let now = clock.now();
+        let due = clock.instant(now + crate::raft::nanos(ahead));
+        let from_now = due.saturating_duration_since(Instant::now());
+        assert!(from_now > ahead / 2 && from_now <= ahead, "due in {from_now:?}");
+    }
+
+    /// A node configured wrong doesn't serve: its error is returned.
+    #[tokio::test]
+    async fn serve_returns_why_it_cant_start() {
+        let unused = "127.0.0.1:1".parse().unwrap();
+        let mut config = Config::new(node::Config::new(NodeId(1), Vec::new()), 1, "unused", Vec::new(), unused, unused);
+        config.admin_token = Some(vec![b'a'; MAX_TOKEN_BYTES + 1]);
+        struct Nothing;
+        impl Service for Nothing {
+            fn on_message(&mut self, _: &mut node::Ctx, _: node::SessionId, _: &[u8]) {}
+            fn snapshot(&self) -> node::SnapshotWriter {
+                Box::new(|_| Ok(()))
+            }
+            fn restore(&mut self, _: &mut dyn io::Read) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let served = tokio::time::timeout(Duration::from_secs(5), serve(config, Nothing)).await;
+        assert_eq!(served.expect("returned at once").unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     /// With `peer_ids`, a peer dialling in is taken only as the node its certificate names: one
