@@ -402,6 +402,26 @@ struct Peer {
     read_round: u64,
 }
 
+/// A run of whole records read back from disk, kept as read: one buffer, not one for each.
+#[derive(Debug)]
+struct Fetched {
+    /// The index of the first.
+    first: u64,
+    bytes: Vec<u8>,
+    /// Where each record ends in `bytes`, in order.
+    ends: Vec<usize>,
+}
+
+impl Fetched {
+    /// The record at `index`, if the run has it.
+    fn record(&self, index: u64) -> Option<&[u8]> {
+        let i = usize::try_from(index.checked_sub(self.first)?).ok()?;
+        let end = *self.ends.get(i)?;
+        let start = i.checked_sub(1).map_or(0, |before| self.ends[before]);
+        Some(&self.bytes[start..end])
+    }
+}
+
 /// A leadership transfer under way.
 #[derive(Debug, Clone, Copy)]
 struct Transfer {
@@ -470,9 +490,8 @@ pub struct Raft {
     unpersisted: VecDeque<(u64, u64)>,
     unapplied: VecDeque<(u64, u64)>,
     uncommitted_bytes: usize,
-    /// Records read back from disk, by the index of the first in each run, until the next
-    /// [`Raft::take_outputs`].
-    fetched: Vec<(u64, Vec<Vec<u8>>)>,
+    /// Runs of records read back from disk, until the next [`Raft::take_outputs`].
+    fetched: Vec<Fetched>,
     durable: u64,
     commit: u64,
     peers: Vec<Peer>,

@@ -1539,3 +1539,29 @@ fn what_a_quorum_reaches_is_its_quorumth_highest() {
     assert_eq!(quorum_highest([1; MAX_MEMBERS], MAX_MEMBERS), Some(1));
     assert_eq!(quorum_highest([1; MAX_MEMBERS + 1], 1), None, "more than a cluster's members");
 }
+
+/// A run of records read back is found record by record, each whole, and nothing either side of
+/// it.
+#[test]
+fn records_read_back_are_found_each_whole() {
+    let records: Vec<Vec<u8>> = [(1, 1), (2, 1), (3, 2)]
+        .map(|(index, term)| {
+            let mut record = Vec::new();
+            Record { term, index, payload: b"x" }.encode_into(&mut record);
+            record
+        })
+        .into();
+    let ends = records
+        .iter()
+        .scan(0, |at, record| {
+            *at += record.len();
+            Some(*at)
+        })
+        .collect::<Vec<_>>();
+    let run = Fetched { first: 1, bytes: records.concat(), ends };
+    for (index, record) in (1..).zip(&records) {
+        assert_eq!(run.record(index), Some(&record[..]));
+    }
+    assert_eq!(run.record(0), None);
+    assert_eq!(run.record(4), None);
+}

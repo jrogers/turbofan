@@ -25,19 +25,19 @@ impl Raft {
     /// Records read back from disk for [`Outputs::reads`]. They're kept until the next
     /// [`Raft::take_outputs`]; any that the log doesn't hold, or holds in memory, are ignored.
     pub fn on_read(&mut self, records: &[u8]) {
-        let (mut first, mut run, mut at) = (None, Vec::new(), 0);
+        let (mut first, mut ends, mut at) = (None, Vec::new(), 0);
         while let Ok(Some((record, len))) = Record::decode(&records[at..]) {
-            let index = first.map_or(record.index, |f| f + crate::widen(run.len()));
+            let index = first.map_or(record.index, |f| f + crate::widen(ends.len()));
             let on_disk = index >= self.log.first && index < self.log.window_first;
             if record.index != index || !on_disk || self.log.term_at(index) != Some(record.term) {
                 break;
             }
             first.get_or_insert(index);
-            run.push(records[at..at + len].to_vec());
             at += len;
+            ends.push(at);
         }
         if let Some(first) = first {
-            self.fetched.push((first, run));
+            self.fetched.push(Fetched { first, bytes: records[..at].to_vec(), ends });
         }
     }
 
@@ -373,11 +373,7 @@ impl Raft {
         if index < self.log.first || index > self.last_index() {
             return None;
         }
-        self.log.record(index).or_else(|| {
-            self.fetched
-                .iter()
-                .find_map(|(first, run)| run.get(usize::try_from(index.checked_sub(*first)?).ok()?).map(Vec::as_slice))
-        })
+        self.log.record(index).or_else(|| self.fetched.iter().find_map(|run| run.record(index)))
     }
 
     pub(super) fn last_term(&self) -> u64 {
