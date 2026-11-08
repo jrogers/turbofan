@@ -31,6 +31,12 @@
 //! A second table says where the time goes: from an entry proposed on the leader to its own copy
 //! durable, to committed, and to applied (and so answered), from the node's metrics, beside the
 //! client's round trip.
+//!
+//! `BENCH_CLUSTER=<addr,...>` drives a cluster running elsewhere instead, the clients alone in
+//! this process: the client addresses of nodes of `examples/echo.rs`, on machines of their own, so
+//! the clients don't take the nodes' CPUs. The nodes' runs alone, as they're configured:
+//! `BENCH_FSYNC=1` says they `serve --fsync`, and `BENCH_TLS_CA=<pem>` that they're over TLS,
+//! their certificates signed by that CA. Not the stages, which are the nodes' metrics.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -132,10 +138,12 @@ async fn main() {
     let secs = std::env::var("BENCH_SECS").map_or(10, |s| s.parse().expect("BENCH_SECS is a number"));
     let shape = throughput_shape();
     let cpus = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
-    println!(
-        "Three nodes on one machine ({}, {cpus} CPUs), {PAYLOAD_BYTES}-byte messages, {secs}s a run.",
-        std::env::consts::OS
-    );
+    let remote = remote();
+    let place = match &remote {
+        Some((addrs, ..)) => format!("A cluster at {}, its clients on this machine", addrs.join(", ")),
+        None => "Three nodes on one machine".to_owned(),
+    };
+    println!("{place} ({}, {cpus} CPUs), {PAYLOAD_BYTES}-byte messages, {secs}s a run.", std::env::consts::OS);
     println!();
     let baseline = std::env::var("BENCH_BASELINE").ok().and_then(|path| std::fs::read_to_string(path).ok());
     let baseline: Option<Vec<(&str, u64)>> = baseline.as_deref().map(|text| {
@@ -158,42 +166,59 @@ async fn main() {
         results.push_str(&format!("{name}\t{msgs}\n"));
         println!("{row}{}", compared(&name, msgs, baseline.as_deref(), &mut warnings));
     };
-    // Before the clusters over TCP, which go on heartbeating once they're done with.
-    for (name, clients, window) in [("latency, in memory", 1, 1), ("throughput, in memory", shape.0, shape.1)] {
-        let mut latencies = in_memory(clients, window, secs);
-        latencies.sort_unstable();
-        let (msgs, row) = table_row(name, clients, window, &latencies, secs);
-        report((name.to_owned(), msgs, row, None, 0));
-    }
-    let dir = tempfile::tempdir().unwrap();
-    for tls in [false, true] {
-        if tls && !cfg!(feature = "tls") {
-            break;
+    if let Some((addrs, tls, fsync)) = &remote {
+        // Once a client has a session, there's a leader.
+        drop(connect(addrs, tls.as_ref()).await);
+        for run in bench(addrs, tls.as_ref(), *fsync, secs, shape, &stages).await {
+            report(run);
         }
-        for fsync in [driver::Fsync::Never, driver::Fsync::EachBatch] {
-            let dir = dir.path().join(format!("{}-{fsync:?}", if tls { "tls" } else { "plain" }));
-            let (addrs, tls) = start(&dir, tls, fsync);
-            // Once a client has a session, there's a leader.
-            drop(connect(&addrs, tls.as_ref()).await);
-            for run in bench(&addrs, tls.as_ref(), fsync, secs, shape, &stages).await {
-                report(run);
+    } else {
+        // Before the clusters over TCP, which go on heartbeating once they're done with.
+        for (name, clients, window) in [("latency, in memory", 1, 1), ("throughput, in memory", shape.0, shape.1)] {
+            let mut latencies = in_memory(clients, window, secs);
+            latencies.sort_unstable();
+            let (msgs, row) = table_row(name, clients, window, &latencies, secs);
+            report((name.to_owned(), msgs, row, None, 0));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for tls in [false, true] {
+            if tls && !cfg!(feature = "tls") {
+                break;
+            }
+            for fsync in [driver::Fsync::Never, driver::Fsync::EachBatch] {
+                let dir = dir.path().join(format!("{}-{fsync:?}", if tls { "tls" } else { "plain" }));
+                let (addrs, tls) = start(&dir, tls, fsync);
+                // Once a client has a session, there's a leader.
+                drop(connect(&addrs, tls.as_ref()).await);
+                for run in bench(&addrs, tls.as_ref(), fsync, secs, shape, &stages).await {
+                    report(run);
+                }
             }
         }
     }
-    println!();
-    println!("Where the time goes, from proposed on the leader: p50 / p99.");
-    println!();
-    println!("| run | persisted | committed | applied | client's round trip |");
-    println!("|---|---:|---:|---:|---:|");
-    for row in stage_rows {
-        println!("{row}");
-    }
+    print_stages(&stage_rows);
     if let Ok(path) = std::env::var("BENCH_RESULTS") {
         std::fs::write(path, results).unwrap();
     }
     if !warnings.is_empty() {
         println!();
         println!("{}", warnings.join("\n"));
+    }
+}
+
+/// The second table, of where the time goes: none from a cluster elsewhere, whose stages are its
+/// nodes' metrics.
+fn print_stages(rows: &[String]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("Where the time goes, from proposed on the leader: p50 / p99.");
+    println!();
+    println!("| run | persisted | committed | applied | client's round trip |");
+    println!("|---|---:|---:|---:|---:|");
+    for row in rows {
+        println!("{row}");
     }
 }
 
@@ -209,6 +234,19 @@ fn compared(name: &str, msgs: u64, baseline: Option<&[(&str, u64)]>, warnings: &
             .push(format!("::warning title=Benchmark regression::{name}: {msgs} msgs/s, {percent}% of main's {then}"));
     }
     format!(" {percent}%{} |", if flagged { " ⚠️" } else { "" })
+}
+
+/// The cluster elsewhere `BENCH_CLUSTER` names, if it does: its client addresses, what a client
+/// connects to it with over TLS (`BENCH_TLS_CA`), and how its nodes sync (`BENCH_FSYNC`).
+fn remote() -> Option<(Vec<String>, Option<ClientTls>, driver::Fsync)> {
+    let addrs: Vec<String> = std::env::var("BENCH_CLUSTER").ok()?.split(',').map(str::to_owned).collect();
+    let tls = std::env::var("BENCH_TLS_CA").ok().map(|ca| ClientTls::load(Path::new(&ca), None).expect("BENCH_TLS_CA"));
+    let fsync = match std::env::var("BENCH_FSYNC").as_deref() {
+        Ok("1") => driver::Fsync::EachBatch,
+        Err(_) | Ok("0") => driver::Fsync::Never,
+        Ok(other) => panic!("BENCH_FSYNC is 1 or 0, not {other}"),
+    };
+    Some((addrs, tls, fsync))
 }
 
 /// The throughput run's clients and messages in flight each, from `BENCH_THROUGHPUT`.
@@ -242,8 +280,10 @@ async fn bench(
         let (msgs, row) = table_row(&format!("{name}{over}{failover}"), clients, window, &latencies, secs);
         let both = |sorted: &[u64]| format!("{} / {}", per_mille(sorted, 500), per_mille(sorted, 990));
         let [persisted, committed, applied] = by_stage.each_ref().map(|s| both(s));
-        let stage_row = format!("| {name}{over} | {persisted} | {committed} | {applied} | {} |", both(&latencies));
-        rows.push((format!("{name}{over}"), msgs, row, Some(stage_row), reattached));
+        // The stages are the nodes' metrics: none from a cluster elsewhere.
+        let stage_row = (!by_stage[0].is_empty())
+            .then(|| format!("| {name}{over} | {persisted} | {committed} | {applied} | {} |", both(&latencies)));
+        rows.push((format!("{name}{over}"), msgs, row, stage_row, reattached));
     }
     if fsync == driver::Fsync::Never {
         for (name, clients, window) in [("query latency", 1, 1), ("query throughput", shape.0, shape.1)] {

@@ -18,6 +18,9 @@ a patch version (0.1.1) doesn't.
   node to join, IDs 1 to `MAX_MEMBERS`), `remove_member`, `set_role` and `members`; `upgrade`
   restarts a node on a newer service, and `activate` switches the cluster to its version. Its
   clients know every ID's address, as a gateway configured for the cluster's growth.
+- `examples/echo.rs`, the benchmark's service as a binary, and `BENCH_CLUSTER=<addr,...>`, the
+  benchmark driving a cluster of them elsewhere, its clients alone on its machine (#24):
+  `BENCH_FSYNC=1` and `BENCH_TLS_CA=<pem>` say how the nodes run.
 
 ### Fixed
 
