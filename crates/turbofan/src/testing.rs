@@ -44,6 +44,9 @@ use crate::{NodeConfig, snapshot, wire};
 /// The most client events a client holds before the test takes them ([`Cluster::events`]): a
 /// test that never does would otherwise grow them without end.
 pub const MAX_CLIENT_EVENTS: usize = 1 << 20;
+/// The most events the cluster holds in flight. Messages that beget more than one each (a bug)
+/// would otherwise grow them without end in no time of the cluster's, which bounds the runs.
+pub const MAX_QUEUED_EVENTS: usize = 1 << 20;
 /// How long a client waits to dial again when there's no node to dial, or no leader yet.
 const REDIAL: Duration = Duration::from_millis(50);
 /// How long [`Builder::build`] waits for the first leader.
@@ -735,6 +738,7 @@ impl<S: Service> Cluster<S> {
     }
 
     fn schedule(&mut self, after: u64, event: Scheduled) {
+        assert!(self.events.len() < MAX_QUEUED_EVENTS, "a storm of messages at {:?}", Duration::from_nanos(self.now));
         self.events.insert((self.now + after, self.next_event), event);
         self.next_event += 1;
     }
