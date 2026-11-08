@@ -9,8 +9,9 @@ repository.workspace = true
 readme = "../../README.md"
 keywords = ["raft", "replication", "consensus", "state-machine", "distributed"]
 categories = ["network-programming", "database-implementations", "asynchronous"]
-# The fuzz targets build only with cargo fuzz, outside the workspace.
-exclude = ["fuzz"]
+# The fuzz targets build only with cargo fuzz, outside the workspace; the TLA+ model is checked
+# with scripts/tla.sh.
+exclude = ["fuzz", "tla"]
 
 # Document every feature on docs.rs, so the TLS configuration appears.
 [package.metadata.docs.rs]

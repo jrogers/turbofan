@@ -53,9 +53,9 @@
 //! on disk ([`Persist::Trust`]).
 //! Meanwhile its votes say so, and an election needs a vote more than a majority for each voter
 //! in doubt, its own included (or every member): however many of those lost a committed entry,
-//! the voters then still include one that holds it and turns down a candidate without it. After
-//! a power cut that tears every node's log, all of them doubt, and an election needs every
-//! member up.
+//! the voters then still include one that holds it, if any node still does, and turns down a
+//! candidate without it. After a power cut that tears every node's log, all of them doubt, and
+//! an election needs every member up.
 //!
 //! **The driver's one rule:** perform each [`Outputs`]' `persist` operations in order, batch
 //! after batch, and make them durable; then call [`Raft::on_persisted`] with the
