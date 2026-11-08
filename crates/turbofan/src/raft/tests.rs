@@ -1579,3 +1579,23 @@ fn a_trimmed_log_keeps_the_terms_of_what_is_left() {
     log.trim_to(4);
     assert!(log.terms.is_empty());
 }
+
+/// An append carries records up to `MAX_APPEND_BYTES` exactly, and the next goes in another.
+#[test]
+fn an_append_is_filled_to_its_byte_limit() {
+    let mut rafts = cluster(3);
+    elect(&mut rafts, &[1, 2, 3], 1, 1000 * MS);
+    let leader = &mut rafts[0];
+    flush(leader);
+    // Records of 40,000 bytes, their headers in: 25 of them are the limit to the byte.
+    let payload = vec![b'x'; 40_000 - codec::RECORD_HEADER];
+    for _ in 0..26 {
+        leader.propose(&payload);
+    }
+    let counts: Vec<u32> = flush(leader)
+        .iter()
+        .filter(|(to, _)| *to == NodeId(2))
+        .filter_map(|(_, f)| if let wire::Decoded::AppendEntries(m) = decode(f) { Some(m.count()) } else { None })
+        .collect();
+    assert_eq!(counts, [25, 1]);
+}
