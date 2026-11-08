@@ -428,9 +428,11 @@ impl<S: Service + 'static> Core<S> {
             Input::Open(conn, tx) => {
                 self.conns.insert(conn, tx);
             }
+            // Unless the node was told already, as it dropped one too slow to read.
             Input::Closed(conn) => {
-                self.conns.remove(&conn);
-                self.node.on_disconnect(conn);
+                if self.conns.remove(&conn).is_some() {
+                    self.node.on_disconnect(conn);
+                }
             }
             Input::SnapshotSaved(saved) => self.node.on_snapshot_saved(saved?),
         }
@@ -506,6 +508,8 @@ impl<S: Service + 'static> Core<S> {
     /// Dials `members` and the contacts, a member's address taking precedence, and stops dialling
     /// any other peer.
     fn dial(&mut self, members: &[Member]) {
+        // Those stopped below, the last time, reaped: each is kept till joined.
+        while self.dials.try_join_next().is_some() {}
         let mut wanted: HashMap<NodeId, String> = self.contacts.iter().cloned().collect();
         wanted.extend(members.iter().map(|m| (m.id, m.peer.clone())));
         wanted.retain(|&id, _| Some(id) != self.hello.node_id);
