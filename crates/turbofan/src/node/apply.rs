@@ -21,16 +21,23 @@ impl<S: Service> Node<S> {
         while self.state.applied < self.raft.commit_index() {
             let index = self.state.applied + 1;
             let ours = self.raft.role() == Role::Leader && self.raft.term_at(index) == Some(self.raft.term());
-            let Some(payload) = self.raft.entry(index).map(<[u8]>::to_vec) else {
+            // Copied out of the log, which the entry's callbacks may change, into room kept for
+            // it rather than allocated for each.
+            let mut payload = std::mem::take(&mut self.local.entry);
+            let Some(record) = self.raft.entry(index) else {
+                self.local.entry = payload;
                 self.raft.fetch(index);
                 break;
             };
+            payload.clear();
+            payload.extend_from_slice(record);
             // An entry this node can't read was logged by a newer one before every member could
             // read it, which WIRE.md's rules forbid.
             let (entry, _) = wire::decode(&payload).expect("a log entry of a version this node knows");
             self.state.applied = index;
             self.apply_entry(index, &entry, ours);
             let wanted = matches!(entry, wire::Decoded::Snapshot(_));
+            self.local.entry = payload;
             let last = self.raft.snapshot_index().max(self.saving.unwrap_or(0));
             if wanted || index >= last + self.config.snapshot_every_entries {
                 self.take_snapshot();
@@ -209,11 +216,11 @@ impl<S: Service> Node<S> {
         self.ctx.now = self.state.time;
         self.ctx.service_version = self.state.service_version;
         callback(&mut self.service, &mut self.ctx);
-        let effects = std::mem::take(&mut self.ctx.effects);
+        let mut effects = std::mem::take(&mut self.ctx.effects);
         if let Some(replayed) = &mut self.replayed {
             replayed.extend(effects.iter().cloned());
         }
-        for effect in effects {
+        for effect in effects.drain(..) {
             match effect {
                 Effect::Send(session, payload) => self.egress(session, payload),
                 Effect::Schedule { id, at } => {
@@ -228,6 +235,11 @@ impl<S: Service> Node<S> {
                     self.state.outbox.insert(self.state.next_proposal, payload);
                 }
             }
+        }
+        // Its room kept for the next callback's effects, not allocated again for each message;
+        // unless a callback run meanwhile (a session closed) left its own.
+        if self.ctx.effects.capacity() == 0 {
+            self.ctx.effects = effects;
         }
     }
 

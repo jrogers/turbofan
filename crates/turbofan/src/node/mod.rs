@@ -232,6 +232,8 @@ struct Local {
     query_bytes: usize,
     answerable: VecDeque<(u64, u64)>,
     sends: Vec<(ConnId, Vec<u8>)>,
+    /// The entry being applied, copied out of the log: its room kept from one to the next.
+    entry: Vec<u8>,
 }
 
 /// A cluster member running service `S`.
