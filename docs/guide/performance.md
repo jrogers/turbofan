@@ -97,46 +97,6 @@ which comes from the nodes' own metrics.
 
 ## Results
 
-On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2, Rust 1.98.1, at
-commit `93195a5` (0.10.0), November 2026. Each figure is the median of three runs of 10 s,
-`--features tls`.
-
-| run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
-|---|---|---:|---:|---:|---:|
-| latency, in memory | 1 × 1 | 433,625 | 2 µs | 2 µs | 2 µs |
-| throughput, in memory | 8 × 256 | 499,097 | 3.83 ms | 11.98 ms | 12.82 ms |
-| latency | 1 × 1 | 14,956 | 64 µs | 101 µs | 131 µs |
-| throughput | 8 × 256 | 1,198,294 | 894 µs | 7.95 ms | 10.73 ms |
-| query latency | 1 × 1 | 22,650 | 44 µs | 61 µs | 109 µs |
-| query throughput | 8 × 256 | 2,830,641 | 706 µs | 1.17 ms | 1.43 ms |
-| latency, fsync | 1 × 1 | 125 | 7.84 ms | 14.02 ms | 16.10 ms |
-| throughput, fsync | 8 × 256 | 114,939 | 17.76 ms | 31.96 ms | 38.17 ms |
-| latency, TLS | 1 × 1 | 14,436 | 66 µs | 105 µs | 137 µs |
-| throughput, TLS | 8 × 256 | 1,170,253 | 919 µs | 8.09 ms | 11.17 ms |
-| query latency, TLS | 1 × 1 | 22,713 | 43 µs | 61 µs | 112 µs |
-| query throughput, TLS | 8 × 256 | 2,721,277 | 735 µs | 1.21 ms | 1.48 ms |
-| latency, TLS, fsync | 1 × 1 | 128 | 7.89 ms | 13.97 ms | 16.09 ms |
-| throughput, TLS, fsync | 8 × 256 | 113,730 | 17.94 ms | 32.29 ms | 38.20 ms |
-
-Without fsync, a message is committed in tens of microseconds, and no one task is busy: the
-throughput run is bound by its own window, 2,048 messages in flight over a round trip of about a
-millisecond. More in flight goes faster (at `cf027a9`): 1,375,000 a second with 8 clients of 1,024
-(`BENCH_THROUGHPUT=8x1024`), and 1,145,000 with 64 of 256. TLS costs little, its connections
-buffered as plain TCP's are. With fsync, the disk is what limits it: on macOS a sync is
-`F_FULLFSYNC`, which empties the drive's own cache, some milliseconds each, and its runs vary
-the most from one to the next. Group commit is why throughput with fsync is still over 100,000 a
-second: each sync covers every message that arrived during the one before. A Linux server's NVMe
-drive syncs much faster (below); measure yours.
-
-A query skips the write, so one on its own takes two thirds of a message's time, and with many in
-flight they go more than twice as fast as messages: 2.8 million a second.
-
-The core alone, the `in memory` runs: 433,625 messages a second one at a time, a commit through
-all three nodes in 2 µs at p50, and 499,097 a second at 8 × 256, on its one thread (openraft's
-benchmark, on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without
-fsync, nearly all of a message's 64 µs on its own over TCP is the driver's and the loopback's,
-not the core's.
-
 ### On Linux servers
 
 Three nodes on machines of their own, and the benchmark driving them from a fourth
@@ -179,7 +139,7 @@ Throughput, messages and queries a second, varies by a few per cent from one run
 message on its own doesn't: it's a round trip over the network, client to leader and leader to
 follower, and that depends on where the placement group lands. On `c9gd` its p50 was 83 µs, 130 µs and
 261 µs in the three runs, steady within each; on `c8id`, 326 µs every time, with a long tail
-(p99 642 µs). The Mac's 64 µs is over loopback.
+(p99 642 µs). The Mac's 64 µs (below) is over loopback.
 
 A sync on the instances' NVMe drives takes about a tenth of a millisecond, where the Mac's
 `F_FULLFSYNC` took milliseconds: fsync costs a tenth of the throughput, where on the Mac it cost
@@ -207,6 +167,48 @@ of their own, the Xeons' nodes go faster again; Graviton5's don't, already as fa
 On glibc's malloc and without LTO (`c6id`, at `ee40689`), the cluster did 699,316 messages a second
 nodes apart, and 1,024,529 queries: the allocator and the build are half again the throughput, and
 twice the queries'.
+
+### On a Mac
+
+On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2, Rust 1.98.1, at
+commit `93195a5` (0.10.0), November 2026. Each figure is the median of three runs of 10 s,
+`--features tls`.
+
+| run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
+|---|---|---:|---:|---:|---:|
+| latency, in memory | 1 × 1 | 433,625 | 2 µs | 2 µs | 2 µs |
+| throughput, in memory | 8 × 256 | 499,097 | 3.83 ms | 11.98 ms | 12.82 ms |
+| latency | 1 × 1 | 14,956 | 64 µs | 101 µs | 131 µs |
+| throughput | 8 × 256 | 1,198,294 | 894 µs | 7.95 ms | 10.73 ms |
+| query latency | 1 × 1 | 22,650 | 44 µs | 61 µs | 109 µs |
+| query throughput | 8 × 256 | 2,830,641 | 706 µs | 1.17 ms | 1.43 ms |
+| latency, fsync | 1 × 1 | 125 | 7.84 ms | 14.02 ms | 16.10 ms |
+| throughput, fsync | 8 × 256 | 114,939 | 17.76 ms | 31.96 ms | 38.17 ms |
+| latency, TLS | 1 × 1 | 14,436 | 66 µs | 105 µs | 137 µs |
+| throughput, TLS | 8 × 256 | 1,170,253 | 919 µs | 8.09 ms | 11.17 ms |
+| query latency, TLS | 1 × 1 | 22,713 | 43 µs | 61 µs | 112 µs |
+| query throughput, TLS | 8 × 256 | 2,721,277 | 735 µs | 1.21 ms | 1.48 ms |
+| latency, TLS, fsync | 1 × 1 | 128 | 7.89 ms | 13.97 ms | 16.09 ms |
+| throughput, TLS, fsync | 8 × 256 | 113,730 | 17.94 ms | 32.29 ms | 38.20 ms |
+
+Without fsync, a message is committed in tens of microseconds, and no one task is busy: the
+throughput run is bound by its own window, 2,048 messages in flight over a round trip of about a
+millisecond. More in flight goes faster (at `cf027a9`): 1,375,000 a second with 8 clients of 1,024
+(`BENCH_THROUGHPUT=8x1024`), and 1,145,000 with 64 of 256. TLS costs little, its connections
+buffered as plain TCP's are. With fsync, the disk is what limits it: on macOS a sync is
+`F_FULLFSYNC`, which empties the drive's own cache, some milliseconds each, and its runs vary
+the most from one to the next. Group commit is why throughput with fsync is still over 100,000 a
+second: each sync covers every message that arrived during the one before. A Linux server's NVMe
+drive syncs much faster (above); measure yours.
+
+A query skips the write, so one on its own takes two thirds of a message's time, and with many in
+flight they go more than twice as fast as messages: 2.8 million a second.
+
+The core alone, the `in memory` runs: 433,625 messages a second one at a time, a commit through
+all three nodes in 2 µs at p50, and 499,097 a second at 8 × 256, on its one thread (openraft's
+benchmark, on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without
+fsync, nearly all of a message's 64 µs on its own over TCP is the driver's and the loopback's,
+not the core's.
 
 [clients]: clients.md
 [operations]: operations.md
