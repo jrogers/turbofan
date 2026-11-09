@@ -23,9 +23,9 @@ impl<S: Service> Node<S> {
             let ours = self.raft.role() == Role::Leader && self.raft.term_at(index) == Some(self.raft.term());
             // Copied out of the log, which the entry's callbacks may change, into room kept for
             // it rather than allocated for each.
-            let mut payload = std::mem::take(&mut self.local.entry);
+            let mut payload = std::mem::take(&mut self.entry);
             let Some(record) = self.raft.entry(index) else {
-                self.local.entry = payload;
+                self.entry = payload;
                 self.raft.fetch(index);
                 break;
             };
@@ -37,7 +37,7 @@ impl<S: Service> Node<S> {
             self.state.applied = index;
             self.apply_entry(index, &entry, ours);
             let wanted = matches!(entry, wire::Decoded::Snapshot(_));
-            self.local.entry = payload;
+            self.entry = payload;
             let last = self.raft.snapshot_index().max(self.saving.unwrap_or(0));
             if wanted || index >= last + self.config.snapshot_every_entries {
                 self.take_snapshot();
@@ -217,10 +217,11 @@ impl<S: Service> Node<S> {
         self.ctx.service_version = self.state.service_version;
         callback(&mut self.service, &mut self.ctx);
         let mut effects = std::mem::take(&mut self.ctx.effects);
-        if let Some(replayed) = &mut self.replayed {
-            replayed.extend(effects.iter().cloned());
-        }
         for effect in effects.drain(..) {
+            // As it runs: a session closed runs its own callback's effects before the rest.
+            if let Some(replayed) = &mut self.replayed {
+                replayed.push(effect.clone());
+            }
             match effect {
                 Effect::Send(session, payload) => self.egress(session, payload),
                 Effect::Schedule { id, at } => {

@@ -138,6 +138,9 @@ pub(super) fn decode_state(from: &mut dyn Read) -> io::Result<State> {
         if usize::try_from(s.ring()).map_or(true, |n| n > MAX_EGRESS_RING) {
             return Err(bad("too long a ring"));
         }
+        if s.next_egress() == 0 {
+            return Err(bad("next_egress of 0"));
+        }
         let carried = s.carried_seq().zip(s.carried_egress()).filter(|&marks| marks != (u64::MAX, u64::MAX));
         let mut session = Session {
             last_seq: s.last_seq(),

@@ -37,9 +37,6 @@ impl<S: Service> Node<S> {
         match message {
             wire::Decoded::SnapshotRequest(m) => {
                 let id = m.request_id();
-                if self.local.requested.contains_key(&id) || self.local.awaiting.contains_key(&id) {
-                    return;
-                }
                 self.local.requested.insert(id, conn);
                 self.propose(&wire::Snapshot { timestamp: now, request_id: id });
             }

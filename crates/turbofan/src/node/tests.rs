@@ -17,8 +17,10 @@ impl Service for Recorder {
     fn on_session_open(&mut self, _ctx: &mut Ctx, session: SessionId, principal: &[u8]) {
         self.0.push(format!("open {session} {}", String::from_utf8_lossy(principal)));
     }
-    fn on_session_close(&mut self, _ctx: &mut Ctx, session: SessionId, reason: CloseReason) {
+    fn on_session_close(&mut self, ctx: &mut Ctx, session: SessionId, reason: CloseReason) {
         self.0.push(format!("close {session} {reason:?}"));
+        // An effect of its own, to show where a nested callback's effects run: none's timer.
+        ctx.cancel_timer(u64::MAX);
     }
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
         let text = std::str::from_utf8(payload).unwrap();
@@ -32,6 +34,7 @@ impl Service for Recorder {
             ["propose", what] => ctx.propose(what.as_bytes()).expect("a client payload fits"),
             ["quiet"] => return,
             ["close"] => return ctx.close_session(session),
+            ["close", "and", "say"] => ctx.close_session(session),
             _ => {}
         }
         ctx.send(session, payload).expect("a client payload fits");
@@ -310,6 +313,18 @@ fn a_snapshots_counts_are_checked_at_their_limits() {
         bytes
     };
     assert!(error(ring(MAX_EGRESS_RING + 1)).contains("too long a ring"));
+    let mut egress_zero = node_state(1);
+    let session = wire::SessionState {
+        session: 1,
+        last_seq: 0,
+        next_egress: 0,
+        ring: 0,
+        carried_seq: u64::MAX,
+        carried_egress: u64::MAX,
+        principal: b"",
+    };
+    codec::encode_frame(&session, &mut egress_zero).unwrap();
+    assert!(error(egress_zero).contains("next_egress of 0"));
     assert!(!error(ring(MAX_EGRESS_RING)).contains("too long a ring"));
 
     let frame_of = |len: usize| {
@@ -870,6 +885,54 @@ fn a_connection_holds_one_session_and_a_closed_one_none() {
     node.on_disconnect(8);
     assert!(drive(&mut node).is_empty(), "nothing sent to it");
     assert!(!node.local.conns.contains_key(&8) && !node.local.attached.values().any(|&c| c == 8));
+}
+
+/// A connection that moves on to another session while its own opens isn't attached to the one
+/// opened: the latest request wins, and no session is left attached to a connection not its.
+#[test]
+fn a_connection_moving_on_while_its_session_opens_takes_the_latest() {
+    let mut node = leader();
+    let earlier = open(&mut node, 9, 0);
+    node.on_disconnect(9);
+    let frame = |message: &dyn Fn(&mut Vec<u8>)| {
+        let mut bytes = Vec::new();
+        message(&mut bytes);
+        bytes
+    };
+    let connect = frame(&|b| codec::encode_frame(&wire::Connect { credentials: b"" }, b).unwrap());
+    let reattach = wire::Reattach { session: earlier.0, last_egress_seq: 0, epoch: 0, credentials: b"" };
+    let reattach = frame(&|b| codec::encode_frame(&reattach, b).unwrap());
+    for bytes in [&connect, &reattach] {
+        node.on_client(7, &codec::decode_frame(bytes).unwrap().unwrap().0, 0);
+    }
+    drive(&mut node);
+    assert_eq!(node.local.attached.get(&earlier), Some(&7));
+    for (session, conn) in &node.local.attached {
+        assert_eq!(node.local.conns.get(conn), Some(&Some(*session)), "{session} on {conn}");
+    }
+}
+
+/// Effects are replayed in the order they ran: a session's close runs its own callback's before
+/// the rest of the callback that closed it.
+#[test]
+fn effects_are_replayed_in_the_order_they_run() {
+    let mut node = leader();
+    let session = open(&mut node, 7, 0);
+    node.replayed = Some(Vec::new());
+    client(&mut node, 7, &wire::Message { session: session.0, client_seq: 1, payload: b"close and say" }, 0);
+    let ran: Vec<&str> = node
+        .replayed
+        .take()
+        .unwrap()
+        .iter()
+        .map(|e| match e {
+            Effect::Close(_) => "close",
+            Effect::Cancel(_) => "cancel",
+            Effect::Send(..) => "send",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(ran, ["close", "cancel", "send"]);
 }
 
 /// A leader answers a query from the state as applied, logging nothing.

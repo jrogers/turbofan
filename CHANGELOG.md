@@ -23,6 +23,17 @@ a patch version (0.1.1) doesn't.
 - A snapshot whose header's length is damaged is refused without reading the rest of the file
   into memory.
 - A truncation or reset of the log syncs once, not twice.
+- A connection that reattaches, or connects again, while the session it asked for opens takes
+  the latest: the session opened isn't attached to it, which left another session attached to a
+  connection that had moved on, and later dropped the connection's own.
+- `Node::replay`, and so `replay`, gives the service's effects in the order they ran: a session
+  the service closes runs its own `on_session_close` effects before the rest.
+- A snapshot whose session has a `next_egress` of 0 is refused, not left to underflow on reattach.
+- A TLS file changed while a node starts, after it loaded them and before it began rereading
+  them, is loaded at the first reload, not missed until the files change again.
+- On a listener taking plain TCP beside TLS, a connection that stalls within its first three
+  bytes is peeked at with a backoff, up to 100 ms apart, not every millisecond until its hello's
+  timeout.
 
 ## 0.11.0 (2026-11-09)
 

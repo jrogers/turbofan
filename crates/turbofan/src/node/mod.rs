@@ -231,9 +231,6 @@ struct Local {
     queries: BTreeMap<u64, queries::Waiting>,
     query_bytes: usize,
     answerable: VecDeque<(u64, u64)>,
-    sends: Vec<(ConnId, Vec<u8>)>,
-    /// The entry being applied, copied out of the log: its room kept from one to the next.
-    entry: Vec<u8>,
 }
 
 /// A cluster member running service `S`.
@@ -247,6 +244,10 @@ pub struct Node<S> {
     ctx: Ctx,
     now: u64,
     scratch: Vec<u8>,
+    /// Client frames to send, kept across a change of leader.
+    sends: Vec<(ConnId, Vec<u8>)>,
+    /// The entry being applied, copied out of the log: its room kept from one to the next.
+    entry: Vec<u8>,
     /// The snapshot being written, by index, and one is wanted once it's done.
     saving: Option<u64>,
     want_snapshot: bool,
@@ -292,6 +293,8 @@ impl<S: Service> Node<S> {
             ctx: Ctx::default(),
             now,
             scratch: Vec::new(),
+            sends: Vec::new(),
+            entry: Vec::new(),
             saving: None,
             want_snapshot: false,
             save: None,
@@ -468,8 +471,6 @@ impl<S: Service> Node<S> {
     /// A client connection closed. Its session stays open for the client to reattach to.
     pub fn on_disconnect(&mut self, conn: ConnId) {
         self.detach(conn);
-        // A session it asked for opens all the same, but not on it.
-        self.local.opening.retain(|_, &mut c| c != conn);
         self.drop_queries(conn);
     }
 
@@ -546,7 +547,7 @@ impl<S: Service> Node<S> {
             reads: out.reads,
             peer_appends: out.appends,
             peer_sends: out.sends,
-            client_sends: std::mem::take(&mut self.local.sends),
+            client_sends: std::mem::take(&mut self.sends),
             snapshot_reads: out.snapshot_reads,
             save: self.save.take(),
             restore: self.restoring,
@@ -631,7 +632,7 @@ impl<S: Service> Node<S> {
     }
 
     fn become_leader(&mut self) {
-        self.local = Local { was_leader: true, sends: std::mem::take(&mut self.local.sends), ..Local::default() };
+        self.local = Local { was_leader: true, ..Local::default() };
         // Every session gets a full timeout from now: the old leader's view of them is gone.
         self.local.activity = self.state.sessions.keys().map(|&s| (s, self.now)).collect();
         self.propose(&wire::NewTerm { timestamp: self.now });
@@ -652,8 +653,7 @@ impl<S: Service> Node<S> {
         admins.extend(self.local.changing.map(|(conn, _, _)| conn));
         admins.extend(self.local.shutting.map(|(conn, _, _)| conn));
         admins.extend(self.local.activating.map(|(conn, _, _)| conn));
-        let sends = std::mem::take(&mut self.local.sends);
-        self.local = Local { sends, ..Local::default() };
+        self.local = Local::default();
         for conn in conns {
             self.redirect(conn);
         }

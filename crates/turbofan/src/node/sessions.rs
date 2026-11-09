@@ -4,13 +4,16 @@
 use super::*;
 
 impl<S: Service> Node<S> {
-    /// Forgets `conn`, and the session it's attached to, if any, forgets it.
+    /// Forgets `conn`, and the session it's attached to, if any, forgets it. A session it asked
+    /// for opens all the same, but not on it: else, opening, it would be attached to a session
+    /// the connection had since moved on from.
     pub(super) fn detach(&mut self, conn: ConnId) {
         if let Some(Some(session)) = self.local.conns.remove(&conn)
             && self.local.attached.get(&session) == Some(&conn)
         {
             self.local.attached.remove(&session);
         }
+        self.local.opening.retain(|_, &mut c| c != conn);
     }
 
     pub(super) fn open(&mut self, conn: ConnId, credentials: &[u8]) {
@@ -139,7 +142,7 @@ impl<S: Service> Node<S> {
             let message = wire::Egress { session: session.0, egress_seq, applied_seq: s.last_seq, payload: &payload };
             let mut frame = Vec::new();
             codec::encode_frame(&message, &mut frame).expect("payloads are within their limit");
-            self.local.sends.push((conn, frame));
+            self.sends.push((conn, frame));
         }
         // Over, not only at, the limit: from a node that kept more, or before it was lowered.
         // The cluster's, as activated: a node's own only before.
@@ -166,12 +169,12 @@ impl<S: Service> Node<S> {
         let message = wire::Redirect { leader: NodeId::to_wire(leader), addr };
         let mut frame = Vec::new();
         codec::encode_frame(&message, &mut frame).expect("addresses are short");
-        self.local.sends.push((conn, frame));
+        self.sends.push((conn, frame));
     }
 
     pub(super) fn send_client(&mut self, conn: ConnId, message: &impl turbofan_sbe::Encode) {
         let mut frame = Vec::new();
         codec::encode_frame(message, &mut frame).expect("client messages are within their limits");
-        self.local.sends.push((conn, frame));
+        self.sends.push((conn, frame));
     }
 }

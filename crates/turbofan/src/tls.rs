@@ -292,27 +292,31 @@ pub(crate) type Current = watch::Receiver<Option<Loaded>>;
 
 /// A node's TLS, if it has any, loaded; and what rereads it, to run as long as the node does.
 pub(crate) fn start(tls: Option<NodeTls>) -> io::Result<(Current, impl Future<Output = ()> + Send + 'static)> {
+    // Read before they're loaded: a change after is seen by the first reload, however late the
+    // reloading starts.
+    let files = tls.as_ref().map(read_files);
     let (current, receiver) = watch::channel(tls.as_ref().map(Loaded::load).transpose()?);
     let reloading = async move {
-        if let Some(tls) = tls {
-            reload(tls, current).await;
+        if let (Some(tls), Some(files)) = (tls, files) {
+            reload(tls, files, current).await;
         }
     };
     Ok((receiver, reloading))
 }
 
-/// Rereads `tls`'s files every [`NodeTls::reload_every`], and when they've changed and load, puts
-/// them in `current`.
-async fn reload(tls: NodeTls, current: watch::Sender<Option<Loaded>>) {
-    // Small files, a minute apart: read in place rather than on a blocking thread.
-    let read = |tls: &NodeTls| -> Vec<Option<Vec<u8>>> {
-        let paths = [Some(&tls.cert), Some(&tls.key), tls.peer_ca.as_ref(), tls.admin_ca.as_ref()];
-        paths.into_iter().flatten().map(|path| std::fs::read(path).ok()).collect()
-    };
-    let mut loaded = read(&tls);
+/// `tls`'s files' contents, to tell when they change. Small files, a minute apart: read in place
+/// rather than on a blocking thread.
+fn read_files(tls: &NodeTls) -> Vec<Option<Vec<u8>>> {
+    let paths = [Some(&tls.cert), Some(&tls.key), tls.peer_ca.as_ref(), tls.admin_ca.as_ref()];
+    paths.into_iter().flatten().map(|path| std::fs::read(path).ok()).collect()
+}
+
+/// Rereads `tls`'s files every [`NodeTls::reload_every`], and when they've changed from `loaded`
+/// and load, puts them in `current`.
+async fn reload(tls: NodeTls, mut loaded: Vec<Option<Vec<u8>>>, current: watch::Sender<Option<Loaded>>) {
     loop {
         tokio::time::sleep(tls.reload_every).await;
-        let files = read(&tls);
+        let files = read_files(&tls);
         if files == loaded {
             continue;
         }
@@ -406,9 +410,13 @@ const TLS_RECORD: (u8, u8, std::ops::RangeInclusive<u8>) = (22, 3, 1..=3);
 /// bytes only if it's at least 0x01_0316 bytes long, and a hello is far shorter.
 const _: () = assert!(crate::driver::MAX_HELLO_BYTES < 0x01_0316);
 
+/// The longest [`begins_tls`] waits between peeks.
+const MAX_PEEK_WAIT: Duration = Duration::from_millis(100);
+
 /// Whether `stream` begins with a TLS handshake ([`TLS_RECORD`]), peeked, not read.
 async fn begins_tls(stream: &TcpStream) -> io::Result<bool> {
     let mut start = [0; 3];
+    let mut wait = Duration::from_millis(1);
     loop {
         let n = stream.peek(&mut start).await?;
         if n == 0 {
@@ -422,8 +430,10 @@ async fn begins_tls(stream: &TcpStream) -> io::Result<bool> {
             return Ok(minor.contains(&start[2]));
         }
         // ponytail: polls for the rest, the first segment having been under three bytes, which no
-        // TLS stack or hello sends; the hello's timeout bounds it. A buffered replay if one ever does.
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        // TLS stack or hello sends: backing off, so that a client stalled there costs some tens of
+        // wakeups before the hello's timeout, not thousands. A buffered prefix if one ever does.
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(MAX_PEEK_WAIT);
     }
 }
 
@@ -634,6 +644,53 @@ mod tests {
 
     use super::{Loaded, NodeTls, Plain, accept, begins_tls, connect};
     use crate::driver::{read_frame, write_frames};
+
+    /// A handshake whose first byte came alone, the rest after a stall longer than the peeks'
+    /// longest wait, is still told for one.
+    #[tokio::test]
+    async fn a_handshake_after_a_stall_is_told_for_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dialled = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&[22]).await.unwrap();
+            tokio::time::sleep(super::MAX_PEEK_WAIT * 3).await;
+            stream.write_all(&[3, 3, 0, 200]).await.unwrap();
+            stream
+        });
+        let (accepted, _) = listener.accept().await.unwrap();
+        assert!(begins_tls(&accepted).await.unwrap());
+        drop(dialled.await.unwrap());
+    }
+
+    /// A certificate rewritten after the node loaded its files, before the reloading began, is
+    /// loaded at the first reload: what it's compared with is what was loaded.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn a_certificate_changed_before_reloading_begins_is_reloaded() {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| dir.path().join(name);
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        std::fs::write(file("ca.pem"), ca.pem()).unwrap();
+        let key = KeyPair::generate().unwrap();
+        std::fs::write(file("node.key"), key.serialize_pem()).unwrap();
+        let cert = |name: &str| {
+            let params = CertificateParams::new([name.to_owned()]).unwrap();
+            std::fs::write(file("node.pem"), params.signed_by(&key, &ca).unwrap().pem()).unwrap();
+        };
+        cert("first.turbofan");
+        let mut tls = NodeTls::new(file("node.pem"), file("node.key"), file("ca.pem"), file("ca.pem"));
+        tls.reload_every = Duration::from_millis(20);
+        let (mut current, reloading) = super::start(Some(tls)).unwrap();
+        current.mark_unchanged();
+        cert("second.turbofan");
+        tokio::spawn(reloading);
+        let changed = tokio::time::timeout(Duration::from_secs(2), current.changed()).await;
+        assert!(changed.is_ok(), "the second certificate wasn't loaded");
+    }
 
     /// A listener taking plain TCP beside TLS tells them apart by the first three bytes: a TLS
     /// handshake's record, of versions 3.1 to 3.3, from a hello's length, even one whose first
