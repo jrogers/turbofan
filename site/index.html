@@ -267,22 +267,24 @@
     <h2><a class="anchor" href="#performance">Performance</a></h2>
     <p class="sub">Three nodes on machines of their own, AWS {{bench.machine}} with 8 vCPUs
     each, and the clients on a fourth, over the network, 64-byte messages, from the repository's
-    benchmark: the median of three runs. The <a href="guide/performance.html">guide's performance
+    benchmark: the median of three runs, each batch synced to the instances' NVMe before it's
+    acknowledged, as by default. The <a href="guide/performance.html">guide's performance
     chapter</a> has every run, on other machines too, and how to measure your own.</p>
     <div class="grid">
       <div class="card stat">
         <b>{{bench.throughput}}</b><span>messages a second</span>
-        <p>Eight clients with 256 in flight each. p99 latency {{bench.throughput.p99}}.</p>
+        <p>Eight clients with 256 in flight each, one sync for all that arrived during the last.
+        p99 latency {{bench.throughput.p99}}.</p>
       </div>
       <div class="card stat">
         <b>{{bench.latency}}</b><span>p50 round trip</span>
         <p>One message at a time, from the client to its response, committed on two nodes of three
-        and applied: two round trips over the network. p99 {{bench.latency.p99}}.</p>
+        and applied: two round trips over the network, the leader's sync overlapping them. p99
+        {{bench.latency.p99}}.</p>
       </div>
       <div class="card stat">
-        <b>{{bench.fsync}}</b><span>messages a second, synced</span>
-        <p>Synced, the default: every batch on the instances' NVMe before it's acknowledged,
-        one sync for all that arrived during the last.</p>
+        <b>{{bench.unsynced}}</b><span>messages a second, unsynced</span>
+        <p>With <code>--no-fsync</code>: the other nodes' copies the redundancy, not the disk.</p>
       </div>
     </div>
   </section>

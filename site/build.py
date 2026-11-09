@@ -220,11 +220,12 @@ def bench() -> dict[str, str]:
 
     return {
         "machine": machine.group(1),
-        "throughput": cell("throughput", "msgs/s"),
-        "throughput.p99": cell("throughput", "p99"),
-        "latency": cell("latency", "p50"),
-        "latency.p99": cell("latency", "p99"),
-        "fsync": cell("throughput, fsync", "msgs/s"),
+        # Synced, the default; then without, for comparison.
+        "throughput": cell("throughput, fsync", "msgs/s"),
+        "throughput.p99": cell("throughput, fsync", "p99"),
+        "latency": cell("latency, fsync", "p50"),
+        "latency.p99": cell("latency, fsync", "p99"),
+        "unsynced": cell("throughput", "msgs/s"),
     }
 
 
