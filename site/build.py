@@ -207,7 +207,10 @@ def bench() -> dict[str, str]:
     assert found, "the performance chapter has no Results section: update site/build.py's bench"
     machine = re.search(r"^On (?:an? )?(.+?): ", results, re.M)
     assert machine, "the performance chapter's results no longer start 'On <machine>: '"
-    rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in results.splitlines() if line.startswith("|")]
+    # The first table only: those after it are other machines'.
+    first = re.search(r"^\|.*?(?=\n[^|]|\Z)", results, re.M | re.S)
+    assert first, "the performance chapter's results have no table"
+    rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in first.group(0).splitlines()]
     header, table = rows[0], {row[0]: dict(zip(rows[0], row)) for row in rows[2:]}
 
     def cell(run: str, column: str) -> str:

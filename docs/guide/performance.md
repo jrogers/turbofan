@@ -118,7 +118,7 @@ buffered as plain TCP's are. With fsync, the disk is what limits it: on macOS a 
 `F_FULLFSYNC`, which empties the drive's own cache, some milliseconds each, and its runs vary
 the most from one to the next. Group commit is why throughput with fsync is still over 100,000 a
 second: each sync covers every message that arrived during the one before. A Linux server's NVMe
-drive, with power-loss protection, syncs much faster; measure yours.
+drive syncs much faster (below); measure yours.
 
 A query skips the write, so one on its own takes two thirds of a message's time, and with many in
 flight they go more than twice as fast as messages: 2.6 million a second.
@@ -128,6 +128,44 @@ all three nodes in 2 µs at p50, and 427,212 a second at 8 × 256, on its one th
 benchmark, on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without
 fsync, nearly all of a message's 66 µs on its own over TCP is the driver's and the loopback's,
 not the core's.
+
+### On a Linux server
+
+Three nodes on machines of their own, and the benchmark driving them from a fourth
+(`BENCH_CLUSTER`): AWS `c6id.2xlarge` (8 vCPUs, Intel Xeon Platinum 8375C, local NVMe instance
+storage), one cluster placement group in us-east-1, Linux 7.0, Rust 1.99.1, at commit `ee40689`,
+November 2026. One run of 10 s each, with `scripts/aws-bench.sh`; the nodes' logs on the instance
+storage, except the last two rows, on the root EBS volume (gp3).
+
+| run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
+|---|---|---:|---:|---:|---:|
+| latency | 1 × 1 | 4,211 | 236 µs | 266 µs | 278 µs |
+| throughput | 8 × 256 | 699,316 | 2.88 ms | 7.03 ms | 8.45 ms |
+| query latency | 1 × 1 | 4,605 | 215 µs | 241 µs | 251 µs |
+| query throughput | 8 × 256 | 1,024,529 | 1.99 ms | 2.80 ms | 3.16 ms |
+| latency, fsync | 1 × 1 | 2,847 | 348 µs | 403 µs | 429 µs |
+| throughput, fsync | 8 × 256 | 630,094 | 3.20 ms | 7.36 ms | 8.53 ms |
+| latency, TLS | 1 × 1 | 4,090 | 242 µs | 275 µs | 286 µs |
+| throughput, TLS | 8 × 256 | 698,856 | 2.89 ms | 7.26 ms | 8.73 ms |
+| query latency, TLS | 1 × 1 | 4,623 | 214 µs | 244 µs | 255 µs |
+| query throughput, TLS | 8 × 256 | 998,523 | 2.04 ms | 2.87 ms | 3.20 ms |
+| latency, TLS, fsync | 1 × 1 | 2,729 | 363 µs | 420 µs | 447 µs |
+| throughput, TLS, fsync | 8 × 256 | 640,806 | 3.17 ms | 7.43 ms | 8.60 ms |
+| latency, fsync, EBS | 1 × 1 | 338 | 2.95 ms | 3.11 ms | 4.37 ms |
+| throughput, fsync, EBS | 8 × 256 | 250,503 | 8.07 ms | 13.06 ms | 16.40 ms |
+
+A message on its own is a round trip over the network now, client to leader and leader to
+follower, not over loopback: 236 µs, where the Mac's was 66 µs. A sync on the instance's NVMe
+drive takes about a tenth of a millisecond, where the Mac's `F_FULLFSYNC` took milliseconds: fsync
+adds 112 µs to a message on its own, and costs a tenth of the throughput, where on the Mac it cost
+nine tenths. On EBS, network storage, a sync is a round trip of its own, some milliseconds:
+throughput with fsync falls to 250,503 a second, group commit still filling each sync. TLS costs
+next to nothing.
+
+The same benchmark in one process on the clients' machine, the three nodes and the clients sharing
+its 8 vCPUs: 521,810 messages a second, 498,807 with fsync, and a message on its own in 97 µs,
+202 µs with fsync. The nodes on machines of their own go a third faster, where the clients no
+longer take their CPUs.
 
 [clients]: clients.md
 [operations]: operations.md
