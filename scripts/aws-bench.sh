@@ -21,6 +21,7 @@
 #
 #   AWS_PROFILE  the aws CLI's profile, as for any aws command (AWS_PROFILE=development ...)
 #   REGION       us-east-1           TYPE         c6id.2xlarge (needs local NVMe: a `d` type)
+#   AZ           a zone that offers TYPE, should one be out of capacity (us-east-1b)
 #   BENCH_SECS   10                  MAX_MINUTES  180
 #   RUNS         the runs above, or some of them, space-separated
 set -euo pipefail
@@ -117,8 +118,8 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 # A zone that has the type, and the default VPC's subnet there.
-AZ=$(aws ec2 describe-instance-type-offerings --location-type availability-zone \
-    --filters "Name=instance-type,Values=$TYPE" --query 'InstanceTypeOfferings[0].Location' --output text)
+AZ=${AZ:-$(aws ec2 describe-instance-type-offerings --location-type availability-zone \
+    --filters "Name=instance-type,Values=$TYPE" --query 'InstanceTypeOfferings[0].Location' --output text)}
 [[ $AZ != None ]] || { echo "$TYPE isn't offered in $AWS_REGION" >&2; exit 1; }
 SUBNET=$(aws ec2 describe-subnets --filters "Name=availability-zone,Values=$AZ" "Name=default-for-az,Values=true" \
     --query 'Subnets[0].SubnetId' --output text)
