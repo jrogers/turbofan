@@ -265,7 +265,7 @@ time. Its clients are the same as a gateway's, so they resend after a failover a
 
 ```toml
 [dev-dependencies]
-turbofan = { version = "0.10", features = ["testing"] }
+turbofan = { version = "0.11", features = ["testing"] }
 ```
 
 ```rust

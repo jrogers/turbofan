@@ -8,10 +8,10 @@ small runtime that the generated code calls. Turbofan's wire protocols are built
 
 ```toml
 [dependencies]
-turbofan-sbe = "0.10"
+turbofan-sbe = "0.11"
 
 [build-dependencies]
-turbofan-sbe = "0.10"
+turbofan-sbe = "0.11"
 ```
 
 ```rust

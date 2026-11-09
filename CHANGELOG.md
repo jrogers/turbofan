@@ -4,7 +4,14 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
-## Unreleased
+## 0.11.0 (2026-11-09)
+
+### Breaking
+
+- The frames in `raft::Outputs` and `node::Outputs` (`appends`, `sends`, `peer_appends`,
+  `peer_sends`) are `raft::Frame`, an `Arc<Vec<u8>>`, not a `Vec<u8>`: the leader encodes an
+  append once for every peer at the same index and shares it. Only a driver of one's own over the
+  sans-IO core sees them: write `&frame[..]` where it wrote `&frame`. The wire is unchanged.
 
 ### Added
 
@@ -29,6 +36,28 @@ a patch version (0.1.1) doesn't.
 - A leader deposed without knowing it yet no longer closes a session it hasn't applied as
   `NoSession` when its client reattaches: it redirects the client, which finds the session
   elsewhere (#21).
+- A connection's first frame, on every listener, is read up to `MAX_HELLO_BYTES`, not
+  `MAX_FRAME_BYTES`: a stranger's connection, before its token is checked, can no longer make the
+  node hold a megabyte.
+- A peer whose host vanishes without closing (replaced at a new address behind its name, or its
+  packets dropped) is given up on in seconds, not after the kernel's quarter of an hour: every
+  connection probes an idle other end (TCP keepalive after 5 s), and on Linux gives up on what's
+  unacknowledged after 10 s (`TCP_USER_TIMEOUT`). Accepted connections from such a host no longer
+  pile up toward `MAX_OTHER_CONNECTIONS`.
+- A client connection the driver dropped for reading too slowly is reported to the node once, not
+  twice; and dials to peers no longer wanted are reaped, not kept until the node stops.
+
+### Performance
+
+- Less copied and allocated on a message's path (on the Mac, against 0.10.0, built with fat LTO
+  as the benchmark now is: 8% more messages and queries a second over TCP, 15% for the core
+  alone): an append encoded once for every peer at the same index; frames to a peer written through a buffer,
+  not copied into a batch; a peer's frames handed to the node together, as a client's; what a
+  quorum reaches found without allocating; an entry decoded only if its header says `Members`; and
+  the entry being applied, and a callback's effects, kept in room reused from one to the next.
+- On Linux, glibc's malloc costs a cluster a third to half of its throughput: the guide's
+  performance chapter says to run a service on jemalloc or mimalloc, and with fat LTO, and has
+  results from three AWS types beside the Mac's.
 
 ## 0.10.0 (2026-11-07)
 
