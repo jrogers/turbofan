@@ -157,6 +157,24 @@ nodes and clients on jemalloc (see the allocator, above), with `scripts/aws-benc
 | throughput, TLS, fsync | 946,607 | 1,139,758 | 1,414,762 |
 | throughput, fsync, EBS | 260,191 | 223,386 | 281,898 |
 
+On AWS c9gd.2xlarge (Graviton5): every run, nodes apart, the median of three. The site's landing
+page shows these.
+
+| run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
+|---|---|---:|---:|---:|---:|
+| latency | 1 × 1 | 8,812 | 130 µs | 142 µs | 148 µs |
+| throughput | 8 × 256 | 1,535,851 | 1.27 ms | 2.26 ms | 4.67 ms |
+| query latency | 1 × 1 | 7,658 | 130 µs | 133 µs | 135 µs |
+| query throughput | 8 × 256 | 3,142,472 | 635 µs | 986 µs | 1.11 ms |
+| latency, fsync | 1 × 1 | 7,373 | 134 µs | 154 µs | 198 µs |
+| throughput, fsync | 8 × 256 | 1,403,091 | 1.40 ms | 2.24 ms | 4.78 ms |
+| latency, TLS | 1 × 1 | 9,823 | 88 µs | 204 µs | 212 µs |
+| throughput, TLS | 8 × 256 | 1,547,213 | 1.28 ms | 2.27 ms | 4.80 ms |
+| query latency, TLS | 1 × 1 | 11,278 | 80 µs | 201 µs | 205 µs |
+| query throughput, TLS | 8 × 256 | 3,229,133 | 614 µs | 961 µs | 1.10 ms |
+| latency, TLS, fsync | 1 × 1 | 3,829 | 260 µs | 266 µs | 270 µs |
+| throughput, TLS, fsync | 8 × 256 | 1,414,762 | 1.41 ms | 2.22 ms | 4.80 ms |
+
 Throughput, messages and queries a second, varies by a few per cent from one run to the next. A
 message on its own doesn't: it's a round trip over the network, client to leader and leader to
 follower, and that depends on where the placement group lands. On `c9gd` its p50 was 83 µs, 130 µs and

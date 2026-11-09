@@ -200,16 +200,17 @@ def serve() -> str:
 
 
 def bench() -> dict[str, str]:
-    """The landing page's figures, from the results in the guide's performance chapter: the
-    machine they're from, and cells of its table, which has a row per run and a column per figure."""
+    """The landing page's figures, from the guide's performance chapter: a cluster of machines of
+    its own, on Linux, its full table introduced by "On AWS <machine>: ", which has a row per run
+    and a column per figure."""
     chapter = (ROOT / "docs" / "guide" / "performance.md").read_text()
-    _, found, results = chapter.partition("\n## Results\n")
-    assert found, "the performance chapter has no Results section: update site/build.py's bench"
-    machine = re.search(r"^On (?:an? )?(.+?): ", results, re.M)
-    assert machine, "the performance chapter's results no longer start 'On <machine>: '"
-    # The first table only: those after it are other machines'.
-    first = re.search(r"^\|.*?(?=\n[^|]|\Z)", results, re.M | re.S)
-    assert first, "the performance chapter's results have no table"
+    _, found, results = chapter.partition("\n### On Linux servers\n")
+    assert found, "the performance chapter has no 'On Linux servers' section: update site/build.py's bench"
+    machine = re.search(r"^On AWS (.+?): ", results, re.M)
+    assert machine, "the Linux section has no full table introduced by 'On AWS <machine>: '"
+    # The table after that line.
+    first = re.search(r"^\|.*?(?=\n[^|]|\Z)", results[machine.end():], re.M | re.S)
+    assert first, "the Linux section's machine has no table"
     rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in first.group(0).splitlines()]
     header, table = rows[0], {row[0]: dict(zip(rows[0], row)) for row in rows[2:]}
 

@@ -261,10 +261,10 @@
 
   <section>
     <h2>Performance</h2>
-    <p class="sub">Three nodes on one machine ({{bench.machine}}) over loopback TCP, 64-byte
-    messages, from the repository's benchmark. A real cluster adds its network's round trips: the
-    <a href="guide/performance.html">guide's performance chapter</a> has every run, and how to
-    measure your own.</p>
+    <p class="sub">Three nodes on machines of their own, AWS {{bench.machine}} with 8 vCPUs
+    each, and the clients on a fourth, over the network, 64-byte messages, from the repository's
+    benchmark: the median of three runs. The <a href="guide/performance.html">guide's performance
+    chapter</a> has every run, on other machines too, and how to measure your own.</p>
     <div class="grid">
       <div class="card stat">
         <b>{{bench.throughput}}</b><span>messages a second</span>
@@ -273,12 +273,12 @@
       <div class="card stat">
         <b>{{bench.latency}}</b><span>p50 round trip</span>
         <p>One message at a time, from the client to its response, committed on two nodes of three
-        and applied. p99 {{bench.latency.p99}}.</p>
+        and applied: two round trips over the network. p99 {{bench.latency.p99}}.</p>
       </div>
       <div class="card stat">
         <b>{{bench.fsync}}</b><span>messages a second, synced</span>
-        <p>With <code>--fsync</code>: every batch on disk before it's acknowledged, one sync for
-        all that arrived during the last.</p>
+        <p>With <code>--fsync</code>: every batch on the instances' NVMe before it's acknowledged,
+        one sync for all that arrived during the last.</p>
       </div>
     </div>
   </section>
