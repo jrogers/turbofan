@@ -98,25 +98,25 @@ which comes from the nodes' own metrics.
 ## Results
 
 On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2, Rust 1.98.1, at
-commit `8d81e55` (0.10.0), November 2026. Each figure is the median of three runs of 10 s,
+commit `93195a5` (0.10.0), November 2026. Each figure is the median of three runs of 10 s,
 `--features tls`.
 
 | run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
 |---|---|---:|---:|---:|---:|
-| latency, in memory | 1 × 1 | 354,989 | 2 µs | 3 µs | 3 µs |
-| throughput, in memory | 8 × 256 | 427,212 | 4.51 ms | 13.70 ms | 13.93 ms |
-| latency | 1 × 1 | 14,649 | 66 µs | 103 µs | 133 µs |
-| throughput | 8 × 256 | 1,125,109 | 1.03 ms | 7.02 ms | 10.88 ms |
-| query latency | 1 × 1 | 22,559 | 43 µs | 60 µs | 103 µs |
-| query throughput | 8 × 256 | 2,645,500 | 754 µs | 1.24 ms | 1.55 ms |
-| latency, fsync | 1 × 1 | 117 | 8.05 ms | 13.65 ms | 15.69 ms |
-| throughput, fsync | 8 × 256 | 115,359 | 17.53 ms | 30.89 ms | 40.00 ms |
-| latency, TLS | 1 × 1 | 14,092 | 68 µs | 107 µs | 140 µs |
-| throughput, TLS | 8 × 256 | 1,105,282 | 1.04 ms | 7.83 ms | 11.07 ms |
-| query latency, TLS | 1 × 1 | 22,771 | 43 µs | 64 µs | 120 µs |
-| query throughput, TLS | 8 × 256 | 2,535,012 | 789 µs | 1.29 ms | 1.60 ms |
-| latency, TLS, fsync | 1 × 1 | 136 | 7.01 ms | 13.08 ms | 14.81 ms |
-| throughput, TLS, fsync | 8 × 256 | 113,861 | 17.84 ms | 29.30 ms | 35.80 ms |
+| latency, in memory | 1 × 1 | 433,625 | 2 µs | 2 µs | 2 µs |
+| throughput, in memory | 8 × 256 | 499,097 | 3.83 ms | 11.98 ms | 12.82 ms |
+| latency | 1 × 1 | 14,956 | 64 µs | 101 µs | 131 µs |
+| throughput | 8 × 256 | 1,198,294 | 894 µs | 7.95 ms | 10.73 ms |
+| query latency | 1 × 1 | 22,650 | 44 µs | 61 µs | 109 µs |
+| query throughput | 8 × 256 | 2,830,641 | 706 µs | 1.17 ms | 1.43 ms |
+| latency, fsync | 1 × 1 | 125 | 7.84 ms | 14.02 ms | 16.10 ms |
+| throughput, fsync | 8 × 256 | 114,939 | 17.76 ms | 31.96 ms | 38.17 ms |
+| latency, TLS | 1 × 1 | 14,436 | 66 µs | 105 µs | 137 µs |
+| throughput, TLS | 8 × 256 | 1,170,253 | 919 µs | 8.09 ms | 11.17 ms |
+| query latency, TLS | 1 × 1 | 22,713 | 43 µs | 61 µs | 112 µs |
+| query throughput, TLS | 8 × 256 | 2,721,277 | 735 µs | 1.21 ms | 1.48 ms |
+| latency, TLS, fsync | 1 × 1 | 128 | 7.89 ms | 13.97 ms | 16.09 ms |
+| throughput, TLS, fsync | 8 × 256 | 113,730 | 17.94 ms | 32.29 ms | 38.20 ms |
 
 Without fsync, a message is committed in tens of microseconds, and no one task is busy: the
 throughput run is bound by its own window, 2,048 messages in flight over a round trip of about a
@@ -129,12 +129,12 @@ second: each sync covers every message that arrived during the one before. A Lin
 drive syncs much faster (below); measure yours.
 
 A query skips the write, so one on its own takes two thirds of a message's time, and with many in
-flight they go more than twice as fast as messages: 2.6 million a second.
+flight they go more than twice as fast as messages: 2.8 million a second.
 
-The core alone, the `in memory` runs: 354,989 messages a second one at a time, a commit through
-all three nodes in 2 µs at p50, and 427,212 a second at 8 × 256, on its one thread (openraft's
+The core alone, the `in memory` runs: 433,625 messages a second one at a time, a commit through
+all three nodes in 2 µs at p50, and 499,097 a second at 8 × 256, on its one thread (openraft's
 benchmark, on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without
-fsync, nearly all of a message's 66 µs on its own over TCP is the driver's and the loopback's,
+fsync, nearly all of a message's 64 µs on its own over TCP is the driver's and the loopback's,
 not the core's.
 
 ### On a Linux server
@@ -164,7 +164,7 @@ two rows, on the root EBS volume (gp3).
 | throughput, fsync, EBS | 8 × 256 | 260,191 | 8.02 ms | 10.69 ms | 13.01 ms |
 
 A message on its own is a round trip over the network now, client to leader and leader to
-follower, not over loopback: 232 µs, where the Mac's was 66 µs. A sync on the instance's NVMe
+follower, not over loopback: 232 µs, where the Mac's was 64 µs. A sync on the instance's NVMe
 drive takes about a tenth of a millisecond, where the Mac's `F_FULLFSYNC` took milliseconds: fsync
 adds 108 µs to a message on its own, and costs a tenth of the throughput, where on the Mac it cost
 nine tenths. On EBS, network storage, a sync is a round trip of its own, some milliseconds:
