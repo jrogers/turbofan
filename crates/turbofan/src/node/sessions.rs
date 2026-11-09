@@ -46,6 +46,12 @@ impl<S: Service> Node<S> {
         last_egress_seq: u64,
         credentials: &[u8],
     ) {
+        // A session's ID is the index it opened at: past what's applied here, this node is a
+        // leader deposed without knowing it yet, and can't say the session's gone. Elsewhere.
+        if session.0 > self.state.applied {
+            self.redirect(conn);
+            return;
+        }
         let s = self.state.sessions.get(&session).filter(|_| self.state.of_epoch(session, epoch));
         let Some(s) = s else {
             self.send_client(conn, &wire::Closed { session: session.0, reason: CloseReason::NoSession });

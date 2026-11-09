@@ -71,6 +71,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec::{self, MAX_ENTRIES_PER_APPEND, Record};
@@ -129,6 +130,9 @@ impl std::str::FromStr for NodeId {
         s.parse().map(|id: std::num::NonZeroU8| Self(id.get()))
     }
 }
+
+/// A frame for a peer, shared: an append goes to every peer at the same index as one frame.
+pub type Frame = Arc<Vec<u8>>;
 
 /// The most members a cluster can have.
 pub const MAX_MEMBERS: usize = 7;
@@ -306,9 +310,9 @@ pub struct Outputs {
     /// Persist these first, in order.
     pub persist: Vec<Persist>,
     /// A leader's `AppendEntries`: send these at once, without waiting for `persist`.
-    pub appends: Vec<(NodeId, Vec<u8>)>,
+    pub appends: Vec<(NodeId, Frame)>,
     /// Once `persist` is durable, send these frames.
-    pub sends: Vec<(NodeId, Vec<u8>)>,
+    pub sends: Vec<(NodeId, Frame)>,
     /// Once `persist` is written, read the records from each of these indices on: at least one,
     /// up to [`MAX_READ_BYTES`] or the end of a log file. Give them to [`Raft::on_read`], then take
     /// outputs. A batch may ask again for a read an earlier one asked for and is still under way.
@@ -358,6 +362,20 @@ fn reached(waiting: &mut VecDeque<(u64, u64)>, index: u64, stage: Stage, now: u6
     }
 }
 
+/// The highest of `values` that `quorum` of them reach (the `quorum`th highest), if there are that
+/// many, without allocating: it's taken on every ack. One per member, at most [`MAX_MEMBERS`]: past
+/// that, `None`, which holds back what waits for a quorum rather than panic on members off the wire.
+fn quorum_highest(values: impl IntoIterator<Item = u64>, quorum: usize) -> Option<u64> {
+    let mut all = [0; MAX_MEMBERS];
+    let mut len = 0;
+    for value in values {
+        *all.get_mut(len)? = value;
+        len += 1;
+    }
+    let nth = quorum.checked_sub(1).filter(|&nth| nth < len)?;
+    Some(*all[..len].select_nth_unstable_by(nth, |a, b| b.cmp(a)).1)
+}
+
 #[derive(Debug)]
 struct Peer {
     id: NodeId,
@@ -382,6 +400,26 @@ struct Peer {
     probe_read: bool,
     /// The latest read round it echoed, in this term ([`Raft::read_index`]).
     read_round: u64,
+}
+
+/// A run of whole records read back from disk, kept as read: one buffer, not one for each.
+#[derive(Debug)]
+struct Fetched {
+    /// The index of the first.
+    first: u64,
+    bytes: Vec<u8>,
+    /// Where each record ends in `bytes`, in order.
+    ends: Vec<usize>,
+}
+
+impl Fetched {
+    /// The record at `index`, if the run has it.
+    fn record(&self, index: u64) -> Option<&[u8]> {
+        let i = usize::try_from(index.checked_sub(self.first)?).ok()?;
+        let end = *self.ends.get(i)?;
+        let start = i.checked_sub(1).map_or(0, |before| self.ends[before]);
+        Some(&self.bytes[start..end])
+    }
 }
 
 /// A leadership transfer under way.
@@ -452,9 +490,8 @@ pub struct Raft {
     unpersisted: VecDeque<(u64, u64)>,
     unapplied: VecDeque<(u64, u64)>,
     uncommitted_bytes: usize,
-    /// Records read back from disk, by the index of the first in each run, until the next
-    /// [`Raft::take_outputs`].
-    fetched: Vec<(u64, Vec<Vec<u8>>)>,
+    /// Runs of records read back from disk, until the next [`Raft::take_outputs`].
+    fetched: Vec<Fetched>,
     durable: u64,
     commit: u64,
     peers: Vec<Peer>,
@@ -477,6 +514,9 @@ pub struct Raft {
     snapshot: Option<Snapshot>,
     /// Chunks of it read back from disk, by offset, until the next [`Raft::take_outputs`].
     fetched_chunks: Vec<(u64, Vec<u8>)>,
+    /// The latest append with records, by everything in it but its records, the index after its
+    /// last, and its frame: for the next peer at the same index, until [`Raft::take_outputs`].
+    shared_append: Option<([u64; 6], u64, Frame)>,
     /// A snapshot arriving from the leader, chunk by chunk, and how much of it has.
     incoming: Option<Snapshot>,
     /// The checksum of its bytes so far, to check against the leader's once they're all here.
@@ -559,6 +599,7 @@ impl Raft {
             out: Outputs::default(),
             snapshot,
             fetched_chunks: Vec::new(),
+            shared_append: None,
             incoming: None,
             incoming_sum: crate::codec::CHECKSUM_START,
             installed: false,
@@ -769,7 +810,6 @@ impl Raft {
         }
     }
 
-    /// A peer's message. Messages that aren't Raft's are ignored.
     /// A peer's message. Messages that aren't Raft's are ignored, as are acks from nodes this
     /// one isn't sending to. Any node may lead: a member this node hasn't heard was added.
     pub fn on_message(&mut self, from: NodeId, message: &wire::Decoded<'_>, now: u64) {
@@ -843,6 +883,7 @@ impl Raft {
         }
         self.fetched.clear();
         self.fetched_chunks.clear();
+        self.shared_append = None;
         std::mem::take(&mut self.out)
     }
 }

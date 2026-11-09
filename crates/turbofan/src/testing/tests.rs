@@ -12,9 +12,20 @@ struct Tally {
     messages: Vec<Vec<u8>>,
     /// The session each timer answers, by its ID.
     timers: BTreeMap<u64, SessionId>,
+    /// The version of its behaviour it has, and those the cluster switched to.
+    version: u32,
+    activated: Vec<u32>,
 }
 
 impl Service for Tally {
+    fn version(&self) -> u32 {
+        self.version
+    }
+
+    fn on_activate(&mut self, _ctx: &mut Ctx, version: u32) {
+        self.activated.push(version);
+    }
+
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
         self.messages.push(payload.to_vec());
         if payload == b"timer" {
@@ -236,4 +247,68 @@ fn a_query_in_flight_through_a_failover_is_answered_by_the_new_leader() {
     cluster.crash(old);
     assert_eq!(answer(&mut cluster, alice), Answer { query: id, answer: Ok(b"2".to_vec()) });
     assert_ne!(cluster.leader(), Some(old));
+}
+
+/// A node is added and made a voter, and the leader removed: the new node leads, the clients
+/// following it there, and has every message.
+#[test]
+fn a_member_is_added_and_the_leader_removed() {
+    let mut cluster = Cluster::new(3, |_| Tally::default());
+    let alice = cluster.connect(b"alice").unwrap();
+    cluster.send_batch(alice, numbered(0, 5)).unwrap();
+    assert!(cluster.run_until(Duration::from_secs(1), |c| c.client(alice).unacked() == 0));
+    assert_eq!(answers(&cluster.events(alice)), ["1", "2", "3", "4", "5"]);
+    let new = NodeId(4);
+    let is_member = |c: &Cluster<Tally>, id, learner| {
+        c.members().is_some_and(|m| m.iter().any(|m| m.id == id && m.learner == learner))
+    };
+    assert!(cluster.add_member(new, true));
+    assert!(cluster.run_until(Duration::from_secs(2), |c| is_member(c, new, true)));
+    assert_eq!(cluster.ids(), [NodeId(1), NodeId(2), NodeId(3), new]);
+    assert!(cluster.set_role(new, false));
+    assert!(cluster.run_until(Duration::from_secs(2), |c| is_member(c, new, false)));
+
+    let old = cluster.leader().unwrap();
+    assert!(cluster.remove_member(old));
+    let gone = |c: &Cluster<Tally>| c.members().is_some_and(|m| m.len() == 3 && m.iter().all(|m| m.id != old));
+    assert!(cluster.run_until(Duration::from_secs(2), gone));
+    cluster.crash(old);
+    assert!(cluster.run_until(Duration::from_secs(2), |c| c.leader().is_some_and(|l| l != old)));
+    assert!(cluster.transfer_leadership(Some(new)));
+    assert!(cluster.run_until(Duration::from_secs(2), |c| c.leader() == Some(new)));
+    cluster.send_batch(alice, numbered(5, 10)).unwrap();
+    assert!(cluster.run_until(Duration::from_secs(2), |c| c.client(alice).unacked() == 0));
+    assert_eq!(answers(&cluster.events(alice)), ["6", "7", "8", "9", "10"], "on the same session");
+    assert!(cluster.run_until(Duration::from_secs(1), |c| applied_everywhere(c, 10)));
+    assert_eq!(cluster.service(new).unwrap().messages, numbered(0, 10));
+}
+
+/// A rolling upgrade: the new version is turned down while a member runs the old, and
+/// activated on every node once all run the new; a node restarting after keeps it.
+#[test]
+fn a_rolling_upgrade_activates_the_new_version() {
+    let mut cluster = Cluster::new(3, |_| Tally::default());
+    let alice = cluster.connect(b"alice").unwrap();
+    let v1 = |_| Tally { version: 1, ..Tally::default() };
+    let ids = cluster.ids();
+    for &id in &ids[..2] {
+        cluster.upgrade(id, v1);
+        assert!(cluster.run_until(Duration::from_secs(2), |c| c.leader().is_some()));
+    }
+    cluster.run_for(100 * MS);
+    assert!(cluster.activate(1));
+    cluster.run_for(100 * MS);
+    assert!(ids.iter().all(|&id| cluster.service(id).unwrap().activated.is_empty()), "one runs the old");
+
+    cluster.upgrade(ids[2], v1);
+    assert!(cluster.run_until(Duration::from_secs(2), |c| c.leader().is_some()));
+    cluster.run_for(100 * MS);
+    assert!(cluster.activate(1));
+    let activated = |c: &Cluster<Tally>| ids.iter().all(|&id| c.service(id).unwrap().activated == [1]);
+    assert!(cluster.run_until(Duration::from_secs(1), activated));
+    cluster.crash(ids[0]);
+    cluster.restart(ids[0]);
+    assert_eq!(cluster.service(ids[0]).unwrap().version, 1, "upgraded for good");
+    cluster.send(alice, "after").unwrap();
+    assert!(cluster.run_until(Duration::from_secs(2), |c| c.client(alice).unacked() == 0));
 }

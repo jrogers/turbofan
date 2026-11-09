@@ -280,6 +280,7 @@ version = "0.10.0"
 dependencies = [
  "crc32c",
  "metrics",
+ "socket2",
  "tokio",
  "turbofan-sbe",
 ]

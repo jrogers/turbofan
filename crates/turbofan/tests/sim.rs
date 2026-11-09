@@ -390,7 +390,7 @@ enum Event {
     Deliver {
         from: NodeId,
         to: NodeId,
-        frame: Vec<u8>,
+        frame: turbofan::raft::Frame,
     },
     Tick(NodeId),
     Restart(NodeId),
@@ -1506,7 +1506,7 @@ impl Sim {
         assert!(first == bytes, "seed {}: snapshots of {index} differ", self.seed);
     }
 
-    fn send_peer(&mut self, from: NodeId, to: NodeId, frame: Vec<u8>) {
+    fn send_peer(&mut self, from: NodeId, to: NodeId, frame: turbofan::raft::Frame) {
         if self.cut[usize::from(from)][usize::from(to)] || (self.faults && self.rng.one_in(50)) {
             return;
         }

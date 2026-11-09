@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -36,15 +36,14 @@ use crate::meta::MetaFile;
 use crate::metrics;
 use crate::node::{self, ConnId, Node, Service};
 use crate::pipeline::{self, Pipeline};
-use crate::raft::{Entries, MAX_READ_BYTES, Member, NodeId, Persist, Role, SnapshotRead};
+use crate::raft::{Entries, Frame, MAX_READ_BYTES, Member, NodeId, Persist, Role, SnapshotRead};
 use crate::tls::{self, NodeTls};
 use crate::{snapshot, wire};
 
 /// Inputs waiting for the node, from clients and from the rest: past this, connections wait to
 /// hand theirs over.
 const MAX_QUEUED_INPUTS: usize = 4096;
-/// Inputs taken into one batch before persisting it, a client's or an operator's counted by its
-/// frames.
+/// Inputs taken into one batch before persisting it, a connection's counted by its frames.
 const MAX_BATCH_INPUTS: usize = 1024;
 /// The most frames a connection hands the node at once: those it has read whole, together.
 const MAX_FRAMES_AN_INPUT: usize = 256;
@@ -56,6 +55,9 @@ const MAX_QUEUED_FRAMES: usize = 4096;
 const REDIAL: Duration = Duration::from_millis(100);
 /// The longest wait before dialling an unreachable peer again.
 const MAX_REDIAL: Duration = Duration::from_secs(1);
+/// The buffer frames to a peer are written through: acks and heartbeats, tens of bytes, gather
+/// in it, a thousand to a write; an append bigger than it goes straight to the connection.
+const PEER_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 /// How long to wait to accept again after accepting failed.
 const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 /// How long a node that has stopped waits, for what it sent last to go out.
@@ -154,6 +156,10 @@ fn check_tokens(config: &Config) -> io::Result<()> {
 
 /// The longest token a hello carries.
 pub const MAX_TOKEN_BYTES: usize = 255;
+/// The longest hello taken: a few fixed fields and a token, with a kilobyte's room for fields to
+/// come. A connection's first frame is read before anything is known of it, so not up to
+/// [`MAX_FRAME_BYTES`]: else each stranger's connection may hold a megabyte.
+pub(crate) const MAX_HELLO_BYTES: usize = MAX_TOKEN_BYTES + 1024;
 
 /// Starts a new cluster from the snapshot file `from`: a copy of a node's, taken off it to back
 /// the cluster up. Writes `config.data_dir` for [`serve`] to run, with the same `config`, as the
@@ -196,8 +202,8 @@ pub fn restore(from: &Path, config: &Config) -> io::Result<(u64, u64)> {
 }
 
 enum Input {
-    Peer(NodeId, Vec<u8>),
     /// Frames a connection read together: up to [`MAX_FRAMES_AN_INPUT`].
+    Peer(NodeId, Vec<Vec<u8>>),
     Client(ConnId, Vec<Vec<u8>>),
     Admin(ConnId, Vec<Vec<u8>>),
     Open(ConnId, mpsc::Sender<Vec<u8>>),
@@ -327,7 +333,7 @@ struct Core<S> {
     /// Peers to dial whatever the members are.
     contacts: Vec<(NodeId, String)>,
     /// The peers dialled: where, the frames for them, and the task dialling.
-    peers: HashMap<NodeId, (String, mpsc::Sender<Vec<u8>>, AbortHandle)>,
+    peers: HashMap<NodeId, (String, mpsc::Sender<Frame>, AbortHandle)>,
     dials: JoinSet<()>,
     conns: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
 }
@@ -396,12 +402,17 @@ impl<S: Service + 'static> Core<S> {
         }
     }
 
-    /// Hands `input` to the node, returning how many inputs it counts as: a client's or an
-    /// operator's, its frames.
+    /// Hands `input` to the node, returning how many inputs it counts as: a connection's, its
+    /// frames.
     fn handle(&mut self, input: Input) -> io::Result<usize> {
         let now = self.clock.now();
         match input {
-            Input::Peer(from, frame) => self.node.on_peer(from, &decode(&frame), now),
+            Input::Peer(from, frames) => {
+                for frame in &frames {
+                    self.node.on_peer(from, &decode(frame), now);
+                }
+                return Ok(frames.len());
+            }
             Input::Client(conn, frames) => {
                 for frame in &frames {
                     self.node.on_client(conn, &decode(frame), now);
@@ -417,9 +428,11 @@ impl<S: Service + 'static> Core<S> {
             Input::Open(conn, tx) => {
                 self.conns.insert(conn, tx);
             }
+            // Unless the node was told already, as it dropped one too slow to read.
             Input::Closed(conn) => {
-                self.conns.remove(&conn);
-                self.node.on_disconnect(conn);
+                if self.conns.remove(&conn).is_some() {
+                    self.node.on_disconnect(conn);
+                }
             }
             Input::SnapshotSaved(saved) => self.node.on_snapshot_saved(saved?),
         }
@@ -495,6 +508,8 @@ impl<S: Service + 'static> Core<S> {
     /// Dials `members` and the contacts, a member's address taking precedence, and stops dialling
     /// any other peer.
     fn dial(&mut self, members: &[Member]) {
+        // Those stopped below, the last time, reaped: each is kept till joined.
+        while self.dials.try_join_next().is_some() {}
         let mut wanted: HashMap<NodeId, String> = self.contacts.iter().cloned().collect();
         wanted.extend(members.iter().map(|m| (m.id, m.peer.clone())));
         wanted.retain(|&id, _| Some(id) != self.hello.node_id);
@@ -521,7 +536,7 @@ impl<S: Service + 'static> Core<S> {
         }
     }
 
-    fn send_peers(&self, frames: Vec<(NodeId, Vec<u8>)>) {
+    fn send_peers(&self, frames: Vec<(NodeId, Frame)>) {
         for (to, frame) in frames {
             if let Some((_, tx, _)) = self.peers.get(&to) {
                 // Full or down: Raft resends.
@@ -807,10 +822,20 @@ pub(crate) async fn write_frames<'a>(
 ///
 /// If reading fails, the connection closes, or the frame is too long.
 pub(crate) async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+    read_frame_up_to(reader, MAX_FRAME_BYTES).await
+}
+
+/// Reads a connection's first frame, its hello, refusing one over [`MAX_HELLO_BYTES`].
+async fn read_hello(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+    read_frame_up_to(reader, MAX_HELLO_BYTES).await
+}
+
+/// [`read_frame`], refusing one over `max` bytes by its length, before anything is allocated.
+async fn read_frame_up_to(reader: &mut (impl AsyncRead + Unpin), max: usize) -> io::Result<Vec<u8>> {
     let len = reader.read_u32_le().await?;
     let len = usize::try_from(len).map_err(io::Error::other)?;
-    if len > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame over MAX_FRAME_BYTES"));
+    if len > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("a frame of {len} bytes, over {max}")));
     }
     let mut frame = vec![0; 4 + len];
     frame[..4].copy_from_slice(&u32::try_from(len).expect("checked").to_le_bytes());
@@ -917,10 +942,10 @@ async fn accept_peers(
         conns.spawn(async move {
             let handshake = async {
                 let (mut stream, cert) = tls::accept(stream, tls.as_ref(), plain_beside).await?;
-                let first = read_frame(&mut stream).await?;
+                let first = read_hello(&mut stream).await?;
                 io::Result::Ok((stream, cert, first))
             };
-            let Ok(Ok((mut stream, cert, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else {
+            let Ok(Ok((stream, cert, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else {
                 return;
             };
             let theirs = hello.check(&first, wire::Role::Peer);
@@ -932,14 +957,26 @@ async fn accept_peers(
             if Some(from) == hello.node_id || (peer_ids && !tls::names(cert.as_ref(), from)) {
                 return;
             }
-            while let Ok(frame) = read_valid_frame(&mut stream).await {
-                // Checked again as this node learns its epoch, or it changes: a connection from
-                // another cluster's node is dropped then.
-                if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frame)).await.is_err() {
-                    return;
-                }
-            }
+            // Only read, but its writing half kept: dropping it would close the dialler's way in.
+            let (mut reader, _writer) = stream.split();
+            read_peer(&mut reader, from, epoch, &hello, &inputs).await;
         });
+    }
+}
+
+/// Hands the node what a peer sends, until it sends something malformed, the connection fails,
+/// or it's found of another cluster.
+async fn read_peer(reader: &mut tls::ReadHalf, from: NodeId, epoch: u64, hello: &Hello, inputs: &mpsc::Sender<Input>) {
+    while let Ok(frame) = read_valid_frame(reader).await {
+        // With the rest read whole meanwhile, as a client's are: a leader's acks from a
+        // follower come many at once, each else an input of its own.
+        let mut frames = vec![frame];
+        let rest = read_buffered(reader, &mut frames).await;
+        // Checked again as this node learns its epoch, or it changes: a connection from
+        // another cluster's node is dropped then.
+        if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frames)).await.is_err() || rest.is_err() {
+            return;
+        }
     }
 }
 
@@ -995,7 +1032,7 @@ async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
     };
     let handshake = async {
         let (mut stream, _) = tls::accept(stream, tls.as_ref(), plain_beside).await?;
-        let first = read_frame(&mut stream).await?;
+        let first = read_hello(&mut stream).await?;
         io::Result::Ok((stream, first))
     };
     let Ok(Ok((stream, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else { return };
@@ -1063,6 +1100,18 @@ fn open_node<S: Service>(config: &Config, service: S) -> io::Result<(Node<S>, St
     Ok((node, storage, lock, clock))
 }
 
+/// Into `batch`, `first` and what else is queued, until they come to a frame's limit.
+fn gather(first: Frame, rx: &mut mpsc::Receiver<Frame>, batch: &mut Vec<Frame>) {
+    batch.clear();
+    let mut bytes = first.len();
+    batch.push(first);
+    while bytes < MAX_FRAME_BYTES {
+        let Ok(frame) = rx.try_recv() else { break };
+        bytes += frame.len();
+        batch.push(frame);
+    }
+}
+
 /// The wait before dialling again after one of `redial` failed.
 fn backoff(redial: Duration) -> Duration {
     (redial * 2).min(MAX_REDIAL)
@@ -1076,18 +1125,21 @@ async fn dial_peer(
     token: Arc<[u8]>,
     tls: tls::Current,
     node: Option<NodeId>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<Frame>,
 ) {
     let mut batch = Vec::new();
     let mut redial = REDIAL;
     loop {
         let dial = tls.borrow().as_ref().and_then(|t| t.dial.clone());
         let connected = tokio::time::timeout(HELLO_TIMEOUT, tls::connect(&addr, dial.as_ref(), node)).await;
-        let Ok(Ok(mut stream)) = connected else {
+        let Ok(Ok(stream)) = connected else {
             tokio::time::sleep(redial).await;
             redial = backoff(redial);
             continue;
         };
+        // Small frames gathered into fewer writes (over TLS, fewer records); an append with its
+        // records, past the buffer, goes straight through, not copied again.
+        let mut stream = BufWriter::with_capacity(PEER_WRITE_BUFFER_BYTES, stream);
         let epoch = hello.epoch();
         if write_frames(&mut stream, [&hello.frame(wire::Role::Peer, &token)[..]]).await.is_err() {
             tokio::time::sleep(redial).await;
@@ -1102,13 +1154,14 @@ async fn dial_peer(
             if hello.epoch() != epoch {
                 break;
             }
-            batch.clear();
-            batch.extend_from_slice(&frame);
-            while batch.len() < MAX_FRAME_BYTES {
-                let Ok(frame) = rx.try_recv() else { break };
-                batch.extend_from_slice(&frame);
-            }
-            if write_frames(&mut stream, [&batch[..]]).await.is_err() {
+            gather(frame, &mut rx, &mut batch);
+            let written = async {
+                for frame in &batch {
+                    stream.write_all(frame).await?;
+                }
+                stream.flush().await
+            };
+            if written.await.is_err() {
                 break;
             }
         }
@@ -1171,6 +1224,25 @@ mod tests {
         assert_eq!(waits, [ms(100), ms(200), ms(400), ms(800), ms(1000), ms(1000)]);
     }
 
+    /// Frames queued for a peer are written together up to a frame's limit, the rest left for the
+    /// next write; and a write is of whatever's queued, one frame or more.
+    #[test]
+    fn frames_to_a_peer_are_gathered_up_to_a_frames_limit() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let quarter = || Frame::new(vec![0; MAX_FRAME_BYTES / 4]);
+        for _ in 0..6 {
+            tx.try_send(quarter()).unwrap();
+        }
+        let mut batch = vec![quarter()];
+        gather(rx.try_recv().unwrap(), &mut rx, &mut batch);
+        assert_eq!(batch.len(), 4, "the one before, cleared");
+        gather(rx.try_recv().unwrap(), &mut rx, &mut batch);
+        assert_eq!(batch.len(), 2, "the rest");
+        tx.try_send(quarter()).unwrap();
+        gather(Frame::new(vec![0; 1]), &mut rx, &mut batch);
+        assert_eq!(batch.len(), 2);
+    }
+
     /// Peers are of one cluster unless both know its epoch, and they differ: a node that knows
     /// none yet (joining, or a new cluster's before its first leader names it) talks to any.
     #[test]
@@ -1224,6 +1296,30 @@ mod tests {
         assert_eq!(frames, [keepalive(1)], "those before it");
     }
 
+    /// A peer's frames before a malformed one reach the node, and none after: it's dropped there.
+    /// None at all from a peer found of another cluster.
+    #[tokio::test]
+    async fn a_peer_is_read_up_to_a_malformed_frame() {
+        let keepalive = |session| {
+            let mut frame = Vec::new();
+            codec::encode_frame(&wire::KeepAlive { session }, &mut frame).unwrap();
+            frame
+        };
+        let mut malformed = keepalive(2);
+        malformed[8..10].copy_from_slice(&7_u16.to_le_bytes());
+        let bytes = [keepalive(1), malformed, keepalive(3)].concat();
+        let reader = || -> tls::ReadHalf { tokio::io::BufReader::new(Box::new(std::io::Cursor::new(bytes.clone()))) };
+        let hello = Hello { service_id: 1, node_id: Some(NodeId(1)), epoch: Arc::new(AtomicU64::new(7)) };
+        let (inputs, mut taken) = mpsc::channel(8);
+        read_peer(&mut reader(), NodeId(2), 7, &hello, &inputs).await;
+        let Ok(Input::Peer(NodeId(2), frames)) = taken.try_recv() else { panic!("the frame before it") };
+        assert_eq!(frames, [keepalive(1)]);
+        assert!(taken.try_recv().is_err(), "none after it");
+
+        read_peer(&mut reader(), NodeId(2), 8, &hello, &inputs).await;
+        assert!(taken.try_recv().is_err(), "another cluster's");
+    }
+
     /// A connection from a newer node isn't dropped for a message this one doesn't know: it's
     /// skipped, and the next read.
     #[tokio::test]
@@ -1238,7 +1334,77 @@ mod tests {
 
         let mut malformed = known.clone();
         malformed[8..10].copy_from_slice(&7_u16.to_le_bytes());
-        assert!(read_valid_frame(&mut &malformed[..]).await.is_err(), "another schema's");
+        // A frame after it, so a malformed one skipped would read that, not fail at the end.
+        let bytes = [malformed, known].concat();
+        let read = read_valid_frame(&mut &bytes[..]).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidData, "another schema's");
+    }
+
+    /// A frame up to `MAX_FRAME_BYTES` is read; one longer is refused by its length, before
+    /// anything is allocated for it.
+    #[tokio::test]
+    async fn a_frame_over_the_limit_is_refused() {
+        let at_limit = [&u32::try_from(MAX_FRAME_BYTES).unwrap().to_le_bytes()[..], &vec![0; MAX_FRAME_BYTES]].concat();
+        assert_eq!(read_frame(&mut &at_limit[..]).await.unwrap(), at_limit);
+        let over = u32::try_from(MAX_FRAME_BYTES + 1).unwrap().to_le_bytes();
+        let read = read_frame(&mut &over[..]).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidData, "by its length, not for want of bytes");
+    }
+
+    /// A hello with the longest token is taken; a first frame longer than a hello can be is
+    /// refused by its length, before anything is allocated for it.
+    #[tokio::test]
+    async fn a_first_frame_longer_than_a_hello_is_refused() {
+        let hello = Hello { service_id: 7, node_id: None, epoch: Arc::new(AtomicU64::new(0)) };
+        let longest = hello.frame(wire::Role::Client, &[b't'; MAX_TOKEN_BYTES]);
+        assert!(longest.len() <= MAX_HELLO_BYTES, "{} bytes", longest.len());
+        assert_eq!(read_hello(&mut &longest[..]).await.unwrap(), longest);
+        let over = u32::try_from(MAX_HELLO_BYTES + 1).unwrap().to_le_bytes();
+        let read = read_hello(&mut &over[..]).await;
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidData, "by its length, not for want of bytes");
+    }
+
+    /// Tokens match only byte for byte: one of the same length a byte off doesn't, wherever it is.
+    #[test]
+    fn a_token_matches_only_byte_for_byte() {
+        assert!(same(b"secret", b"secret"));
+        assert!(!same(b"secret", b"secreT"));
+        assert!(!same(b"secret", b"Secret"));
+        assert!(!same(b"secret", b"secret!"));
+        assert!(!same(b"ab", b"ba"), "differences that cancel out");
+        assert!(same(b"", b""));
+    }
+
+    /// A hello is taken only with the magic, the service and the role expected.
+    #[test]
+    fn a_hello_is_taken_only_for_this_service_and_role() {
+        let ours = Hello { service_id: 7, node_id: None, epoch: Arc::new(AtomicU64::new(0)) };
+        let other_service = Hello { service_id: 8, ..ours.clone() };
+        assert!(ours.check(&ours.frame(wire::Role::Client, b""), wire::Role::Client).is_some());
+        assert!(ours.check(&ours.frame(wire::Role::Client, b""), wire::Role::Peer).is_none(), "another role");
+        assert!(ours.check(&other_service.frame(wire::Role::Client, b""), wire::Role::Client).is_none());
+        let mut frame = Vec::new();
+        let hello =
+            wire::Hello { magic: MAGIC ^ 1, service_id: 7, role: wire::Role::Client, node_id: 0, epoch: 0, token: b"" };
+        codec::encode_frame(&hello, &mut frame).unwrap();
+        assert!(ours.check(&frame, wire::Role::Client).is_none(), "another magic");
+    }
+
+    /// A token as long as a hello carries is taken; one longer is refused as the node starts.
+    #[test]
+    fn a_token_longer_than_a_hello_carries_is_refused() {
+        let unused = "127.0.0.1:1".parse().unwrap();
+        let node = node::Config::new(NodeId(1), Vec::new());
+        let config = |admin: usize, peer: usize| Config {
+            admin_token: Some(vec![b'a'; admin]),
+            peer_token: Some(vec![b'p'; peer]),
+            ..Config::new(node.clone(), 1, "unused", Vec::new(), unused, unused)
+        };
+        assert!(check_tokens(&config(MAX_TOKEN_BYTES, MAX_TOKEN_BYTES)).is_ok());
+        // The other at the limit, taken: the one over it is what's refused.
+        for (admin, peer) in [(MAX_TOKEN_BYTES + 1, MAX_TOKEN_BYTES), (MAX_TOKEN_BYTES, MAX_TOKEN_BYTES + 1)] {
+            assert_eq!(check_tokens(&config(admin, peer)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     /// A listener at its limit waits for a connection to close before it takes another.
@@ -1321,6 +1487,46 @@ mod tests {
         assert_eq!(at, base + 3 * SECOND + 1_000_000 - 500_000);
         // A monotonic reading behind the last changes nothing.
         assert_eq!(clock.advance(SECOND, base), at);
+        // A gap narrower than a second's slew is closed at once, either way.
+        let free = at + SECOND;
+        assert_eq!(clock.advance(4 * SECOND, free + 100), free + 100);
+        assert_eq!(clock.advance(5 * SECOND, free + SECOND - 100), free + SECOND - 100);
+    }
+
+    /// The driver's clock starts at the wall clock, and a cluster time ahead is due that far
+    /// ahead on the monotonic clock.
+    #[test]
+    fn the_drivers_clock_starts_at_the_wall_clock() {
+        let mut clock = Clock::new();
+        // Read here, not by `wall_ns`, which is what's checked.
+        let wall = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+        let gap = clock.now().abs_diff(wall);
+        assert!(gap < SECOND, "{gap} ns from the wall clock");
+        let ahead = Duration::from_millis(500);
+        let now = clock.now();
+        let due = clock.instant(now + crate::raft::nanos(ahead));
+        let from_now = due.saturating_duration_since(Instant::now());
+        assert!(from_now > ahead / 2 && from_now <= ahead, "due in {from_now:?}");
+    }
+
+    /// A node configured wrong doesn't serve: its error is returned.
+    #[tokio::test]
+    async fn serve_returns_why_it_cant_start() {
+        let unused = "127.0.0.1:1".parse().unwrap();
+        let mut config = Config::new(node::Config::new(NodeId(1), Vec::new()), 1, "unused", Vec::new(), unused, unused);
+        config.admin_token = Some(vec![b'a'; MAX_TOKEN_BYTES + 1]);
+        struct Nothing;
+        impl Service for Nothing {
+            fn on_message(&mut self, _: &mut node::Ctx, _: node::SessionId, _: &[u8]) {}
+            fn snapshot(&self) -> node::SnapshotWriter {
+                Box::new(|_| Ok(()))
+            }
+            fn restore(&mut self, _: &mut dyn io::Read) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let served = tokio::time::timeout(Duration::from_secs(5), serve(config, Nothing)).await;
+        assert_eq!(served.expect("returned at once").unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     /// With `peer_ids`, a peer dialling in is taken only as the node its certificate names: one

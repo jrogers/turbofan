@@ -25,19 +25,19 @@ impl Raft {
     /// Records read back from disk for [`Outputs::reads`]. They're kept until the next
     /// [`Raft::take_outputs`]; any that the log doesn't hold, or holds in memory, are ignored.
     pub fn on_read(&mut self, records: &[u8]) {
-        let (mut first, mut run, mut at) = (None, Vec::new(), 0);
+        let (mut first, mut ends, mut at) = (None, Vec::new(), 0);
         while let Ok(Some((record, len))) = Record::decode(&records[at..]) {
-            let index = first.map_or(record.index, |f| f + crate::widen(run.len()));
+            let index = first.map_or(record.index, |f| f + crate::widen(ends.len()));
             let on_disk = index >= self.log.first && index < self.log.window_first;
             if record.index != index || !on_disk || self.log.term_at(index) != Some(record.term) {
                 break;
             }
             first.get_or_insert(index);
-            run.push(records[at..at + len].to_vec());
             at += len;
+            ends.push(at);
         }
         if let Some(first) = first {
-            self.fetched.push((first, run));
+            self.fetched.push(Fetched { first, bytes: records[..at].to_vec(), ends });
         }
     }
 
@@ -202,7 +202,7 @@ impl Raft {
                     last_index: self.last_index(),
                     read_round: self.reads.round,
                 };
-                self.send_append_frame(id, &heartbeat);
+                let _ = self.send_append_frame(id, &heartbeat);
             }
             return false;
         }
@@ -210,41 +210,45 @@ impl Raft {
             self.resume_snapshot(peer);
             return false;
         }
-        let prev_term = self.term_at(next - 1).expect("next is past the snapshot");
-        let mut bytes = Vec::new();
-        let mut count = 0_u32;
-        let mut index = next;
         // A heartbeat to a peer too far behind on its acks (gone, say) carries no records: each
         // would otherwise queue another for it, up to a megabyte.
         let to = if next > self.peers[peer].matched + MAX_IN_FLIGHT { 0 } else { self.replicate_to() };
-        while index <= to && u64::from(count) < crate::widen(MAX_ENTRIES_PER_APPEND) {
-            let Some(record) = self.record(index) else { break };
-            if !bytes.is_empty() && bytes.len() + record.len() > MAX_APPEND_BYTES {
-                break;
+        // Every field of the append, but its records, which these fix: the same for each peer at
+        // `next`, so the one made for the first goes to the rest.
+        let key = [next, to, self.commit, self.reads.round, self.last_index(), self.meta.term];
+        let (index, count) = if let Some((_, end, frame)) = self.shared_append.as_ref().filter(|s| s.0 == key) {
+            let (end, frame) = (*end, Arc::clone(frame));
+            self.out.appends.push((id, frame));
+            (end, end - next)
+        } else {
+            let prev_term = self.term_at(next - 1).expect("next is past the snapshot");
+            let (bytes, count) = self.records_for_append(next, to);
+            let index = next + u64::from(count);
+            if count == 0 && next <= to {
+                self.fetch(next);
+                self.peers[peer].probe_read = self.peers[peer].probe.is_some();
+                if !probe {
+                    return false;
+                }
             }
-            bytes.extend_from_slice(record);
-            count += 1;
-            index += 1;
-        }
-        if count == 0 && next <= to {
-            self.fetch(next);
-            self.peers[peer].probe_read = self.peers[peer].probe.is_some();
-            if !probe {
-                return false;
+            let append = wire::AppendEntries {
+                term: self.meta.term,
+                leader: self.config.id.0,
+                prev_index: next - 1,
+                prev_term,
+                commit: self.commit,
+                count,
+                entries: &bytes,
+                last_index: self.last_index(),
+                read_round: self.reads.round,
+            };
+            let frame = self.send_append_frame(id, &append);
+            // Records are what's worth sharing: a heartbeat is a few dozen bytes.
+            if count > 0 {
+                self.shared_append = Some((key, index, frame));
             }
-        }
-        let append = wire::AppendEntries {
-            term: self.meta.term,
-            leader: self.config.id.0,
-            prev_index: next - 1,
-            prev_term,
-            commit: self.commit,
-            count,
-            entries: &bytes,
-            last_index: self.last_index(),
-            read_round: self.reads.round,
+            (index, u64::from(count))
         };
-        self.send_append_frame(id, &append);
         let p = &mut self.peers[peer];
         if p.probe.is_some() {
             // It goes again from where it is, by heartbeat, until it's answered; its records
@@ -256,19 +260,35 @@ impl Raft {
         index > next
     }
 
-    pub(super) fn send_append_frame(&mut self, to: NodeId, append: &wire::AppendEntries<'_>) {
+    /// The records in memory from `next`, up to `to`, as many as one append carries, and how many.
+    fn records_for_append(&self, next: u64, to: u64) -> (Vec<u8>, u32) {
+        let (mut bytes, mut count) = (Vec::new(), 0_u32);
+        let mut index = next;
+        while index <= to && u64::from(count) < crate::widen(MAX_ENTRIES_PER_APPEND) {
+            let Some(record) = self.record(index) else { break };
+            if !bytes.is_empty() && bytes.len() + record.len() > MAX_APPEND_BYTES {
+                break;
+            }
+            bytes.extend_from_slice(record);
+            count += 1;
+            index += 1;
+        }
+        (bytes, count)
+    }
+
+    /// Queues `append` for `to`, returning its frame for others it may go to.
+    pub(super) fn send_append_frame(&mut self, to: NodeId, append: &wire::AppendEntries<'_>) -> Frame {
         let mut frame = Vec::new();
         codec::encode_frame(append, &mut frame).expect("an append is within a frame");
-        self.out.appends.push((to, frame));
+        let frame = Arc::new(frame);
+        self.out.appends.push((to, Arc::clone(&frame)));
+        frame
     }
 
     pub(super) fn advance_commit(&mut self) {
-        let mut matched: Vec<u64> = self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.matched).collect();
-        if self.is_voter(self.config.id) {
-            matched.push(self.durable);
-        }
-        matched.sort_unstable_by(|a, b| b.cmp(a));
-        let Some(&candidate) = matched.get(self.quorum() - 1) else { return };
+        let peers = self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.matched);
+        let mine = self.is_voter(self.config.id).then_some(self.durable);
+        let Some(candidate) = quorum_highest(peers.chain(mine), self.quorum()) else { return };
         // Only an entry of this term commits by counting; earlier ones commit beneath it.
         if candidate > self.commit && self.term_at(candidate) == Some(self.meta.term) {
             self.commit = candidate;
@@ -337,7 +357,7 @@ impl Raft {
     pub(super) fn send(&mut self, to: NodeId, message: &impl turbofan_sbe::Encode) {
         let mut frame = Vec::new();
         codec::encode_frame(message, &mut frame).expect("Raft's messages are within their limits");
-        self.out.sends.push((to, frame));
+        self.out.sends.push((to, Arc::new(frame)));
     }
 
     /// The first index of the run of entries with the same term as `index`'s.
@@ -353,11 +373,7 @@ impl Raft {
         if index < self.log.first || index > self.last_index() {
             return None;
         }
-        self.log.record(index).or_else(|| {
-            self.fetched
-                .iter()
-                .find_map(|(first, run)| run.get(usize::try_from(index.checked_sub(*first)?).ok()?).map(Vec::as_slice))
-        })
+        self.log.record(index).or_else(|| self.fetched.iter().find_map(|run| run.record(index)))
     }
 
     pub(super) fn last_term(&self) -> u64 {

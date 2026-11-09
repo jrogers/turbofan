@@ -97,11 +97,8 @@ impl Raft {
 
     /// The latest round a quorum of the voters has echoed, this leader among them if it votes.
     fn confirmed_round(&self) -> u64 {
-        let mut echoed: Vec<u64> = self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.read_round).collect();
-        if self.is_voter(self.config.id) {
-            echoed.push(self.reads.round);
-        }
-        echoed.sort_unstable_by(|a, b| b.cmp(a));
-        echoed.get(self.quorum() - 1).copied().unwrap_or(0)
+        let peers = self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.read_round);
+        let mine = self.is_voter(self.config.id).then_some(self.reads.round);
+        quorum_highest(peers.chain(mine), self.quorum()).unwrap_or(0)
     }
 }

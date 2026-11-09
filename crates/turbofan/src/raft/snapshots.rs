@@ -27,13 +27,9 @@ impl Raft {
     /// durable, as a leader knows: one that removed itself leads until that commits.
     #[must_use]
     pub fn quorum_snapshot_index(&self) -> u64 {
-        let mut indices: Vec<u64> =
-            self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.snapshot_index).collect();
-        if self.is_voter(self.config.id) {
-            indices.push(self.snapshot_index());
-        }
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-        indices[self.quorum() - 1]
+        let peers = self.peers.iter().filter(|p| self.is_voter(p.id)).map(|p| p.snapshot_index);
+        let mine = self.is_voter(self.config.id).then_some(self.snapshot_index());
+        quorum_highest(peers.chain(mine), self.quorum()).unwrap_or(0)
     }
 
     /// Whether a snapshot from the leader replaced the state machine since the last call: the
@@ -138,7 +134,7 @@ impl Raft {
             let mut frame = Vec::new();
             codec::encode_frame(&message, &mut frame).expect("a chunk is within a frame");
             s.sent += crate::widen(chunk.len());
-            self.out.sends.push((self.peers[peer].id, frame));
+            self.out.sends.push((self.peers[peer].id, Arc::new(frame)));
         }
         self.peers[peer].sending = Some(s);
     }

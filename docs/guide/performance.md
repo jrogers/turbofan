@@ -73,6 +73,20 @@ Three nodes on one machine share its disk and CPUs, and talk over loopback, so t
 for comparing changes and configurations, not a promise for a real cluster: measure your own.
 CI runs it on every push, and its summary has each run's table.
 
+To measure a real cluster, run the benchmark's service as nodes of their own (`examples/echo.rs`,
+with `serve`'s usual flags), and the benchmark on another machine, driving them:
+
+```sh
+cargo build --release -p turbofan --example echo   # then, on each node's machine:
+target/release/examples/echo serve --id 1 --data ./n1 --peers ... --clients ... --admin ... [--fsync]
+# and on the clients' machine:
+BENCH_CLUSTER=10.0.0.1:7101,10.0.0.2:7101,10.0.0.3:7101 cargo bench -p turbofan --bench cluster
+```
+
+`BENCH_FSYNC=1` says the nodes run with `--fsync`, and `BENCH_TLS_CA=<pem>` that they're over
+TLS, signed by that CA. It runs only what the nodes are configured for, and not the second table,
+which comes from the nodes' own metrics.
+
 ## Results
 
 On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2, Rust 1.98.1, at

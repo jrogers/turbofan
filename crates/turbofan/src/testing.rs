@@ -19,9 +19,13 @@
 //! cluster.send(alice, b"order 2").unwrap(); // on the same session, through the new leader
 //! ```
 //!
-//! What it doesn't model: a disk that tears or rots, messages dropped or reordered between two
-//! nodes, members added or removed, and upgrades. The simulation (`tests/sim.rs`) does those, to
-//! test the framework; this is for testing a service on it.
+//! Members are added, removed and made learners or voters ([`Cluster::add_member`]), and a node
+//! upgraded to a new version of the service, which the cluster then activates
+//! ([`Cluster::upgrade`], [`Cluster::activate`]): a rolling upgrade, node by node.
+//!
+//! What it doesn't model: a disk that tears or rots, and messages dropped or reordered between
+//! two nodes. The simulation (`tests/sim.rs`) does those, to test the framework; this is for
+//! testing a service on it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -40,6 +44,9 @@ use crate::{NodeConfig, snapshot, wire};
 /// The most client events a client holds before the test takes them ([`Cluster::events`]): a
 /// test that never does would otherwise grow them without end.
 pub const MAX_CLIENT_EVENTS: usize = 1 << 20;
+/// The most events the cluster holds in flight. Messages that beget more than one each (a bug)
+/// would otherwise grow them without end in no time of the cluster's, which bounds the runs.
+pub const MAX_QUEUED_EVENTS: usize = 1 << 20;
 /// How long a client waits to dial again when there's no node to dial, or no leader yet.
 const REDIAL: Duration = Duration::from_millis(50);
 /// How long [`Builder::build`] waits for the first leader.
@@ -220,10 +227,18 @@ impl<S: Service> Cluster<S> {
         leaders.max_by_key(|(_, n)| n.raft().term()).map(|(id, _)| id)
     }
 
-    /// The members' IDs: 1 to the number of nodes.
+    /// The nodes' IDs: 1 to the number it was built with, and those [`Cluster::add_member`]
+    /// started since, members or not.
     #[must_use]
     pub fn ids(&self) -> Vec<NodeId> {
-        self.members.iter().map(|m| m.id).collect()
+        self.nodes.keys().copied().collect()
+    }
+
+    /// The members, as the leader has committed them, if there's one: a change counts once it's
+    /// done, and the next can begin.
+    #[must_use]
+    pub fn members(&self) -> Option<Vec<Member>> {
+        self.leader().and_then(|id| self.node(id)).map(|n| n.raft().members_at(n.raft().commit_index()))
     }
 
     /// Node `id`'s state, as its metrics endpoint has it, unless the node is down.
@@ -257,7 +272,8 @@ impl<S: Service> Cluster<S> {
     ///
     /// If `credentials` are too long ([`Client::new`]).
     pub fn connect(&mut self, credentials: impl Into<Vec<u8>>) -> Result<ClientId, ClientConfigError> {
-        let addrs: Vec<String> = self.members.iter().map(|m| m.client.clone()).collect();
+        // Every node's that could be a member, as a gateway configured for the cluster's growth.
+        let addrs: Vec<String> = ids().map(|id| member(id).client).collect();
         let keepalive = self.config(NodeId(1)).session_timeout / 4;
         let client = Client::new(addrs, credentials, keepalive)?;
         let id = self.clients.len();
@@ -386,6 +402,65 @@ impl<S: Service> Cluster<S> {
         self.admin(&wire::SnapshotRequest { request_id: 1 })
     }
 
+    /// Asks the leader to add node `id` as a member, a learner if `learner` (it votes once
+    /// [`Cluster::set_role`] makes it a voter): whether there was a leader to ask. A node `id`
+    /// hasn't been one of the cluster's is started first, with an empty disk, to join it; one
+    /// removed earlier comes back with its disk as it was. The change follows as the cluster runs,
+    /// once the node has caught up; the leader turns it down if another is under way.
+    ///
+    /// # Panics
+    ///
+    /// If `id` is 0 or more than [`MAX_MEMBERS`].
+    pub fn add_member(&mut self, id: NodeId, learner: bool) -> bool {
+        assert!(ids().any(|i| i == id), "node IDs are 1 to {MAX_MEMBERS}");
+        if self.leader().is_none() {
+            return false;
+        }
+        if let std::collections::btree_map::Entry::Vacant(e) = self.nodes.entry(id) {
+            e.insert(TestNode::default());
+            self.start(id);
+        }
+        let m = member(id);
+        let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
+        self.admin(&wire::AddMember { request_id: 1, id: id.0, learner: u8::from(learner), peer, client, admin })
+    }
+
+    /// Asks the leader to remove member `id`, perhaps itself: whether there was a leader to ask.
+    /// The node runs on, no longer a member, until it's crashed.
+    pub fn remove_member(&mut self, id: NodeId) -> bool {
+        self.admin(&wire::RemoveMember { request_id: 1, id: id.0 })
+    }
+
+    /// Asks the leader to make member `id` a learner, or a voter: whether there was a leader
+    /// to ask.
+    pub fn set_role(&mut self, id: NodeId, learner: bool) -> bool {
+        self.admin(&wire::SetRole { request_id: 1, id: id.0, learner: u8::from(learner) })
+    }
+
+    /// Node `id` is upgraded: stopped as a crash stops it, and started again, from what it had
+    /// written, on the service `service` makes, then and each time it starts after. Its
+    /// [`Service::version`] counts once [`Cluster::activate`] switches the cluster to it.
+    ///
+    /// # Panics
+    ///
+    /// If there's no node `id`.
+    pub fn upgrade(&mut self, id: NodeId, service: impl FnMut(NodeId) -> S + 'static) {
+        self.crash(id);
+        self.nodes.get_mut(&id).expect("a member").service = Some(Box::new(service));
+        self.start(id);
+    }
+
+    /// Asks the leader to switch the cluster to `service_version` of the service's behaviour,
+    /// and the framework's to the newest every member runs: whether there was a leader to ask.
+    /// The leader turns it down if a member's service is older ([`Service::version`]), or hasn't
+    /// been heard from yet; once it's applied, each node's [`Service::on_activate`] is called.
+    pub fn activate(&mut self, service_version: u32) -> bool {
+        let Some(protocol) = self.leader().and_then(|id| self.node(id)).map(|n| n.raft().lowest_versions().0) else {
+            return false;
+        };
+        self.admin(&wire::Activate { request_id: 1, protocol, service_version })
+    }
+
     fn admin(&mut self, request: &impl turbofan_sbe::Encode) -> bool {
         let Some(id) = self.leader() else { return false };
         let mut frame = Vec::new();
@@ -397,12 +472,15 @@ impl<S: Service> Cluster<S> {
         true
     }
 
+    /// Node `id`'s configuration: one it was built with begins the cluster with the others; one
+    /// added later begins with no members, to join it.
     fn config(&self, id: NodeId) -> NodeConfig {
-        let mut config = NodeConfig::new(id, self.members.clone());
+        let members = if self.members.iter().any(|m| m.id == id) { self.members.clone() } else { Vec::new() };
+        let mut config = NodeConfig::new(id, members.clone());
         config.raft.seed = self.seed ^ (u64::from(id) << 32);
         (self.configure)(&mut config);
         assert_eq!(config.raft.id, id, "a node keeps its ID");
-        assert_eq!(config.raft.members, self.members, "a node keeps its members");
+        assert_eq!(config.raft.members, members, "a node keeps its members");
         config
     }
 
@@ -411,7 +489,11 @@ impl<S: Service> Cluster<S> {
         let test_node = self.nodes.get_mut(&id).expect("a member");
         config.raft.seed ^= test_node.incarnation;
         let (log, snapshot) = test_node.disk.open(config.raft.log_window_bytes);
-        let service = (self.service)(id);
+        let test_node = self.nodes.get_mut(&id).expect("a member");
+        let service = match test_node.service.as_mut() {
+            Some(upgraded) => upgraded(id),
+            None => (self.service)(id),
+        };
         let test_node = self.nodes.get_mut(&id).expect("a member");
         let meta = test_node.disk.meta;
         let mut node = Node::new(config, service, meta, snapshot.as_ref().map(|(s, _)| s.clone()), log, self.now);
@@ -538,7 +620,7 @@ impl<S: Service> Cluster<S> {
         self.flush(id);
     }
 
-    fn send_peer(&mut self, from: NodeId, to: NodeId, frame: Vec<u8>) {
+    fn send_peer(&mut self, from: NodeId, to: NodeId, frame: raft::Frame) {
         if !self.cut.contains(&(from, to)) {
             self.schedule(self.network_latency, Scheduled::Deliver { from, to, frame });
         }
@@ -581,7 +663,13 @@ impl<S: Service> Cluster<S> {
     fn dial(&mut self, c: usize) {
         self.clients[c].dialing = false;
         let target = self.clients[c].client.target();
-        let id = self.members.iter().find(|m| m.client == target).expect("a member's address").id;
+        let id = ids().find(|&id| member(id).client == target).expect("a node's address");
+        if !self.nodes.contains_key(&id) {
+            // Never started: refused at once, as a host that doesn't listen.
+            self.clients[c].client.on_disconnected();
+            self.dial_later(c, Duration::ZERO);
+            return;
+        }
         if self.nodes[&id].node.is_none() {
             self.clients[c].client.on_disconnected();
             self.dial_later(c, REDIAL);
@@ -650,6 +738,7 @@ impl<S: Service> Cluster<S> {
     }
 
     fn schedule(&mut self, after: u64, event: Scheduled) {
+        assert!(self.events.len() < MAX_QUEUED_EVENTS, "a storm of messages at {:?}", Duration::from_nanos(self.now));
         self.events.insert((self.now + after, self.next_event), event);
         self.next_event += 1;
     }
@@ -670,7 +759,7 @@ enum Scheduled {
     Deliver {
         from: NodeId,
         to: NodeId,
-        frame: Vec<u8>,
+        frame: raft::Frame,
     },
     Tick(NodeId),
     /// A node's write is durable, unless it crashed since.
@@ -698,6 +787,8 @@ enum Scheduled {
 
 struct TestNode<S> {
     node: Option<Node<S>>,
+    /// What makes its service, once it's upgraded: the cluster's until then.
+    service: Option<Box<dyn FnMut(NodeId) -> S>>,
     disk: Disk,
     pipeline: Pipeline,
     /// The batches being written.
@@ -711,6 +802,7 @@ impl<S> Default for TestNode<S> {
     fn default() -> Self {
         Self {
             node: None,
+            service: None,
             disk: Disk::default(),
             pipeline: Pipeline::default(),
             writing: Vec::new(),
@@ -864,6 +956,11 @@ impl Disk {
     fn snapshot_bytes(&self, index: u64) -> Vec<u8> {
         self.snapshots.get(&index).expect("a snapshot it has").1.clone()
     }
+}
+
+/// The IDs a node of a cluster can have.
+fn ids() -> impl Iterator<Item = NodeId> {
+    (1..=u8::try_from(MAX_MEMBERS).expect("a node ID")).map(NodeId)
 }
 
 fn member(id: NodeId) -> Member {

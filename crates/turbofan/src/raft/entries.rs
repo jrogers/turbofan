@@ -92,7 +92,11 @@ impl Entries {
         if self.terms.last().is_none_or(|&(_, term)| term != record.term) {
             self.terms.push((record.index, record.term));
         }
-        if let Ok((wire::Decoded::Members(m), _)) = wire::decode(record.payload) {
+        // Decoded only if it's a `Members` entry: nearly every one is a service's, for the node.
+        let header = record.payload.get(..wire::MessageHeader::SIZE).map(wire::MessageHeader::decode);
+        if header.is_some_and(|h| h.template_id == wire::Members::TEMPLATE_ID)
+            && let Ok((wire::Decoded::Members(m), _)) = wire::decode(record.payload)
+        {
             let members = m
                 .member()
                 .map(|a| Member::read(NodeId(a.id()), a.learner(), a.peer(), a.client(), a.admin()))
@@ -130,9 +134,9 @@ impl Entries {
         self.window_first = self.window_first.max(index + 1);
         self.first = index + 1;
         self.configs.retain(|&(at, _)| at > index);
-        while self.terms.len() > 1 && self.terms[1].0 <= self.first {
-            self.terms.remove(0);
-        }
+        // The runs that start by `first`, but the last of them, which holds it.
+        let by_first = self.terms.partition_point(|&(start, _)| start <= self.first);
+        self.terms.drain(..by_first.saturating_sub(1));
         if self.first > self.last() {
             self.terms.clear();
         } else if let Some(run) = self.terms.first_mut() {
