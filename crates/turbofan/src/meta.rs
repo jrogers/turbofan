@@ -53,6 +53,10 @@ impl MetaFile {
 
     fn open_with(path: &Path, sync: bool) -> io::Result<(Self, Meta)> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        if sync {
+            // Else a new file's entry may be lost with power, and its synced vote with it.
+            crate::log::sync_dir(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+        }
         let mut slots = [0; 2 * SLOT];
         let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX).min(slots.len());
         file.read_exact_at(&mut slots[..len], 0)?;

@@ -131,7 +131,7 @@ impl Config {
             node,
             service_id,
             data_dir: data_dir.into(),
-            log_fsync: Fsync::EachBatch,
+            log_fsync: Fsync::default(),
             peer_addrs: peer_addrs.into_iter().map(|(id, addr)| (id, addr.to_string())).collect(),
             peer_listen: None,
             client_listen,

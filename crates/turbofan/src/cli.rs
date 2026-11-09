@@ -432,7 +432,7 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
         node,
         service_id,
         data_dir: flag(args, "--data")?.into(),
-        log_fsync: driver::Fsync::EachBatch,
+        log_fsync: driver::Fsync::default(),
         client_listen: own(&clients)?,
         admin_listen: own(&admins)?,
         peer_listen: Some(own(&peers)?),

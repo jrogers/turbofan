@@ -153,7 +153,9 @@ fn open_file(at: &Path, index: Option<u64>) -> io::Result<(Snapshot, File)> {
     let index = stored;
     // From a header not yet checked: a garbled length mustn't overflow.
     let end = crate::widen(HEADER).checked_add(len).ok_or_else(|| invalid("wrong length"))?;
-    if file.metadata()?.len() < end {
+    // After the bytes, one members frame: a garbled length mustn't have the rest read into memory.
+    let file_len = file.metadata()?.len();
+    if file_len < end || file_len - end > crate::widen(4 + codec::MAX_FRAME_BYTES) {
         return Err(invalid("wrong length"));
     }
     let body_sum = sum_body(&mut file, len)?;
@@ -397,6 +399,9 @@ mod tests {
         refused(&index, "not a snapshot");
         refused(&good[..good.len() - 1], "checksum mismatch");
         refused(&good[..HEADER + 4], "wrong length");
+        let mut padded = good.clone();
+        padded.resize(good.len() + 4 + codec::MAX_FRAME_BYTES, 0);
+        refused(&padded, "wrong length");
         fs::write(path(dir.path(), 10), &good).unwrap();
         assert!(load(dir.path()).unwrap().is_some(), "and whole, it's read");
     }

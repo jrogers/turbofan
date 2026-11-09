@@ -366,14 +366,16 @@ impl Log {
         if index >= self.next_index {
             return Ok(());
         }
+        let mut reopened = false;
         while self.segments.len() > 1 && *self.segments.last().expect("not empty") >= index {
             let first = self.segments.pop().expect("not empty");
             fs::remove_file(segment_path(&self.dir, first))?;
-            self.dir_dirty = true;
+            (self.dir_dirty, reopened) = (true, true);
         }
         let first = *self.segments.last().expect("never empty");
+        let path = segment_path(&self.dir, first);
         let mut bytes = Vec::new();
-        File::open(segment_path(&self.dir, first))?.read_to_end(&mut bytes)?;
+        File::open(&path)?.read_to_end(&mut bytes)?;
         let mut keep = 0;
         let mut at_index = first;
         while at_index < index {
@@ -383,14 +385,23 @@ impl Log {
             keep += len;
             at_index += 1;
         }
-        self.file = OpenOptions::new().write(true).open(segment_path(&self.dir, first))?;
-        self.file.set_len(crate::widen(keep))?;
+        if reopened {
+            // A closed segment, which a capture may have linked as never written again: a new
+            // file of what's kept, synced before it replaces it, so as not to change the capture.
+            let temp = path.with_extension("tmp");
+            fs::write(&temp, &bytes[..keep])?;
+            self.file = OpenOptions::new().write(true).open(&temp)?;
+            if self.sync {
+                self.file.sync_data()?;
+            }
+            fs::rename(&temp, &path)?;
+        } else {
+            self.file = OpenOptions::new().write(true).open(&path)?;
+            self.file.set_len(crate::widen(keep))?;
+        }
         self.file.seek(SeekFrom::End(0))?;
         self.file_len = crate::widen(keep);
         self.next_index = index;
-        if self.sync {
-            self.file.sync_all()?;
-        }
         self.sync()
     }
 
@@ -457,9 +468,6 @@ impl Log {
         }
         self.file =
             OpenOptions::new().create(true).truncate(true).write(true).open(segment_path(&self.dir, next_index))?;
-        if self.sync {
-            self.file.sync_all()?;
-        }
         self.segments = vec![next_index];
         self.file_len = 0;
         self.next_index = next_index;
@@ -542,7 +550,7 @@ fn flusher() -> io::Result<mpsc::SyncSender<File>> {
     Ok(tx)
 }
 
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
@@ -904,5 +912,28 @@ mod tests {
         let none = tempfile::tempdir().unwrap();
         log.capture(none.path(), 8, 7).unwrap();
         assert_eq!(fs::read_dir(none.path()).unwrap().count(), 0, "an empty range takes nothing");
+    }
+
+    /// A new leader truncating back into a closed segment a capture linked writes a new file, so
+    /// the capture is as it was.
+    #[test]
+    fn a_truncation_into_a_captured_segment_leaves_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        three_segments(dir.path());
+        let (mut log, _) = open(dir.path());
+        let into = tempfile::tempdir().unwrap();
+        log.capture(into.path(), 3, 6).unwrap();
+        let linked = into.path().join(format!("{:020}.log", 3));
+        let before = fs::read(&linked).unwrap();
+        log.truncate_from(4).unwrap();
+        let mut replaced = Vec::new();
+        Record { term: 2, index: 4, payload: b"new" }.encode_into(&mut replaced);
+        log.append(&replaced).unwrap();
+        log.sync().unwrap();
+        assert_eq!(fs::read(&linked).unwrap(), before, "the capture's segment unchanged");
+        drop(log);
+        let mut found = Vec::new();
+        Log::open(dir.path(), Fsync::EachBatch, |r| found.push((r.index, r.term))).unwrap();
+        assert_eq!(found, [(1, 1), (2, 1), (3, 1), (4, 2)]);
     }
 }

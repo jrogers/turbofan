@@ -14,6 +14,16 @@ a patch version (0.1.1) doesn't.
   nothing more. Production is meant to be Linux on local NVMe, where a sync costs about a tenth of
   the throughput; the guide now says so. `BENCH_FSYNC` defaults to `1` to match.
 
+### Fixed
+
+- A new node's `meta` file is synced into its directory: a power cut could lose the file, the
+  vote it held with it, and the node vote twice in a term.
+- A new leader's truncation back into a closed log segment writes a new file, rather than the one
+  a `capture` hard-linked, which changed the capture under its reader.
+- A snapshot whose header's length is damaged is refused without reading the rest of the file
+  into memory.
+- A truncation or reset of the log syncs once, not twice.
+
 ## 0.11.0 (2026-11-09)
 
 ### Breaking
