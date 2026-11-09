@@ -44,6 +44,14 @@ commit. The busier the cluster, the bigger the batches.
   the client's task in one call, written together, rather than one each (see [Clients][clients]).
 - **TLS** costs encryption on every connection, including the followers'. The benchmark measures
   it too.
+- **The allocator, on Linux.** A message's path allocates buffers of a few kilobytes and frees
+  them soon after, which glibc's malloc does slowly: on Linux it costs a third to half of the
+  throughput (half the queries'), against jemalloc on the same machine. Run the service on
+  jemalloc or mimalloc, preloaded (`LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`, from
+  Debian and Ubuntu's `libjemalloc2`) or linked (`#[global_allocator]`). macOS's own is as quick.
+- **The build.** `lto = "fat"` and `codegen-units = 1` in the service's `[profile.release]` give
+  10 to 18% more throughput, for a slower build; the profile is the service's own, not inherited
+  from turbofan's.
 
 ## The benchmark
 

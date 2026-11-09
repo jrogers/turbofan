@@ -11,6 +11,8 @@
 #   nvme-fsync     the same, with --fsync
 #   nvme-tls, nvme-tls-fsync   both again over TLS
 #   ebs-fsync      with --fsync, the logs on the root EBS volume (gp3): network storage
+# Nodes and benchmark alike on jemalloc (LD_PRELOAD), as the guide's performance chapter says a
+# service on Linux should be: glibc's malloc costs a third to half of the throughput.
 #
 # What it costs: four instances while it runs, ~$0.40/hour each for c6id.2xlarge on demand
 # (check AWS's pricing), and a public IPv4 address each. Everything it makes is tagged
@@ -176,14 +178,16 @@ for host in "${PUBLIC[@]}"; do
         dev=$(lsblk -dno NAME,MODEL | awk "/Instance Storage/ {print \"/dev/\" \$1; exit}")
         [ -n "$dev" ] || { echo "no instance store: a d type is needed" >&2; exit 1; }
         sudo mkfs.ext4 -q -F "$dev" && sudo mkdir -p /data && sudo mount "$dev" /data
-        sudo chown ubuntu /data && mkdir -p /home/ubuntu/ebs' &
+        sudo chown ubuntu /data && mkdir -p /home/ubuntu/ebs
+        sudo apt-get -qq update && sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get -qq install -y libjemalloc2 >/dev/null
+        test -f /usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2' &
     PIDS+=($!)
 done
 for pid in "${PIDS[@]}"; do wait "$pid"; done
 git archive --format=tar HEAD | on "$CLIENT" 'mkdir -p src && tar -x -C src'
 log "building $(git rev-parse --short HEAD) on the clients' machine"
 on "$CLIENT" 'set -e
-    sudo apt-get -qq update && sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get -qq install -y build-essential >/dev/null
+    sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get -qq install -y build-essential >/dev/null
     curl -fsS https://sh.rustup.rs | sh -s -- -y -q --profile minimal >/dev/null
     . ~/.cargo/env && cd src
     cargo build -q --release -p turbofan --example echo --features tls
@@ -216,13 +220,15 @@ list() { local port=$1 i out=''; for i in 1 2 3; do out+="$i=${PRIVATE[i-1]}:$po
 FLAGS="--peers $(list 7001) --clients $(list 7101) --admin $(list 7201)"
 TLS_FLAGS='--tls-cert certs/node.pem --tls-key certs/node.key --tls-peer-ca certs/ca.pem'
 CLIENTS=$(list 7101 | sed 's/[0-9]=//g')
+# Expanded on each machine: its own architecture's path.
+JEMALLOC='LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2'
 
 # One remote run: the nodes started with `extra` flags and their logs under `data`, a leader
 # waited for, the benchmark run against them, and the nodes stopped and their data removed.
 remote() {
     local name=$1 data=$2 extra=$3 fsync=$4 tls=$5 i status_tls='' bench_tls=''
     for i in 1 2 3; do
-        on "${PUBLIC[i-1]}" "TURBOFAN_ADMIN_TOKEN=$ADMIN_TOKEN TURBOFAN_PEER_TOKEN=$PEER_TOKEN \
+        on "${PUBLIC[i-1]}" "TURBOFAN_ADMIN_TOKEN=$ADMIN_TOKEN TURBOFAN_PEER_TOKEN=$PEER_TOKEN $JEMALLOC \
             nohup ./echo serve --id $i --data $data/n$i $FLAGS $extra >node.log 2>&1 </dev/null &"
     done
     if [[ $tls == 1 ]]; then
@@ -240,7 +246,7 @@ remote() {
     fi
     log "run $name"
     on "$CLIENT" ". ~/.cargo/env && cd src && BENCH_SECS=$BENCH_SECS BENCH_CLUSTER=$CLIENTS BENCH_FSYNC=$fsync \
-        $bench_tls cargo bench -q -p turbofan --bench cluster --features tls" | tee "$OUT/$name.md"
+        $bench_tls $JEMALLOC cargo bench -q -p turbofan --bench cluster --features tls" | tee "$OUT/$name.md"
     for i in 1 2 3; do
         # By name: `-f 'echo serve'` matches this command's own shell too, and kills it.
         on "${PUBLIC[i-1]}" "pkill -TERM -x echo || true
@@ -254,7 +260,7 @@ for run in $RUNS; do
         local)
             log "run local"
             on "$CLIENT" ". ~/.cargo/env && cd src && mkdir -p /data/tmp && TMPDIR=/data/tmp BENCH_SECS=$BENCH_SECS \
-                cargo bench -q -p turbofan --bench cluster --features tls" | tee "$OUT/local.md"
+                $JEMALLOC cargo bench -q -p turbofan --bench cluster --features tls" | tee "$OUT/local.md"
             ;;
         nvme) remote nvme /data '' 0 0 ;;
         nvme-fsync) remote nvme-fsync /data --fsync 1 0 ;;
@@ -269,7 +275,7 @@ done
 {
     echo "# $RUN"
     echo
-    echo "turbofan $(git rev-parse --short HEAD), $TYPE in $AZ ($AWS_REGION), $BENCH_SECS s a run."
+    echo "turbofan $(git rev-parse --short HEAD), $TYPE in $AZ ($AWS_REGION), $BENCH_SECS s a run, on jemalloc."
     on "$CLIENT" 'echo; lscpu | grep "Model name"; uname -sr; . ~/.cargo/env && rustc --version
         lsblk -dno NAME,MODEL,SIZE | grep -v loop'
     for run in $RUNS; do

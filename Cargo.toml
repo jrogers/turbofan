@@ -44,3 +44,9 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 # and overflow checks still on.
 [profile.test]
 opt-level = 2
+
+# The benchmark and examples/echo.rs: 10 to 18% more throughput than thin local LTO and 16 units, for
+# a slower build. A service sets its own: a dependency's profiles don't apply to it.
+[profile.release]
+lto = "fat"
+codegen-units = 1
