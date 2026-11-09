@@ -20,7 +20,7 @@
 # shuts itself down after MAX_MINUTES, which terminates it, and `clean` deletes the rest.
 #
 #   AWS_PROFILE  the aws CLI's profile, as for any aws command (AWS_PROFILE=development ...)
-#   REGION       us-east-1           TYPE         c6id.2xlarge (needs local NVMe: a `d` type)
+#   REGION       us-east-1           TYPE         c6id.2xlarge (needs local NVMe: a `d` type; x86 or Graviton)
 #   AZ           a zone that offers TYPE, should one be out of capacity (us-east-1b)
 #   BENCH_SECS   10                  MAX_MINUTES  180
 #   RUNS         the runs above, or some of them, space-separated
@@ -34,7 +34,6 @@ MAX_MINUTES=${MAX_MINUTES:-180}
 RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
 TAG=turbofan-bench
 HOME_DIR=/home/ubuntu
-AMI=resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
 ADMIN_TOKEN=bench-admin
 PEER_TOKEN=bench-peer
 
@@ -124,6 +123,11 @@ AZ=${AZ:-$(aws ec2 describe-instance-type-offerings --location-type availability
 SUBNET=$(aws ec2 describe-subnets --filters "Name=availability-zone,Values=$AZ" "Name=default-for-az,Values=true" \
     --query 'Subnets[0].SubnetId' --output text)
 VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)
+# Ubuntu for the type's architecture: x86 or Graviton.
+ARCH=$(aws ec2 describe-instance-types --instance-types "$TYPE" \
+    --query 'InstanceTypes[0].ProcessorInfo.SupportedArchitectures[0]' --output text)
+[[ $ARCH == x86_64 ]] && ARCH=amd64
+AMI=resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/$ARCH/hvm/ebs-gp3/ami-id
 MY_IP=$(curl -fsS https://checkip.amazonaws.com)
 log "$RUN: 4 × $TYPE in $AZ, SSH from $MY_IP"
 
@@ -245,6 +249,10 @@ remote() {
         echo "$name: no leader elected" >&2
         return 1
     fi
+    for i in 1 2 3; do
+        on "${PUBLIC[i-1]}" 'grep -q libjemalloc /proc/$(pgrep -x echo)/maps' ||
+            { echo "$name: node $i isn't on jemalloc" >&2; return 1; }
+    done
     log "run $name"
     on "$CLIENT" ". ~/.cargo/env && cd src && BENCH_SECS=$BENCH_SECS BENCH_CLUSTER=$CLIENTS BENCH_FSYNC=$fsync \
         $bench_tls $JEMALLOC cargo bench -q -p turbofan --bench cluster --features tls" | tee "$OUT/$name.md"
