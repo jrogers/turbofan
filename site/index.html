@@ -92,6 +92,10 @@
   section { padding: 72px 0 8px; }
   .window pre.shell { white-space: pre; }
   h2 { font-size: 1.85rem; letter-spacing: -0.025em; margin: 0 0 10px; }
+  /* Each section's heading links to it, a # showing on hover, to copy a link to the section. */
+  h2 a.anchor { color: inherit; text-decoration: none; }
+  h2 a.anchor::after { content: " #"; opacity: 0; color: var(--ink-3); }
+  h2 a.anchor:hover::after, h2 a.anchor:focus-visible::after { opacity: 0.5; }
   .sub { color: var(--ink-2); margin: 0 0 32px; }
   .status { display: flex; gap: 14px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); border-radius: 12px; padding: 16px 20px; color: var(--ink); font-size: 0.95rem; margin-top: 40px; }
   .status b { white-space: nowrap; }
@@ -180,8 +184,8 @@
     change before 1.0. It is provided as is, without warranty of any kind.</span>
   </div>
 
-  <section>
-    <h2>What it's for</h2>
+  <section id="what-its-for">
+    <h2><a class="anchor" href="#what-its-for">What it's for</a></h2>
     <p class="sub">Systems whose state fits in memory, where every change must happen once, in one
     order every machine agrees on, and quickly. The <a href="guide/use-cases.html">guide's first
     chapter</a> goes into each, and when Turbofan isn't the right tool.</p>
@@ -209,8 +213,8 @@
     </div>
   </section>
 
-  <section>
-    <h2>Built so a failure loses nothing</h2>
+  <section id="failure">
+    <h2><a class="anchor" href="#failure">Built so a failure loses nothing</a></h2>
     <p class="sub">Safe, thoroughly tested, then fast: a replicated service is only as good as its
     worst failover.</p>
     <div class="grid">
@@ -247,8 +251,8 @@
     </div>
   </section>
 
-  <section>
-    <h2>A service</h2>
+  <section id="a-service">
+    <h2><a class="anchor" href="#a-service">A service</a></h2>
     <p class="sub">Your code is a <code>Service</code>: every node applies the same log to it, so it
     must be deterministic, taking time from <code>Ctx::now</code> rather than a clock. This one
     answers each message with how many its session has sent; <code>run</code> gives it a command
@@ -259,8 +263,8 @@
     </div>
   </section>
 
-  <section>
-    <h2>Performance</h2>
+  <section id="performance">
+    <h2><a class="anchor" href="#performance">Performance</a></h2>
     <p class="sub">Three nodes on machines of their own, AWS {{bench.machine}} with 8 vCPUs
     each, and the clients on a fourth, over the network, 64-byte messages, from the repository's
     benchmark: the median of three runs. The <a href="guide/performance.html">guide's performance
@@ -283,8 +287,8 @@
     </div>
   </section>
 
-  <section>
-    <h2>The crates</h2>
+  <section id="crates">
+    <h2><a class="anchor" href="#crates">The crates</a></h2>
     <p class="sub">The framework, and the codecs it speaks on the wire.</p>
     <div class="grid">
       <a class="card crate" href="https://crates.io/crates/turbofan"><code>turbofan</code><p>The framework: Raft, client sessions, timers and snapshots, a node on tokio over TCP or TLS, and its clients.</p></a>
