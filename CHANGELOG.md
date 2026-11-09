@@ -34,6 +34,13 @@ a patch version (0.1.1) doesn't.
 - On a listener taking plain TCP beside TLS, a connection that stalls within its first three
   bytes is peeked at with a backoff, up to 100 ms apart, not every millisecond until its hello's
   timeout.
+- A client whose session diverged writes its `Close` before it lets the connection go, so the
+  cluster closes the session at once rather than timing it out.
+- `Client::close` (and `ClusterClient::close`) called while the session isn't open on a
+  connection, mid-failover, closes it once it's open again, rather than being forgotten and the
+  session carried on.
+- `Client::new` refuses a keepalive of zero (`ClientConfigError::ZeroKeepalive`), which had the
+  client spin and leave every member as silent.
 
 ## 0.11.0 (2026-11-09)
 

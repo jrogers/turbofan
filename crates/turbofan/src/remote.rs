@@ -252,8 +252,11 @@ async fn run(
                     return;
                 }
             }
-            // Over: `recv` returns `None` once the events are read, and nothing reattaches.
+            // Over: `recv` returns `None` once the events are read, and nothing reattaches. A
+            // diverged session's `Close` is written first, so the cluster needn't time it out.
             if client.is_closed() {
+                conn.write(&mut client);
+                conn.finish().await;
                 return;
             }
             conn.write(&mut client);
@@ -360,6 +363,17 @@ impl Connection {
         }
     }
 }
+
+impl Connection {
+    /// Waits, a little, for what was handed to the writer to be written.
+    async fn finish(mut self) {
+        drop(std::mem::replace(&mut self.out, mpsc::unbounded_channel().0));
+        let _ = tokio::time::timeout(FINISH_WAIT, &mut self.written).await;
+    }
+}
+
+/// How long [`Connection::finish`] waits.
+const FINISH_WAIT: Duration = Duration::from_secs(1);
 
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -822,4 +836,27 @@ async fn ask<T>(
         return Some(Err(String::from_utf8_lossy(m.addr()).into_owned()));
     }
     answer(&reply).map(Ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::TcpListener;
+
+    use super::Connection;
+    use crate::driver::read_frame;
+    use crate::tls;
+
+    /// A connection finished writes what it was handed before it goes: a diverged session's
+    /// `Close`, say, handed over just before.
+    #[tokio::test]
+    async fn a_finished_connection_writes_what_it_was_handed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conn = Connection::new(tls::connect(&addr, None, None).await.unwrap());
+        let (mut accepted, _) = listener.accept().await.unwrap();
+        let frame = [&3_u32.to_le_bytes()[..], b"end"].concat();
+        conn.out.send(vec![frame.clone()]).unwrap();
+        conn.finish().await;
+        assert_eq!(read_frame(&mut accepted).await.unwrap(), frame);
+    }
 }

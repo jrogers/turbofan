@@ -156,6 +156,8 @@ pub enum ClientConfigError {
     NoAddresses,
     /// The credentials are over [`MAX_PAYLOAD_BYTES`].
     CredentialsTooLong,
+    /// The keepalive is zero.
+    ZeroKeepalive,
 }
 
 impl std::fmt::Display for ClientConfigError {
@@ -163,6 +165,7 @@ impl std::fmt::Display for ClientConfigError {
         f.write_str(match self {
             Self::NoAddresses => "no members' addresses",
             Self::CredentialsTooLong => "credentials over MAX_PAYLOAD_BYTES",
+            Self::ZeroKeepalive => "a keepalive of zero",
         })
     }
 }
@@ -183,6 +186,8 @@ pub struct Client {
     /// The current connection is attached to the session.
     open: bool,
     closed: bool,
+    /// [`Client::close`] was called: the session is closed as soon as it's open on a connection.
+    closing: bool,
     next_seq: u64,
     unacked: VecDeque<(u64, Vec<u8>)>,
     /// The highest `client_seq` the cluster has said it applied.
@@ -209,7 +214,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// If `addrs` is empty, or `credentials` are over [`MAX_PAYLOAD_BYTES`].
+    /// If `addrs` is empty, `credentials` are over [`MAX_PAYLOAD_BYTES`], or `keepalive` is zero.
     pub fn new(
         addrs: impl IntoIterator<Item = impl Into<String>>,
         credentials: impl Into<Vec<u8>>,
@@ -223,6 +228,9 @@ impl Client {
         if credentials.len() > MAX_PAYLOAD_BYTES {
             return Err(ClientConfigError::CredentialsTooLong);
         }
+        if keepalive.is_zero() {
+            return Err(ClientConfigError::ZeroKeepalive);
+        }
         Ok(Self {
             addrs,
             credentials,
@@ -231,6 +239,7 @@ impl Client {
             epoch: 0,
             open: false,
             closed: false,
+            closing: false,
             next_seq: 1,
             unacked: VecDeque::new(),
             applied: 0,
@@ -347,6 +356,11 @@ impl Client {
                 self.open = true;
                 self.trim(m.applied_seq());
                 self.events.push_back(Event::Opened(SessionId(m.session())));
+                // Closed while it wasn't open here: closed now, nothing more sent.
+                if self.closing {
+                    self.frame(&wire::Close { session: m.session() });
+                    return;
+                }
                 let resend: Vec<(u64, Vec<u8>)> = self.unacked.iter().cloned().collect();
                 for (client_seq, payload) in resend {
                     self.frame(&wire::Message { session: m.session(), client_seq, payload: &payload });
@@ -505,7 +519,7 @@ impl Client {
         self.closed = true;
         self.unacked.clear();
         self.fail_queries(QueryError::Closed);
-        let unapplied = usize::try_from(self.next_seq - 1 - m.applied_seq()).unwrap_or(usize::MAX);
+        let unapplied = usize::try_from((self.next_seq - 1).saturating_sub(m.applied_seq())).unwrap_or(usize::MAX);
         self.events.push_back(Event::Closed { reason: CloseReason::Diverged, unapplied });
     }
 
@@ -536,8 +550,9 @@ impl Client {
         self.applied
     }
 
-    /// Closes the session.
+    /// Closes the session: now, if it's open on the connection, else once it's open on one.
     pub fn close(&mut self) {
+        self.closing = true;
         if let (true, Some(session)) = (self.open, self.session) {
             self.frame(&wire::Close { session: session.0 });
         }
@@ -670,9 +685,29 @@ mod tests {
         let mut client = open();
         client.close();
         assert_eq!(decoded(&client.take_frames()), ["Close(CloseRef { session: 9 })"]);
+    }
+
+    /// Closed while it isn't open on a connection (mid-failover, or with its `Close` lost with
+    /// the connection), the session is closed once it's open again, not carried on.
+    #[test]
+    fn a_close_between_connections_closes_the_session_when_it_opens() {
+        let mut client = open();
+        client.send(b"order".to_vec()).unwrap();
+        client.take_frames();
         client.on_disconnected();
         client.close();
         assert!(client.take_frames().is_empty(), "no connection with the session open");
+        client.on_connected(0);
+        client.take_frames();
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 0, last_egress_seq: 0, epoch: 0 }));
+        assert_eq!(decoded(&client.take_frames()), ["Close(CloseRef { session: 9 })"], "the order not resent");
+    }
+
+    /// A keepalive of zero would have the client spin, and leave every member as silent.
+    #[test]
+    fn a_zero_keepalive_is_refused() {
+        let made = Client::new(["a"], Vec::new(), Duration::ZERO);
+        assert_eq!(made.err(), Some(ClientConfigError::ZeroKeepalive));
     }
 
     /// An idle session sends a keepalive once a `keepalive` (1 s) has passed, and is next due a
