@@ -137,49 +137,58 @@ benchmark, on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on sev
 fsync, nearly all of a message's 64 µs on its own over TCP is the driver's and the loopback's,
 not the core's.
 
-### On a Linux server
+### On Linux servers
 
 Three nodes on machines of their own, and the benchmark driving them from a fourth
-(`BENCH_CLUSTER`): AWS `c6id.2xlarge` (8 vCPUs, Intel Xeon Platinum 8375C, local NVMe instance
-storage), one cluster placement group in us-east-1, Linux 7.0, Rust 1.99.1, at commit `f50fb3d`,
-November 2026: fat LTO, and nodes and clients on jemalloc (see the allocator, above). One run of
-10 s each, with `scripts/aws-bench.sh`; the nodes' logs on the instance storage, except the last
-two rows, on the root EBS volume (gp3).
+(`BENCH_CLUSTER`), on three AWS types of 8 vCPUs with local NVMe instance storage, one cluster
+placement group in us-east-1, Linux 7.0, Rust 1.99.1, at commit `07ea8ba`, November 2026: fat LTO,
+nodes and clients on jemalloc (see the allocator, above), with `scripts/aws-bench.sh`. `c8id` and
+`c9gd` are the median of three runs of 10 s, each on instances of its own; `c6id` one run, at
+`f50fb3d`. The nodes' logs on the instance storage, except the EBS row, on the root volume (gp3).
 
-| run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
-|---|---|---:|---:|---:|---:|
-| latency | 1 × 1 | 4,281 | 232 µs | 261 µs | 273 µs |
-| throughput | 8 × 256 | 1,083,686 | 1.85 ms | 3.71 ms | 5.37 ms |
-| query latency | 1 × 1 | 4,772 | 208 µs | 234 µs | 246 µs |
-| query throughput | 8 × 256 | 2,135,321 | 952 µs | 1.34 ms | 1.54 ms |
-| latency, fsync | 1 × 1 | 2,910 | 340 µs | 394 µs | 419 µs |
-| throughput, fsync | 8 × 256 | 971,121 | 2.15 ms | 3.71 ms | 5.69 ms |
-| latency, TLS | 1 × 1 | 4,184 | 238 µs | 267 µs | 281 µs |
-| throughput, TLS | 8 × 256 | 1,093,138 | 1.85 ms | 3.64 ms | 5.60 ms |
-| query latency, TLS | 1 × 1 | 4,664 | 213 µs | 243 µs | 262 µs |
-| query throughput, TLS | 8 × 256 | 2,057,921 | 985 µs | 1.40 ms | 1.60 ms |
-| latency, TLS, fsync | 1 × 1 | 2,772 | 359 µs | 412 µs | 436 µs |
-| throughput, TLS, fsync | 8 × 256 | 946,607 | 2.13 ms | 3.73 ms | 5.46 ms |
-| latency, fsync, EBS | 1 × 1 | 337 | 2.95 ms | 3.09 ms | 4.35 ms |
-| throughput, fsync, EBS | 8 × 256 | 260,191 | 8.02 ms | 10.69 ms | 13.01 ms |
+| run, nodes apart | `c6id`, Xeon Ice Lake | `c8id`, Xeon Granite Rapids | `c9gd`, Graviton5 |
+|---|---:|---:|---:|
+| latency, 1 × 1 (p50) | 232 µs | 326 µs | 130 µs |
+| throughput, 8 × 256 | 1,083,686 | 1,285,232 | 1,535,851 |
+| query throughput | 2,135,321 | 2,356,813 | 3,142,472 |
+| latency, fsync (p50) | 340 µs | 450 µs | 134 µs |
+| throughput, fsync | 971,121 | 1,130,939 | 1,403,091 |
+| throughput, TLS | 1,093,138 | 1,273,055 | 1,547,213 |
+| throughput, TLS, fsync | 946,607 | 1,139,758 | 1,414,762 |
+| throughput, fsync, EBS | 260,191 | 223,386 | 281,898 |
 
-A message on its own is a round trip over the network now, client to leader and leader to
-follower, not over loopback: 232 µs, where the Mac's was 64 µs. A sync on the instance's NVMe
-drive takes about a tenth of a millisecond, where the Mac's `F_FULLFSYNC` took milliseconds: fsync
-adds 108 µs to a message on its own, and costs a tenth of the throughput, where on the Mac it cost
-nine tenths. On EBS, network storage, a sync is a round trip of its own, some milliseconds:
-throughput with fsync falls to 260,191 a second, group commit still filling each sync. TLS costs
-next to nothing.
+Throughput, messages and queries a second, varies by a few per cent from one run to the next. A
+message on its own doesn't: it's a round trip over the network, client to leader and leader to
+follower, and that depends on where the placement group lands. On `c9gd` its p50 was 83 µs, 130 µs and
+261 µs in the three runs, steady within each; on `c8id`, 326 µs every time, with a long tail
+(p99 642 µs). The Mac's 64 µs is over loopback.
 
-On glibc's malloc and without LTO (at `ee40689`), the same cluster did 699,316 messages a second,
-1,024,529 queries, and 630,094 messages with fsync: the allocator and the build are half again
-the throughput, and twice the queries'. A message on its own takes as long either way.
+A sync on the instances' NVMe drives takes about a tenth of a millisecond, where the Mac's
+`F_FULLFSYNC` took milliseconds: fsync costs a tenth of the throughput, where on the Mac it cost
+nine tenths. On `c9gd` it adds next to nothing to a message on its own, the leader's sync
+overlapping its round trip to a follower. On EBS, network storage, a sync is a round trip of its
+own, some milliseconds: throughput with fsync falls to a fifth, group commit still filling each
+sync. TLS costs next to nothing.
 
 The same benchmark in one process on the clients' machine, the three nodes and the clients sharing
-its 8 vCPUs: 791,108 messages a second, 662,892 with fsync, and a message on its own in 82 µs,
-194 µs with fsync. The nodes on machines of their own go a third faster again, where the clients
-no longer take their CPUs. The core alone, `in memory`, does 213,606 a second at 8 × 256 on one of
-this Xeon's cores, half the M4's.
+its 8 vCPUs, as on the Mac (12 cores):
+
+| run, one machine | `c6id` | `c8id` | `c9gd` | Mac mini, M4 Pro |
+|---|---:|---:|---:|---:|
+| throughput, in memory | 213,606 | 318,156 | 379,289 | 499,097 |
+| latency, 1 × 1 (p50) | 82 µs | 75 µs | 40 µs | 64 µs |
+| throughput, 8 × 256 | 791,108 | 1,130,083 | 1,558,024 | 1,198,294 |
+| query throughput | 1,871,507 | 2,390,634 | 3,560,196 | 2,830,641 |
+| latency, fsync (p50) | 194 µs | 207 µs | 83 µs | 7.84 ms |
+
+The core alone, `in memory`, on one thread, follows each CPU's speed on one core: Graviton5 is three
+quarters of the M4's, the newest Xeon two thirds, Ice Lake under half. Over TCP Graviton5 passes
+the Mac, Linux's loopback and wake-ups being cheaper than macOS's. With the clients on a machine
+of their own, the Xeons' nodes go faster again; Graviton5's don't, already as fast sharing it.
+
+On glibc's malloc and without LTO (`c6id`, at `ee40689`), the cluster did 699,316 messages a second
+nodes apart, and 1,024,529 queries: the allocator and the build are half again the throughput, and
+twice the queries'.
 
 [clients]: clients.md
 [operations]: operations.md
