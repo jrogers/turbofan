@@ -309,7 +309,7 @@ later term.
   trusting bounded clock drift, which the simulation's stepped clocks argue against. Add either if
   a service needs it.
 - **Several services per cluster.** Run one cluster per service.
-- **Fewer hops between a client and the leader.** Of a quiet cluster's 65 µs a message, about 25
+- **Fewer hops between a client and the leader.** Of a quiet cluster's 66 µs a message, about 25
   are tasks waking each other: a connection's reader and writer are tasks of their own, at both
   ends, so a peer slow to read never stops one writing, nor one slow to write one reading. About
   10 more are a write handed to a thread and back, on the leader and on the follower whose ack
