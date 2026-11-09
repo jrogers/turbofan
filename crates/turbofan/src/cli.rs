@@ -64,11 +64,10 @@
 //! delete it there. `replay --capture <dir> [--to <n>]` replays one into this binary's service,
 //! printing every effect it makes, a line each: run it with two versions and diff them.
 //!
-//! The log isn't synced to disk: the other nodes' copies are the redundancy, and a crashed
-//! process loses nothing, but a majority of the voters losing power together may lose committed
-//! entries. Spread the voters so that no power domain holds a majority of them, cover a whole
-//! site with a standby (a learner in another region, to `promote`), or run `serve --fsync`, which
-//! syncs the log once a batch, before acknowledging it: see the guide's Running a cluster.
+//! The log is synced to disk once a batch, before it's acknowledged. `serve --no-fsync` doesn't:
+//! the other nodes' copies are then the redundancy, and a crashed process loses nothing, but a
+//! majority of the voters losing power together may lose committed entries: see the guide's
+//! Running a cluster.
 //!
 //! TLS is optional. `serve --tls-cert <pem> --tls-key <pem> --tls-peer-ca <pem> --tls-admin-ca
 //! <pem>` puts it on all three listeners and to peers (see [`crate::tls`]), and without
@@ -117,10 +116,10 @@ const WAIT_POLL: Duration = Duration::from_secs(2);
 
 const USAGE: &str = "usage:
   serve --id <n> --data <dir> --peers <n=addr,...> --clients <n=addr,...> --admin <n=addr,...>
-        [--listen <ip>] [--join | --learners <n,...>] [--keep-snapshots <n>] [--fsync]
+        [--listen <ip>] [--join | --learners <n,...>] [--keep-snapshots <n>] [--no-fsync]
         (an address is <host>:<port>; with a host name for this node's, --listen is the
         interface its listeners bind, on those ports: 0.0.0.0, say)
-        (without --fsync, the log isn't synced before acknowledging: a majority of the voters
+        (with --no-fsync, the log isn't synced before acknowledging: a majority of the voters
         losing power together may lose committed entries)
         [--election-timeout <ms>] [--heartbeat <ms>]
         [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]
@@ -154,7 +153,7 @@ pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
 /// As [`run`], with `configure` changing a node's configuration before it serves: the settings
 /// that are the service's to choose, such as [`NodeConfig::session_timeout`] or
 /// [`NodeConfig::egress_ring_entries`]. `serve`'s own flags (`--election-timeout`, `--heartbeat`,
-/// `--keep-snapshots`, `--fsync`) apply after it, for what an operator chooses for a deployment.
+/// `--keep-snapshots`, `--no-fsync`) apply after it, for what an operator chooses for a deployment.
 ///
 /// [`NodeConfig::session_timeout`]: crate::NodeConfig::session_timeout
 /// [`NodeConfig::egress_ring_entries`]: crate::NodeConfig::egress_ring_entries
@@ -433,7 +432,7 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
         node,
         service_id,
         data_dir: flag(args, "--data")?.into(),
-        log_fsync: driver::Fsync::Never,
+        log_fsync: driver::Fsync::EachBatch,
         client_listen: own(&clients)?,
         admin_listen: own(&admins)?,
         peer_listen: Some(own(&peers)?),
@@ -501,8 +500,12 @@ fn tune(args: &[String], config: &mut driver::Config) -> Result<(), String> {
     if given("--keep-snapshots") {
         node.snapshots_kept = usize::try_from(number("--keep-snapshots")?).map_err(|_| "--keep-snapshots: too many")?;
     }
-    if given("--fsync") {
-        config.log_fsync = driver::Fsync::EachBatch;
+    // `--fsync`, the default since 0.12, is still taken, for command lines written before it.
+    match (given("--fsync"), given("--no-fsync")) {
+        (true, true) => return Err("--fsync or --no-fsync, not both".into()),
+        (true, false) => config.log_fsync = driver::Fsync::EachBatch,
+        (false, true) => config.log_fsync = driver::Fsync::Never,
+        (false, false) => {}
     }
     let (timeout, heartbeat) = (node.raft.election_timeout, node.raft.heartbeat);
     if heartbeat * 2 >= timeout || timeout >= raft::MAX_TIMEOUT {
@@ -641,12 +644,14 @@ mod tests {
         };
         let config = tuned(&[]).unwrap();
         assert_eq!((config.node.raft.election_timeout, config.node.snapshots_kept), (Duration::from_secs(2), 1));
-        assert_eq!(config.log_fsync, Fsync::Never);
-        let config = tuned(&["--election-timeout", "900", "--heartbeat", "100", "--keep-snapshots", "3", "--fsync"]);
+        assert_eq!(config.log_fsync, Fsync::EachBatch);
+        let config = tuned(&["--election-timeout", "900", "--heartbeat", "100", "--keep-snapshots", "3", "--no-fsync"]);
         let config = config.unwrap();
         assert_eq!(config.node.raft.election_timeout, Duration::from_millis(900));
         assert_eq!((config.node.raft.heartbeat, config.node.snapshots_kept), (Duration::from_millis(100), 3));
-        assert_eq!(config.log_fsync, Fsync::EachBatch);
+        assert_eq!(config.log_fsync, Fsync::Never);
+        assert_eq!(tuned(&["--fsync"]).unwrap().log_fsync, Fsync::EachBatch, "as before it was the default");
+        assert!(tuned(&["--fsync", "--no-fsync"]).is_err());
         assert!(tuned(&["--heartbeat", "1000"]).is_err(), "a heartbeat not under half the timeout");
         assert!(tuned(&["--election-timeout", "0"]).is_err());
         assert!(tuned(&["--keep-snapshots", "x"]).is_err());

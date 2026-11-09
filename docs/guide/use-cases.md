@@ -18,8 +18,9 @@ That's a particular shape of system, and where it fits, it replaces a lot of mac
   state in answer, one message at a time, on one thread. Nothing else writes to the state.
 - **Order matters.** Who came first, whether a balance covers an order, which of two requests
   wins: the log answers every such question the same way on every node, for good.
-- **Latency matters.** On one machine, without fsync, a message is committed and answered in
-  tens of microseconds, and a cluster takes over a million small messages a second (see
+- **Latency matters.** On Linux servers with local NVMe, every batch synced before it's
+  acknowledged, a message is committed and answered in a few hundred microseconds or less, and a
+  cluster takes over a million small messages a second (see
   [Performance][performance]). On a network, a commit costs a round trip to the nearest
   follower.
 - **Losing or repeating a message is a bug.** Not a retry policy and a deduplication table in

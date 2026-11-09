@@ -11,7 +11,7 @@
 //!     --admin   1=10.0.0.1:7201,2=10.0.0.2:7201,3=10.0.0.3:7201
 //! ```
 //!
-//! Every other command of [`turbofan::run`] too: `--fsync`, TLS, `add-member` and the rest.
+//! Every other command of [`turbofan::run`] too: `--no-fsync`, TLS, `add-member` and the rest.
 
 use std::io::{self, Read};
 use std::process::ExitCode;

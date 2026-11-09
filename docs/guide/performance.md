@@ -25,9 +25,9 @@ commit. The busier the cluster, the bigger the batches.
 - **Network.** The commit waits for a round trip to a follower, so put the voters close together:
   the same region, ideally the same data centre over separate power. A standby elsewhere is a
   learner, which commits don't wait for.
-- **fsync.** Without `--fsync` (the default), a write is the page cache's, and the follower's
-  copy is the redundancy (see [Running a cluster][running]). With it, every batch waits for the
-  disk: on a fast NVMe drive a little, on network storage a lot. Choose with the benchmark on your
+- **fsync.** By default every batch waits for the disk: on a local NVMe drive a little, on
+  network storage a lot. With `--no-fsync`, a write is the page cache's, and the follower's copy
+  is the redundancy (see [Running a cluster][running]). Choose with the benchmark on your
   hardware. Either way, a write is made on a thread of its own, the node going on meanwhile, so
   a write the disk holds up (Linux throttles writers when too much is waiting to be written back)
   never holds up the node's heartbeats, and with them the cluster's leader.
@@ -86,12 +86,12 @@ with `serve`'s usual flags), and the benchmark on another machine, driving them:
 
 ```sh
 cargo build --release -p turbofan --example echo   # then, on each node's machine:
-target/release/examples/echo serve --id 1 --data ./n1 --peers ... --clients ... --admin ... [--fsync]
+target/release/examples/echo serve --id 1 --data ./n1 --peers ... --clients ... --admin ... [--no-fsync]
 # and on the clients' machine:
 BENCH_CLUSTER=10.0.0.1:7101,10.0.0.2:7101,10.0.0.3:7101 cargo bench -p turbofan --bench cluster
 ```
 
-`BENCH_FSYNC=1` says the nodes run with `--fsync`, and `BENCH_TLS_CA=<pem>` that they're over
+`BENCH_FSYNC=0` says the nodes run with `--no-fsync`, and `BENCH_TLS_CA=<pem>` that they're over
 TLS, signed by that CA. It runs only what the nodes are configured for, and not the second table,
 which comes from the nodes' own metrics.
 

@@ -4,6 +4,11 @@ A cluster is three or five nodes, usually: it stays up while a majority of its v
 three survive one failure and five survive two. Each node is the service's binary, run with
 `serve`.
 
+Production is meant to be Linux, each node's data directory on a local NVMe drive, ideally with
+power-loss protection: that's what the defaults are chosen and measured for (see
+[Performance][performance]). macOS is for development: it runs the same, but a sync there is
+`F_FULLFSYNC`, milliseconds each. Network storage works, a sync a round trip of its own.
+
 ## The command line
 
 `turbofan::run(service_id, service)` is a service binary's whole `main` (see [A first
@@ -74,15 +79,19 @@ replaced, not repaired: see [Members][membership].
 
 ## Durability
 
-The log isn't synced to disk before an entry is acknowledged, by default. The other nodes' copies
-are the redundancy: a process that crashes loses nothing (the operating system still has the
+The log is synced to disk once a batch, before the batch is acknowledged, by default: even the
+whole cluster losing power loses nothing committed. Group commit keeps it cheap, one sync for
+everything that arrived during the last; on a local NVMe drive it costs about a tenth of the
+throughput, on network storage much more (see [Performance][performance]). The term and vote, and
+snapshots, are always synced.
+
+`serve --no-fsync` (`Fsync::Never`) doesn't sync before acknowledging. The other nodes' copies are
+then the redundancy: a process that crashes loses nothing (the operating system still has the
 writes), and a machine that's lost is caught up from the others. It's still synced behind the
 writes, every 4 MiB, on a thread nothing waits for, so that unwritten data doesn't pile up and
-stall the disk. The term and vote, and snapshots, are always synced.
-
-What it doesn't survive is a majority of the voters losing power together, before the operating
-system has written out what they acknowledged: entries already committed, and answered, may be
-lost. Cover it one of three ways:
+stall the disk. What it doesn't survive is a majority of the voters losing power together, before
+the operating system has written out what they acknowledged: entries already committed, and
+answered, may be lost. Without fsync, cover that one of two ways:
 
 - **Spread the voters over power domains**, so that none holds a majority of them: racks with
   power of their own, or zones (on Kubernetes, a topology spread constraint). A domain losing
@@ -91,17 +100,13 @@ lost. Cover it one of three ways:
 - **Keep a standby in another region** for a whole site losing power: a learner, which commits
   don't wait for, to `promote` if the site is lost (see [Members][membership]). What it hadn't
   yet received, usually the last few milliseconds' worth, is lost with the site.
-- **Run with `serve --fsync`**, which syncs the log once a batch before acknowledging it, so even
-  the whole cluster losing power loses nothing committed: at a cost in latency and throughput,
-  small on a server's NVMe drive with power-loss protection, large on network storage (see
-  [Performance][performance]).
 
 ## Configuration
 
 `run` uses `NodeConfig::new`'s defaults. `run_with` changes them in code, for the settings that
 are the service's to choose; `serve`'s flags then apply over them, for what an operator chooses
 for a deployment (`--election-timeout <ms>`, `--heartbeat <ms>`, `--keep-snapshots <n>`,
-`--fsync`):
+`--no-fsync`):
 
 ```rust,no_run
 # use std::io::{self, Read};
@@ -137,7 +142,7 @@ For full control, call `driver::serve` with a `driver::Config` from a `main` of 
 | `node.snapshot_every_entries` | 100,000 | Each node snapshots once this many entries follow its last snapshot. |
 | `node.snapshots_kept` | 1 | The newest snapshots each node keeps on disk (`--keep-snapshots`): see [Operations][operations]. |
 | `node.egress_ring_entries` | 8192 | Responses kept per session for a client that reattaches (up to `MAX_EGRESS_RING`). From protocol 1, the leader's at the latest `activate`, for every node: see [Upgrades][upgrades]. |
-| `log_fsync` | `Fsync::Never` | `Fsync::EachBatch` is `--fsync`. |
+| `log_fsync` | `Fsync::EachBatch` | `Fsync::Never` is `--no-fsync`: see Durability. |
 | `admin_token`, `peer_token` | none | See below. |
 | `tls` | none | See below. |
 
@@ -169,7 +174,7 @@ async fn main() -> io::Result<()> {
     let peers = members.iter().map(|m| (m.id, addr(&m.peer))).collect();
     let (client, admin) = (addr(&members[0].client), addr(&members[0].admin));
     let mut config = driver::Config::new(node, 1, "/var/lib/my-service", peers, client, admin);
-    config.log_fsync = Fsync::EachBatch;
+    config.log_fsync = Fsync::Never; // The voters are spread over power domains.
     config.admin_token = std::env::var("TURBOFAN_ADMIN_TOKEN").ok().map(String::into_bytes);
     config.peer_token = std::env::var("TURBOFAN_PEER_TOKEN").ok().map(String::into_bytes);
     driver::serve(config, Counter::default()).await

@@ -27,6 +27,9 @@ applies the log to the same deterministic `Service`. If the leader fails, anothe
 with the same state, and clients carry on without losing or repeating a message. The framework
 never looks inside the service's messages: to it, they're opaque bytes.
 
+Production is meant to be Linux, each node's log on a local NVMe drive and synced before it's
+acknowledged (the default); macOS is for development.
+
 ## What it's for
 
 Systems whose state fits in memory, where every change must happen exactly once, in one order

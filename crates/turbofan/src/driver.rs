@@ -88,8 +88,8 @@ pub struct Config {
     pub service_id: u32,
     /// The log, meta and snapshots.
     pub data_dir: PathBuf,
-    /// Whether the log is synced: by default not, the other nodes' copies being the redundancy.
-    /// The term and vote, and snapshots, are synced regardless.
+    /// Whether the log is synced: by default once a batch, before it's acknowledged. The term and
+    /// vote, and snapshots, are synced regardless.
     pub log_fsync: Fsync,
     /// Peers' addresses, `host:port`, this node's included: it dials the others as well as the
     /// members, looking a host name up again each time it dials, so a node may move.
@@ -116,8 +116,8 @@ pub struct Config {
 impl Config {
     /// A node of `node`'s configuration, serving cluster `service_id`, with its state in
     /// `data_dir`, listening for peers on its own of `peer_addrs` (which it dials the others of),
-    /// for clients on `client_listen` and for operators on `admin_listen`. Its log isn't synced,
-    /// and it has no tokens and no TLS: set them after.
+    /// for clients on `client_listen` and for operators on `admin_listen`. Its log is synced once a
+    /// batch, and it has no tokens and no TLS: set them after.
     #[must_use]
     pub fn new(
         node: node::Config,
@@ -131,7 +131,7 @@ impl Config {
             node,
             service_id,
             data_dir: data_dir.into(),
-            log_fsync: Fsync::Never,
+            log_fsync: Fsync::EachBatch,
             peer_addrs: peer_addrs.into_iter().map(|(id, addr)| (id, addr.to_string())).collect(),
             peer_listen: None,
             client_listen,

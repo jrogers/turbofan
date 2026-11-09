@@ -4,6 +4,16 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Breaking
+
+- The log is synced once a batch, before it's acknowledged, by default: `Fsync::EachBatch` is
+  `Fsync`'s default and `driver::Config::new`'s, and `serve`'s. `serve --no-fsync` (or
+  `config.log_fsync = Fsync::Never`) keeps the old behaviour; `--fsync` is still taken, and does
+  nothing more. Production is meant to be Linux on local NVMe, where a sync costs about a tenth of
+  the throughput; the guide now says so. `BENCH_FSYNC` defaults to `1` to match.
+
 ## 0.11.0 (2026-11-09)
 
 ### Breaking

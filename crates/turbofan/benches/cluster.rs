@@ -1,5 +1,5 @@
 //! Throughput and latency of a three-node cluster on one machine, over real TCP and files,
-//! without fsync (the default) and with it. `cargo bench -p turbofan --bench cluster` prints a Markdown
+//! without fsync and with it (the default). `cargo bench -p turbofan --bench cluster` prints a Markdown
 //! table, which CI puts in its summary.
 //!
 //! Two runs a mode. One client with one message in flight: the latency of a commit when nothing
@@ -35,7 +35,7 @@
 //! `BENCH_CLUSTER=<addr,...>` drives a cluster running elsewhere instead, the clients alone in
 //! this process: the client addresses of nodes of `examples/echo.rs`, on machines of their own, so
 //! the clients don't take the nodes' CPUs. The nodes' runs alone, as they're configured:
-//! `BENCH_FSYNC=1` says they `serve --fsync`, and `BENCH_TLS_CA=<pem>` that they're over TLS,
+//! `BENCH_FSYNC=0` says they `serve --no-fsync`, and `BENCH_TLS_CA=<pem>` that they're over TLS,
 //! their certificates signed by that CA. Not the stages, which are the nodes' metrics.
 
 use std::collections::VecDeque;
@@ -242,8 +242,8 @@ fn remote() -> Option<(Vec<String>, Option<ClientTls>, driver::Fsync)> {
     let addrs: Vec<String> = std::env::var("BENCH_CLUSTER").ok()?.split(',').map(str::to_owned).collect();
     let tls = std::env::var("BENCH_TLS_CA").ok().map(|ca| ClientTls::load(Path::new(&ca), None).expect("BENCH_TLS_CA"));
     let fsync = match std::env::var("BENCH_FSYNC").as_deref() {
-        Ok("1") => driver::Fsync::EachBatch,
-        Err(_) | Ok("0") => driver::Fsync::Never,
+        Err(_) | Ok("1") => driver::Fsync::EachBatch,
+        Ok("0") => driver::Fsync::Never,
         Ok(other) => panic!("BENCH_FSYNC is 1 or 0, not {other}"),
     };
     Some((addrs, tls, fsync))

@@ -1,7 +1,7 @@
 //! The log on disk: [`Record`]s appended to segment files named by their first index.
 //!
 //! Appends are written straight away and, with [`Fsync::EachBatch`], made durable by [`Log::sync`],
-//! which the driver calls once per batch (group commit). By default ([`Fsync::Never`]) the log
+//! which the driver calls once per batch (group commit), the default. With [`Fsync::Never`] the log
 //! isn't synced: a crashed process loses nothing, but a machine losing power may lose what it
 //! acknowledged, and the copies on the other nodes are what keep it.
 //!
@@ -39,9 +39,9 @@ pub enum Fsync {
     /// Never before acknowledging: the cluster's copies on other machines are the redundancy;
     /// a majority losing power together may lose committed entries. The log is still synced
     /// behind the writes, on a thread of its own, so that unwritten data doesn't pile up.
-    #[default]
     Never,
     /// Once a batch, before it's acknowledged: committed entries survive any crash.
+    #[default]
     EachBatch,
 }
 

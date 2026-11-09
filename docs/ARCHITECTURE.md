@@ -161,7 +161,7 @@ out ahead of the state it promises. A leader's appends are the exception: they g
 followers write the records while the leader does. The leader counts itself towards a commit only
 once its own copy is durable: `on_persisted` takes the log's end as it was when the batch was
 taken, and counts it only if that entry is still there, not replaced by a new leader's since.
-With the log's `Fsync::Never`, the default, durable means written, to the OS: it survives the
+With the log's `Fsync::Never` (`--no-fsync`), durable means written, to the OS: it survives the
 process, not the machine.
 
 Clients are answered at once, not after the batch: they're only told what's committed, which a
@@ -246,7 +246,7 @@ A query reads the state without logging anything (Raft's ReadIndex, `raft/reads.
 
 | What | Where | How it survives a crash |
 |---|---|---|
-| The log | `log.rs` | Records in segment files named by their first index, not synced by default (`Fsync::Never`): a crashed process loses nothing, and the other nodes' copies cover a machine lost; a majority losing power together may lose committed entries. It's still synced behind the writes, every 4 MiB, on a thread nothing waits for: else the OS lets unwritten data pile up, then stalls every write for seconds while it writes it out. `Fsync::EachBatch` (`serve --fsync`) syncs once a batch. On open, the log is truncated at its first damaged record (a torn write, or rot: they look the same), or a gap between segments, and doubted. Damage found as the node runs stops it, to be replaced. |
+| The log | `log.rs` | Records in segment files named by their first index, synced once a batch by default (`Fsync::EachBatch`, group commit). With `Fsync::Never` (`serve --no-fsync`), not: a crashed process loses nothing, and the other nodes' copies cover a machine lost; a majority losing power together may lose committed entries. It's still synced behind the writes, every 4 MiB, on a thread nothing waits for: else the OS lets unwritten data pile up, then stalls every write for seconds while it writes it out. On open, the log is truncated at its first damaged record (a torn write, or rot: they look the same), or a gap between segments, and doubted. Damage found as the node runs stops it, to be replaced. |
 | Term and vote | `meta.rs` | Two fixed slots, written alternately and synced, each with a generation and a checksum: a torn write leaves the other whole. |
 | Snapshots | `snapshot.rs` | Written to a temporary file, synced, renamed, then the directory synced: the old one or the new one, whole. A checksum covers the bytes and the members. |
 

@@ -7,10 +7,10 @@
 #
 # Runs, each table into target/aws-bench/<run>/:
 #   local          the in-process benchmark on the clients' machine, its files on the local NVMe
-#   nvme           remote, the nodes' logs on their local NVMe, without fsync
-#   nvme-fsync     the same, with --fsync
+#   nvme           remote, the nodes' logs on their local NVMe, with --no-fsync
+#   nvme-fsync     the same, synced (the default)
 #   nvme-tls, nvme-tls-fsync   both again over TLS
-#   ebs-fsync      with --fsync, the logs on the root EBS volume (gp3): network storage
+#   ebs-fsync      synced, the logs on the root EBS volume (gp3): network storage
 # Nodes and benchmark alike on jemalloc (LD_PRELOAD), as the guide's performance chapter says a
 # service on Linux should be: glibc's malloc costs a third to half of the throughput.
 #
@@ -271,11 +271,11 @@ for run in $RUNS; do
             on "$CLIENT" ". ~/.cargo/env && cd src && mkdir -p /data/tmp && TMPDIR=/data/tmp BENCH_SECS=$BENCH_SECS \
                 $JEMALLOC cargo bench -q -p turbofan --bench cluster --features tls" | tee "$OUT/local.md"
             ;;
-        nvme) remote nvme /data '' 0 0 ;;
-        nvme-fsync) remote nvme-fsync /data --fsync 1 0 ;;
-        nvme-tls) remote nvme-tls /data "$TLS_FLAGS" 0 1 ;;
-        nvme-tls-fsync) remote nvme-tls-fsync /data "$TLS_FLAGS --fsync" 1 1 ;;
-        ebs-fsync) remote ebs-fsync "$HOME_DIR/ebs" --fsync 1 0 ;;
+        nvme) remote nvme /data --no-fsync 0 0 ;;
+        nvme-fsync) remote nvme-fsync /data '' 1 0 ;;
+        nvme-tls) remote nvme-tls /data "$TLS_FLAGS --no-fsync" 0 1 ;;
+        nvme-tls-fsync) remote nvme-tls-fsync /data "$TLS_FLAGS" 1 1 ;;
+        ebs-fsync) remote ebs-fsync "$HOME_DIR/ebs" '' 1 0 ;;
         *) echo "no run $run" >&2; exit 2 ;;
     esac
 done
