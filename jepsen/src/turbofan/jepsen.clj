@@ -207,7 +207,9 @@
 (defn admin!
   "Runs operator `command` on node `via`, against its own admin listener,
   returning what it prints; passed on to the leader. Given up after `secs`: a
-  node cut off from the leader waits for it, so try another."
+  node cut off from the leader waits for it, so try another. Seconds, not more:
+  the nemesis has one worker, and every other fault, its undoing too, waits
+  for this."
   [secs via command & args]
   (c/on via
     (apply c/exec :timeout secs :env (str "TURBOFAN_ADMIN_TOKEN=" admin-token)
@@ -248,7 +250,7 @@
   data. A removal that timed out may have happened, or happen later: status
   says which."
   [test members node]
-  (let [result (admin-any! 10 (disj members node) :remove-member :--id (node-id test node))
+  (let [result (admin-any! 3 (disj members node) :remove-member :--id (node-id test node))
         now    (cluster-members test)]
     (if (and now (not (now node)))
       (do (c/on node (c/su (c/exec :touch removed-marker) (stop-and-wipe!)))
@@ -265,8 +267,9 @@
             (c/exec :rm :-f removed-marker)
             (c/exec :touch join-marker)
             (start-node! test node)))
-    ;; Caught up, then added: a moment, for a log this short.
-    (let [[outcome detail] (admin-any! 30 members :add-member :--member spec)]
+    ;; Caught up, then added: a moment, for a log this short. Not added in time,
+    ;; it may be later, which status shows the next time round.
+    (let [[outcome detail] (admin-any! 3 members :add-member :--member spec)]
       (if (= :ok outcome)
         [:added node (cluster-members test)]
         [:not-added node detail]))))
