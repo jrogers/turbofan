@@ -340,6 +340,10 @@
                     :nodes     (:nodes opts)
                     :faults    (:nemesis opts)
                     :partition {:targets [:one :primaries :majority :majorities-ring]}
+                    ;; Not :primaries: a clock fault's nodes are chosen by its generator, which
+                    ;; the interpreter asks again at every turn, so asking the nodes who leads
+                    ;; (over SSH) held up the clients: a fifth of --rate, with clock faults on.
+                    :clock     {:targets [:one :minority :majority :all]}
                     ;; Jepsen's default is no disruption at all.
                     :packet    {:targets   [:one :primaries :minority :majority :all]
                                 :behaviors [{:delay {}}
