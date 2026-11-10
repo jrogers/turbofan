@@ -18,6 +18,7 @@
                     [tests :as tests]]
             [jepsen.checker.timeline :as timeline]
             [jepsen.control.util :as cu]
+            [jepsen.lazyfs :as lazyfs]
             [jepsen.nemesis.combined :as nemesis]
             [jepsen.os.debian :as debian]
             [jepsen.tests.cycle.append :as append])
@@ -89,53 +90,60 @@
   (c/exec :sh :-c (str "test -f " pidfile " && kill -" signal " $(cat " pidfile ") || true")))
 
 (defn db
-  "The cluster, its binary copied from the control node's `(:binary test)`."
-  []
-  (reify
-    db/DB
-    (setup! [_ test node]
-      (c/su
-        (c/exec :mkdir :-p dir)
-        (c/upload (:binary test) binary)
-        (c/exec :chmod :+x binary)
-        (start-node! test node)
-        (start-gateway! test node)))
+  "The cluster, its binary copied from the control node's `(:binary test)`.
+  With `:lazyfs`, its data directory is on LazyFS, and a node killed loses what
+  it wrote but didn't sync, as one that lost power does."
+  [opts]
+  (let [lazyfs (when (:lazyfs opts) (lazyfs/db data-dir))]
+    (reify
+      db/DB
+      (setup! [_ test node]
+        (c/su
+          (c/exec :mkdir :-p dir)
+          (c/upload (:binary test) binary)
+          (c/exec :chmod :+x binary)
+          (when lazyfs (db/setup! lazyfs test node))
+          (start-node! test node)
+          (start-gateway! test node)))
 
-    (teardown! [_ test node]
-      (c/su
-        (signal! "KILL" gateway-pidfile)
-        (signal! "KILL" node-pidfile)
-        (c/exec :rm :-rf dir)))
+      (teardown! [_ test node]
+        (c/su
+          (signal! "KILL" gateway-pidfile)
+          (signal! "KILL" node-pidfile)
+          (when lazyfs (db/teardown! lazyfs test node))
+          (c/exec :rm :-rf dir)))
 
-    db/Kill
-    (start! [_ test node] (c/su (start-node! test node)))
-    (kill! [_ test node]
-      (c/su
-        (signal! "KILL" node-pidfile)
-        (c/exec :rm :-f node-pidfile)))
+      db/Kill
+      (start! [_ test node] (c/su (start-node! test node)))
+      (kill! [_ test node]
+        (c/su
+          (signal! "KILL" node-pidfile)
+          (c/exec :rm :-f node-pidfile)
+          (when lazyfs (lazyfs/lose-unfsynced-writes! lazyfs))))
 
-    db/Pause
-    (pause! [_ test node] (c/su (signal! "STOP" node-pidfile)))
-    (resume! [_ test node] (c/su (signal! "CONT" node-pidfile)))
+      db/Pause
+      (pause! [_ test node] (c/su (signal! "STOP" node-pidfile)))
+      (resume! [_ test node] (c/su (signal! "CONT" node-pidfile)))
 
-    db/Primary
-    (setup-primary! [_ test node])
-    (primaries [_ test]
-      ;; The leader, as any node that answers says it is.
-      (or (some (fn [node]
-                  (try
-                    (c/on node
-                      (let [out (c/exec :env (str "TURBOFAN_ADMIN_TOKEN=" admin-token)
-                                        binary :status :--admin (str node ":" admin-port))
-                            id  (some->> out (re-find #"leader (\d+)") second parse-long)]
-                        (when (and id (<= 1 id (count (:nodes test))))
-                          [(nth (:nodes test) (dec id))])))
-                    (catch Exception _ nil)))
-                (:nodes test))
-          []))
+      db/Primary
+      (setup-primary! [_ test node])
+      (primaries [_ test]
+        ;; The leader, as any node that answers says it is.
+        (or (some (fn [node]
+                    (try
+                      (c/on node
+                        (let [out (c/exec :env (str "TURBOFAN_ADMIN_TOKEN=" admin-token)
+                                          binary :status :--admin (str node ":" admin-port))
+                              id  (some->> out (re-find #"leader (\d+)") second parse-long)]
+                          (when (and id (<= 1 id (count (:nodes test))))
+                            [(nth (:nodes test) (dec id))])))
+                      (catch Exception _ nil)))
+                  (:nodes test))
+            []))
 
-    db/LogFiles
-    (log-files [_ test node] [node-log gateway-log])))
+      db/LogFiles
+      (log-files [_ test node]
+        (cond-> [node-log gateway-log] lazyfs (conj (:log-file (:lazyfs lazyfs))))))))
 
 (defn encode
   "A transaction's request line: `a 1 5;r 1`."
@@ -190,7 +198,7 @@
 (defn turbofan-test
   "The test, from the command line's options."
   [opts]
-  (let [db       (db)
+  (let [db       (db opts)
         workload (append/test {:key-count          10
                                :min-txn-length     1
                                :max-txn-length     4
@@ -203,11 +211,21 @@
                     :partition {:targets [:one :primaries :majority :majorities-ring]}
                     :pause     {:targets [:one :primaries :minority]}
                     :kill      {:targets [:one :primaries :minority :all]}
+                    ;; Jepsen's default is no disruption at all.
+                    :packet    {:targets   [:one :primaries :minority :majority :all]
+                                :behaviors [{:delay {}}
+                                            {:loss {}}
+                                            {:delay {}, :reorder {}}
+                                            {:duplicate {}}
+                                            {:corrupt {}}
+                                            {:rate {}}
+                                            {:delay {}, :loss {}, :duplicate {}}]}
                     :interval  (:nemesis-interval opts)})]
     (merge tests/noop-test
            opts
            {:name            (->> [(str/join "," (map name (sort (:nemesis opts))))
-                                       (if (:fsync opts) "fsync" "no-fsync")]
+                                       (if (:fsync opts) "fsync" "no-fsync")
+                                       (when (:lazyfs opts) "lazyfs")]
                                       (remove str/blank?)
                                       (str/join " ")
                                       (str "turbofan list-append "))
@@ -239,6 +257,8 @@
   [[nil "--binary PATH" "examples/list_append, built for the nodes' platform, on the control node."
     :default "/turbofan/target/jepsen/release/examples/list_append"]
    [nil "--fsync" "Run the nodes as by default, syncing the log. Without it, --no-fsync."
+    :default false]
+   [nil "--lazyfs" "The nodes' data on LazyFS: a node killed loses what it didn't sync."
     :default false]
    [nil "--nemesis FAULTS" "Faults to inject, comma-separated: partition, kill, pause, clock, packet; or none."
     :default #{}
