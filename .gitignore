@@ -4,3 +4,4 @@ crates/turbofan/fuzz/artifacts/
 mutants.out/
 mutants.out.old/
 jepsen/store/
+jepsen/.lein-failures
