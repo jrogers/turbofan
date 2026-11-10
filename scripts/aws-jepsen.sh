@@ -182,6 +182,8 @@ read -r -a PRIVATE <<<"$(addresses "$NODE_IDS" PrivateIpAddress)"
 read -r -a PUBLIC <<<"$(addresses "$NODE_IDS" PublicIpAddress)"
 CONTROL=$(addresses "$CONTROL_ID" PublicIpAddress)
 
+# A locale every Debian has: ssh sends this machine's, which the nodes lack, and each shell warns.
+export LC_ALL=C.UTF-8
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$OUT/known_hosts"
     -o ConnectTimeout=5 -o ServerAliveInterval=15 -o BatchMode=yes)
 on() { local host=$1; shift; "${SSH[@]}" "admin@$host" "$@"; }

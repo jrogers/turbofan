@@ -308,6 +308,21 @@
      :nemesis   (member-nemesis)
      :perf      #{{:name "member", :fs #{:member}, :color "#E9A0E6"}}}))
 
+(defn db-generator
+  "Kills and pauses, each undone at the next tick. Jepsen's own mixes the two,
+  a kill undone only when the mix next picks kills: on AWS, once, every node
+  killed for four minutes of a five-minute test."
+  [opts]
+  (let [faults (:nemesis opts)
+        cycle  (fn [f targets undo]
+                 (->> (gen/flip-flop (fn [_ _] {:type :info, :f f, :value (rand-nth targets)})
+                                     (gen/repeat {:type :info, :f undo, :value :all}))
+                      (gen/stagger (:nemesis-interval opts))))
+        gens   (cond-> []
+                 (faults :kill)  (conj (cycle :kill [:one :primaries :minority :all] :start))
+                 (faults :pause) (conj (cycle :pause [:one :primaries :minority] :resume)))]
+    (when (seq gens) (apply gen/any gens))))
+
 (defn turbofan-test
   "The test, from the command line's options."
   [opts]
@@ -322,8 +337,6 @@
                     :nodes     (:nodes opts)
                     :faults    (:nemesis opts)
                     :partition {:targets [:one :primaries :majority :majorities-ring]}
-                    :pause     {:targets [:one :primaries :minority]}
-                    :kill      {:targets [:one :primaries :minority :all]}
                     ;; Jepsen's default is no disruption at all.
                     :packet    {:targets   [:one :primaries :minority :majority :all]
                                 :behaviors [{:delay {}}
@@ -334,6 +347,8 @@
                                             {:rate {}}
                                             {:delay {}, :loss {}, :duplicate {}}]}
                     :interval  (:nemesis-interval opts)})
+        ;; The last, the db's, its kills and pauses as db-generator has them.
+        package  (update package (dec (count package)) assoc :generator (db-generator opts))
         package  (nemesis/compose-packages (keep identity (conj package (member-package opts))))]
     (merge tests/noop-test
            opts
