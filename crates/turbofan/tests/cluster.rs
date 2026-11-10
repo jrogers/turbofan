@@ -158,6 +158,18 @@ async fn a_cluster_answers_every_message_once_through_failovers() {
     // Everyone back: one more round, then a snapshot every node can take.
     exchange(&mut cluster, &mut client, next, next + 99).await;
     admin.request_snapshot().await.unwrap();
+    // Every one caught up first: a shutdown doesn't wait for a member it hasn't heard from in an
+    // election timeout, as it takes one down, and on a busy machine the last started can be that.
+    let mut caught_up = false;
+    for _ in 0..100 {
+        let status = admin.status().await.unwrap();
+        if (1..=3).all(|id| status.lag(NodeId(id)) == Some(0)) {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(caught_up, "every node caught up");
 
     // Shut down, every node has the same snapshot and stops; started again, the session goes on.
     let index = admin.shutdown().await.unwrap();
