@@ -142,6 +142,10 @@ Every member snapshots at the same index, then stops, and `serve` returns. A res
 snapshot rather than replaying the log. Start the nodes again with the same command line: their
 data directories say who the members are.
 
+The shutdown doesn't wait for a member the leader hasn't heard from within an election timeout:
+one that's down, cut off, or still starting. Such a member isn't told to stop, and runs on with
+no leader to follow: stop it yourself. Started again with the others, it catches up from them.
+
 ## Metrics
 
 A node reports through the [`metrics`](https://docs.rs/metrics) facade. Install a recorder in the
