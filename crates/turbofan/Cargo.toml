@@ -50,3 +50,8 @@ workspace = true
 [[bench]]
 name = "cluster"
 harness = false
+
+# Its tests run with the crate's: the service, and the gateway against a node over TCP.
+[[example]]
+name = "list_append"
+test = true
