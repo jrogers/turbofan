@@ -40,7 +40,9 @@ log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 # Each run's lein arguments, and whether Elle should find it valid.
 args() {
     case $1 in
-        all) echo "--nemesis $FAULTS,clock --fsync --lazyfs" ;;
+        # One worker carries out every fault, a clock strobe for up to 30s: six kinds every 10s
+        # outrun it, and the backlog grows until a kill is undone minutes late.
+        all) echo "--nemesis $FAULTS,clock --nemesis-interval 40 --fsync --lazyfs" ;;
         clock) echo "--nemesis clock --fsync" ;;
         crash) echo "--nemesis $FAULTS" ;;
         lazyfs-unsynced) echo "--nemesis kill --lazyfs" ;;
