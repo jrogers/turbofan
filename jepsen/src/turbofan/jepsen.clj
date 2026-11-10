@@ -1,0 +1,257 @@
+(ns turbofan.jepsen
+  "Jepsen's list-append workload against a cluster of examples/list_append.rs (#14).
+
+  Each node runs `list_append serve`, and beside it `list_append gateway`,
+  which Jepsen's clients speak a line of text to: the gateway holds a session
+  with the cluster for each connection, resent through failovers as any
+  client's is. A request is `a <k> <v>;r <k>`, and its answer `ok <EDN txn>`,
+  `fail <why>` (never applied) or `info <why>` (maybe applied)."
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
+            [clojure.tools.logging :refer [info warn]]
+            [jepsen [checker :as checker]
+                    [cli :as cli]
+                    [client :as client]
+                    [control :as c]
+                    [db :as db]
+                    [generator :as gen]
+                    [tests :as tests]]
+            [jepsen.checker.timeline :as timeline]
+            [jepsen.control.util :as cu]
+            [jepsen.nemesis.combined :as nemesis]
+            [jepsen.os.debian :as debian]
+            [jepsen.tests.cycle.append :as append])
+  (:import (java.io BufferedReader InputStreamReader OutputStreamWriter)
+           (java.net InetSocketAddress Socket)
+           (java.nio.charset StandardCharsets)))
+
+(def dir "/opt/turbofan")
+(def binary (str dir "/list_append"))
+(def data-dir (str dir "/data"))
+(def node-log (str dir "/node.log"))
+(def gateway-log (str dir "/gateway.log"))
+(def node-pidfile (str dir "/node.pid"))
+(def gateway-pidfile (str dir "/gateway.pid"))
+
+(def peer-port 7001)
+(def client-port 7101)
+(def admin-port 7201)
+(def gateway-port 7301)
+
+(def admin-token "jepsen-admin")
+(def peer-token "jepsen-peer")
+
+;; How long the gateway waits for an answer, and Jepsen's client for the
+;; gateway's: longer, so the gateway's `info timeout` comes first.
+(def gateway-timeout-ms 5000)
+(def socket-timeout-ms 10000)
+
+(defn node-id
+  "Node n3's ID, 3: by its place in the test's nodes."
+  [test node]
+  (inc (.indexOf ^java.util.List (:nodes test) node)))
+
+(defn members
+  "`1=n1:7001,2=n2:7001,...` for `port`."
+  [test port]
+  (->> (:nodes test)
+       (map (fn [node] (str (node-id test node) "=" node ":" port)))
+       (str/join ",")))
+
+(def env {:TURBOFAN_ADMIN_TOKEN admin-token, :TURBOFAN_PEER_TOKEN peer-token})
+
+(defn start-node! [test node]
+  (apply cu/start-daemon!
+         {:logfile node-log, :pidfile node-pidfile, :chdir dir, :env env}
+         binary
+         (cond-> [:serve
+                  :--id      (node-id test node)
+                  :--data    data-dir
+                  :--listen  "0.0.0.0"
+                  :--peers   (members test peer-port)
+                  :--clients (members test client-port)
+                  :--admin   (members test admin-port)]
+           (not (:fsync test)) (conj :--no-fsync))))
+
+(defn start-gateway! [test node]
+  (cu/start-daemon!
+    {:logfile gateway-log, :pidfile gateway-pidfile, :chdir dir}
+    binary
+    :gateway
+    :--listen     (str "0.0.0.0:" gateway-port)
+    :--clients    (->> (:nodes test) (map #(str % ":" client-port)) (str/join ","))
+    :--timeout-ms gateway-timeout-ms))
+
+(defn signal!
+  "Sends `signal` to the process in `pidfile`, if there's one: the node and the
+  gateway run the same binary, so killing by name would take both."
+  [signal pidfile]
+  (c/exec :sh :-c (str "test -f " pidfile " && kill -" signal " $(cat " pidfile ") || true")))
+
+(defn db
+  "The cluster, its binary copied from the control node's `(:binary test)`."
+  []
+  (reify
+    db/DB
+    (setup! [_ test node]
+      (c/su
+        (c/exec :mkdir :-p dir)
+        (c/upload (:binary test) binary)
+        (c/exec :chmod :+x binary)
+        (start-node! test node)
+        (start-gateway! test node)))
+
+    (teardown! [_ test node]
+      (c/su
+        (signal! "KILL" gateway-pidfile)
+        (signal! "KILL" node-pidfile)
+        (c/exec :rm :-rf dir)))
+
+    db/Kill
+    (start! [_ test node] (c/su (start-node! test node)))
+    (kill! [_ test node]
+      (c/su
+        (signal! "KILL" node-pidfile)
+        (c/exec :rm :-f node-pidfile)))
+
+    db/Pause
+    (pause! [_ test node] (c/su (signal! "STOP" node-pidfile)))
+    (resume! [_ test node] (c/su (signal! "CONT" node-pidfile)))
+
+    db/Primary
+    (setup-primary! [_ test node])
+    (primaries [_ test]
+      ;; The leader, as any node that answers says it is.
+      (or (some (fn [node]
+                  (try
+                    (c/on node
+                      (let [out (c/exec :env (str "TURBOFAN_ADMIN_TOKEN=" admin-token)
+                                        binary :status :--admin (str node ":" admin-port))
+                            id  (some->> out (re-find #"leader (\d+)") second parse-long)]
+                        (when (and id (<= 1 id (count (:nodes test))))
+                          [(nth (:nodes test) (dec id))])))
+                    (catch Exception _ nil)))
+                (:nodes test))
+          []))
+
+    db/LogFiles
+    (log-files [_ test node] [node-log gateway-log])))
+
+(defn encode
+  "A transaction's request line: `a 1 5;r 1`."
+  [txn]
+  (->> txn
+       (map (fn [[f k v]]
+              (case f
+                :append (str "a " k " " v)
+                :r      (str "r " k))))
+       (str/join ";")))
+
+(defn read-only? [txn]
+  (every? (comp #{:r} first) txn))
+
+(defn answer
+  "Completes `op` with the gateway's `line`."
+  [op line]
+  (let [[kind rest] (str/split (or line "info connection-closed") #" " 2)]
+    (case kind
+      "ok"   (assoc op :type :ok, :value (edn/read-string rest))
+      "fail" (assoc op :type :fail, :error (keyword rest))
+      "info" (assoc op :type (if (read-only? (:value op)) :fail :info), :error (keyword rest)))))
+
+(defrecord Client [^Socket socket ^BufferedReader in ^OutputStreamWriter out]
+  client/Client
+  (open! [this test node]
+    (let [socket (doto (Socket.)
+                   (.connect (InetSocketAddress. ^String node (int gateway-port)) 2000)
+                   (.setSoTimeout (int socket-timeout-ms))
+                   (.setTcpNoDelay true))]
+      (assoc this
+             :socket socket
+             :in     (BufferedReader. (InputStreamReader. (.getInputStream socket) StandardCharsets/UTF_8))
+             :out    (OutputStreamWriter. (.getOutputStream socket) StandardCharsets/UTF_8))))
+
+  (setup! [_ _])
+
+  (invoke! [_ _ op]
+    (try
+      (.write out (str (encode (:value op)) "\n"))
+      (.flush out)
+      (answer op (.readLine in))
+      (catch java.io.IOException e
+        ;; Sent, perhaps, and no answer: a read logs nothing, so it failed.
+        (assoc op :type (if (read-only? (:value op)) :fail :info) :error [:io (.getMessage e)]))))
+
+  (teardown! [_ _])
+
+  (close! [_ _]
+    (when socket (.close socket))))
+
+(defn turbofan-test
+  "The test, from the command line's options."
+  [opts]
+  (let [db       (db)
+        workload (append/test {:key-count          10
+                               :min-txn-length     1
+                               :max-txn-length     4
+                               :max-writes-per-key 128
+                               :consistency-models [:strict-serializable]})
+        package  (nemesis/nemesis-package
+                   {:db        db
+                    :nodes     (:nodes opts)
+                    :faults    (:nemesis opts)
+                    :partition {:targets [:one :primaries :majority :majorities-ring]}
+                    :pause     {:targets [:one :primaries :minority]}
+                    :kill      {:targets [:one :primaries :minority :all]}
+                    :interval  (:nemesis-interval opts)})]
+    (merge tests/noop-test
+           opts
+           {:name            (->> [(str/join "," (map name (sort (:nemesis opts))))
+                                       (if (:fsync opts) "fsync" "no-fsync")]
+                                      (remove str/blank?)
+                                      (str/join " ")
+                                      (str "turbofan list-append "))
+            :os              debian/os
+            :db              db
+            :client          (map->Client {})
+            :nemesis         (:nemesis package)
+            :pure-generators true
+            :checker         (checker/compose
+                               {:perf     (checker/perf {:nemeses (:perf package)})
+                                :stats    (checker/stats)
+                                :timeline (timeline/html)
+                                :crash    (checker/log-file-pattern #"panicked at" "node.log")
+                                :workload (:checker workload)})
+            :generator       (gen/phases
+                               (->> (:generator workload)
+                                    (gen/stagger (/ (:rate opts)))
+                                    (gen/nemesis (gen/phases (gen/sleep 5) (:generator package)))
+                                    (gen/time-limit (:time-limit opts)))
+                               (gen/log "Healing")
+                               (gen/nemesis (:final-generator package))
+                               (gen/log "Waiting for recovery")
+                               (gen/sleep 10)
+                               (gen/clients (:final-generator workload)))})))
+
+(def faults #{:partition :kill :pause :clock :packet})
+
+(def cli-opts
+  [[nil "--binary PATH" "examples/list_append, built for the nodes' platform, on the control node."
+    :default "/turbofan/target/jepsen/release/examples/list_append"]
+   [nil "--fsync" "Run the nodes as by default, syncing the log. Without it, --no-fsync."
+    :default false]
+   [nil "--nemesis FAULTS" "Faults to inject, comma-separated: partition, kill, pause, clock, packet; or none."
+    :default #{}
+    :parse-fn (fn [s] (if (= s "none") #{} (set (map keyword (str/split s #",")))))
+    :validate [#(every? faults %) (str "Faults are some of " (str/join ", " (map name faults)))]]
+   [nil "--nemesis-interval SECS" "Seconds between faults."
+    :default 10
+    :parse-fn parse-double]
+   [nil "--rate HZ" "Transactions a second, all clients together."
+    :default 100
+    :parse-fn parse-double]])
+
+(defn -main [& args]
+  (cli/run! (merge (cli/single-test-cmd {:test-fn turbofan-test, :opt-spec cli-opts})
+                   (cli/serve-cmd))
+            args))

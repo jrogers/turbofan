@@ -3,3 +3,4 @@ crates/turbofan/fuzz/corpus/
 crates/turbofan/fuzz/artifacts/
 mutants.out/
 mutants.out.old/
+jepsen/store/

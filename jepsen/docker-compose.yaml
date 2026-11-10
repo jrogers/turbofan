@@ -1,0 +1,6 @@
+# Over jepsen-docker's jepsen-compose.yaml (jepsen/docker.sh): the repository on the control node,
+# for the harness and the binary it copies to the nodes.
+services:
+  control:
+    volumes:
+      - ${TURBOFAN_ROOT}:/turbofan
