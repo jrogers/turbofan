@@ -19,6 +19,7 @@
             [jepsen.checker.timeline :as timeline]
             [jepsen.control.util :as cu]
             [jepsen.lazyfs :as lazyfs]
+            [jepsen.nemesis :as n]
             [jepsen.nemesis.combined :as nemesis]
             [jepsen.os.debian :as debian]
             [jepsen.tests.cycle.append :as append])
@@ -33,6 +34,12 @@
 (def gateway-log (str dir "/gateway.log"))
 (def node-pidfile (str dir "/node.pid"))
 (def gateway-pidfile (str dir "/gateway.pid"))
+;; A node removed from the cluster, and its data with it: never started again
+;; until it's added back.
+(def removed-marker (str dir "/removed"))
+;; A node added back: it starts with --join from then on, its members its
+;; log's, not the command line's.
+(def join-marker (str dir "/join"))
 
 (def peer-port 7001)
 (def client-port 7101)
@@ -72,7 +79,8 @@
                   :--peers   (members test peer-port)
                   :--clients (members test client-port)
                   :--admin   (members test admin-port)]
-           (not (:fsync test)) (conj :--no-fsync))))
+           (not (:fsync test))     (conj :--no-fsync)
+           (cu/exists? join-marker) (conj :--join))))
 
 (defn start-gateway! [test node]
   (cu/start-daemon!
@@ -114,7 +122,8 @@
           (c/exec :rm :-rf dir)))
 
       db/Kill
-      (start! [_ test node] (c/su (start-node! test node)))
+      (start! [_ test node]
+        (c/su (when-not (cu/exists? removed-marker) (start-node! test node))))
       (kill! [_ test node]
         (c/su
           (signal! "KILL" node-pidfile)
@@ -132,7 +141,7 @@
         (or (some (fn [node]
                     (try
                       (c/on node
-                        (let [out (c/exec :env (str "TURBOFAN_ADMIN_TOKEN=" admin-token)
+                        (let [out (c/exec :timeout 2 :env (str "TURBOFAN_ADMIN_TOKEN=" admin-token)
                                           binary :status :--admin (str node ":" admin-port))
                               id  (some->> out (re-find #"leader (\d+)") second parse-long)]
                           (when (and id (<= 1 id (count (:nodes test))))
@@ -195,6 +204,110 @@
   (close! [_ _]
     (when socket (.close socket))))
 
+(defn admin!
+  "Runs operator `command` on node `via`, against its own admin listener,
+  returning what it prints; passed on to the leader. Given up after `secs`: a
+  node cut off from the leader waits for it, so try another."
+  [secs via command & args]
+  (c/on via
+    (apply c/exec :timeout secs :env (str "TURBOFAN_ADMIN_TOKEN=" admin-token)
+           binary command :--admin (str via ":" admin-port) args)))
+
+(defn admin-any!
+  "As admin!, through each of `vias` in turn until one answers: what it
+  printed, or the last error."
+  [secs vias command & args]
+  (loop [[via & more] (shuffle vias)]
+    (let [result (try [:ok (apply admin! secs via command args)]
+                      (catch Exception e [:error (.getMessage e)]))]
+      (if (or (= :ok (first result)) (empty? more))
+        result
+        (recur more)))))
+
+(defn cluster-members
+  "The members, as the first node to answer `status` says, or nil if none does."
+  [test]
+  (some (fn [via]
+          (try
+            (let [ids (->> (admin! 2 via :status) (re-seq #"(?m)^member (\d+)") (map (comp parse-long second)))]
+              (when (seq ids) (set (map #(nth (:nodes test) (dec %)) ids))))
+            (catch Exception _ nil)))
+        (shuffle (:nodes test))))
+
+(defn stop-and-wipe!
+  "Stops the node on this machine and empties its data directory (on LazyFS,
+  the mount itself stays)."
+  []
+  (signal! "KILL" node-pidfile)
+  (c/exec :rm :-f node-pidfile)
+  (c/exec :mkdir :-p data-dir)
+  (c/exec :find data-dir :-mindepth 1 :-delete))
+
+(defn remove-member!
+  "Removes `node`, then, once `status` says it's gone, stops it and drops its
+  data. A removal that timed out may have happened, or happen later: status
+  says which."
+  [test members node]
+  (let [result (admin-any! 10 (disj members node) :remove-member :--id (node-id test node))
+        now    (cluster-members test)]
+    (if (and now (not (now node)))
+      (do (c/on node (c/su (c/exec :touch removed-marker) (stop-and-wipe!)))
+          [:removed node now])
+      [:not-removed node (second result)])))
+
+(defn add-member!
+  "Starts `node` empty, joining, and asks the cluster to add it, as a node
+  replaced is."
+  [test members node]
+  (let [spec (str (node-id test node) "=" node ":" peer-port "," node ":" client-port "," node ":" admin-port)]
+    (c/on node
+      (c/su (stop-and-wipe!)
+            (c/exec :rm :-f removed-marker)
+            (c/exec :touch join-marker)
+            (start-node! test node)))
+    ;; Caught up, then added: a moment, for a log this short.
+    (let [[outcome detail] (admin-any! 30 members :add-member :--member spec)]
+      (if (= :ok outcome)
+        [:added node (cluster-members test)]
+        [:not-added node detail]))))
+
+(defn member-nemesis
+  "Removes a member, or adds back one removed, one at a time: never fewer than
+  three voters."
+  []
+  (reify
+    n/Reflection
+    (fs [_] #{:member})
+
+    n/Nemesis
+    (setup! [this _] this)
+    (invoke! [_ test op]
+      (let [members (cluster-members test)
+            out     (when members (remove members (:nodes test)))]
+        (assoc op :value
+               (cond
+                 (nil? members)
+                 [:no-status]
+
+                 (and (seq out) (or (<= (count members) 3) (< (rand) 0.5)))
+                 (add-member! test members (rand-nth (vec out)))
+
+                 (> (count members) 3)
+                 (remove-member! test members (rand-nth (vec members)))
+
+                 :else
+                 [:nothing members]))))
+    (teardown! [_ _])))
+
+(defn member-package
+  "Membership changes, as a package for jepsen.nemesis.combined."
+  [opts]
+  (when ((:nemesis opts) :member)
+    {:generator (->> (gen/repeat {:type :info, :f :member})
+                     (gen/stagger (:nemesis-interval opts)))
+     :nemesis   (member-nemesis)
+     :perf      #{{:name "member", :fs #{:member}, :color "#E9A0E6"}}}))
+
 (defn turbofan-test
   "The test, from the command line's options."
   [opts]
@@ -204,7 +317,7 @@
                                :max-txn-length     4
                                :max-writes-per-key 128
                                :consistency-models [:strict-serializable]})
-        package  (nemesis/nemesis-package
+        package  (nemesis/nemesis-packages
                    {:db        db
                     :nodes     (:nodes opts)
                     :faults    (:nemesis opts)
@@ -220,7 +333,8 @@
                                             {:corrupt {}}
                                             {:rate {}}
                                             {:delay {}, :loss {}, :duplicate {}}]}
-                    :interval  (:nemesis-interval opts)})]
+                    :interval  (:nemesis-interval opts)})
+        package  (nemesis/compose-packages (keep identity (conj package (member-package opts))))]
     (merge tests/noop-test
            opts
            {:name            (->> [(str/join "," (map name (sort (:nemesis opts))))
@@ -251,7 +365,7 @@
                                (gen/sleep 10)
                                (gen/clients (:final-generator workload)))})))
 
-(def faults #{:partition :kill :pause :clock :packet})
+(def faults #{:partition :kill :pause :clock :packet :member})
 
 (def cli-opts
   [[nil "--binary PATH" "examples/list_append, built for the nodes' platform, on the control node."
@@ -260,7 +374,7 @@
     :default false]
    [nil "--lazyfs" "The nodes' data on LazyFS: a node killed loses what it didn't sync."
     :default false]
-   [nil "--nemesis FAULTS" "Faults to inject, comma-separated: partition, kill, pause, clock, packet; or none."
+   [nil "--nemesis FAULTS" "Faults to inject, comma-separated: partition, kill, pause, clock, packet, member; or none."
     :default #{}
     :parse-fn (fn [s] (if (= s "none") #{} (set (map keyword (str/split s #",")))))
     :validate [#(every? faults %) (str "Faults are some of " (str/join ", " (map name faults)))]]
