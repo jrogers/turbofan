@@ -285,6 +285,8 @@ pub async fn serve_until<S: Service + 'static>(
         storage: Some(storage),
         pipeline: Pipeline::default(),
         writing: None,
+        write_inline: config.log_fsync == Fsync::Never,
+        written_inline: None,
         snapshots,
         lock,
         inputs,
@@ -313,6 +315,12 @@ struct Core<S> {
     pipeline: Pipeline,
     /// The write under way, and the storage back with it.
     writing: Option<JoinHandle<Written>>,
+    /// Whether small writes are made on the node's task ([`small_appends`]): with
+    /// [`Fsync::Never`] one is only a copy into the page cache, quicker than handing it to a
+    /// blocking thread and waking it.
+    write_inline: bool,
+    /// A write made on the node's task, for the loop to hand back before it waits on anything.
+    written_inline: Option<Written>,
     /// Where snapshots are saved, apart from the batches, reporting back on `inputs`.
     snapshots: PathBuf,
     /// The node's directory lock ([`Log::lock`]), for a snapshot being saved to hold: else, the
@@ -353,6 +361,10 @@ impl<S: Service + 'static> Core<S> {
         let mut leaving: Option<Instant> = None;
         loop {
             self.flush();
+            if let Some(written) = self.written_inline.take() {
+                self.written(written)?;
+                continue;
+            }
             if self.published.elapsed() >= METRICS_EVERY {
                 self.published = Instant::now();
                 self.node.metrics(self.clock.now()).publish();
@@ -466,6 +478,11 @@ impl<S: Service + 'static> Core<S> {
         }
         if let Some(batches) = taken.write {
             let mut storage = self.storage.take().expect("storage is back between writes");
+            if self.write_inline && small_appends(&batches) {
+                let done = storage.write(&batches);
+                self.written_inline = Some(Written { storage, done });
+                return;
+            }
             self.writing = Some(tokio::task::spawn_blocking(move || {
                 let done = storage.write(&batches);
                 Written { storage, done }
@@ -667,6 +684,29 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+/// Appends of at most this many bytes, unsynced, are written on the node's task. A bigger
+/// write goes to a blocking thread, the node building its next batch meanwhile. One message in
+/// flight writes ~100 bytes: inline, a commit was 11 µs sooner at p50 (25 at p99). Under load,
+/// writing every batch inline cost 7% of throughput and two thirds more at p99; up to 16 KiB,
+/// 3% and an eighth; up to 4 KiB, within the runs' noise.
+const MAX_INLINE_WRITE_BYTES: usize = 4 << 10;
+
+/// Whether `batches` are appends alone, and few: nothing read, compacted or installed, which
+/// may take a while.
+fn small_appends(batches: &[pipeline::Batch]) -> bool {
+    let mut bytes = 0;
+    for batch in batches {
+        if !batch.reads.is_empty() || !batch.snapshot_reads.is_empty() || !batch.captures.is_empty() {
+            return false;
+        }
+        for op in &batch.persist {
+            let Persist::Append(records) = op else { return false };
+            bytes += records.len();
+        }
+    }
+    bytes <= MAX_INLINE_WRITE_BYTES
 }
 
 /// A write done: what was read for it, or the error that stops the node.
