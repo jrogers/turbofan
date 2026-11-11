@@ -266,7 +266,8 @@
   <section id="performance">
     <h2><a class="anchor" href="#performance">Performance</a></h2>
     <p class="sub">Three nodes on machines of their own, AWS {{bench.machine}} with 8 vCPUs
-    each, and the clients on a fourth, over the network, 64-byte messages, from the repository's
+    each, their NICs' interrupt moderation off, and the clients on a fourth, over the network,
+    64-byte messages, from the repository's
     benchmark: the median of three runs, each batch synced to the instances' NVMe before it's
     acknowledged, as by default. The <a href="guide/performance.html">guide's performance
     chapter</a> has every run, on other machines too, and how to measure your own.</p>

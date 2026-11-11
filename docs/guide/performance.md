@@ -25,6 +25,18 @@ commit. The busier the cluster, the bigger the batches.
 - **Network.** The commit waits for a round trip to a follower, so put the voters close together:
   the same region, ideally the same data centre over separate power. A standby elsewhere is a
   learner, which commits don't wait for.
+- **The NIC's interrupt moderation.** A NIC holds back its interrupts to take more packets in each,
+  which costs a message on its own its wait. On EC2 (the `ena` driver: adaptive on receive, 20 µs,
+  and 64 µs on send) a query on its own took a fixed 130 µs on `c9gd`; without moderation, 72 µs,
+  and a message 73 µs, against 75. Each packet then interrupts, which costs CPU: messages a second
+  were 3% more (synced, 10%), queries 5% fewer. Where a request's latency matters, turn it off on
+  each node, at every boot (a systemd unit, say), for the NIC the cluster's traffic goes out of:
+
+  ```sh
+  sudo ethtool -C ens5 adaptive-rx off rx-usecs 0 tx-usecs 0   # its name: ip route get <a peer>
+  ```
+
+  Measure it with your load. `scripts/aws-bench.sh` does this with `NIC_COALESCE_OFF=1`.
 - **fsync.** By default every batch waits for the disk: on a local NVMe drive a little, on
   network storage a lot. With `--no-fsync`, a write is the page cache's, and the follower's copy
   is the redundancy (see [Running a cluster][running]). Choose with the benchmark on your
@@ -133,23 +145,27 @@ row, on the root volume (gp3).
 | throughput, TLS, fsync | 1,339,659 | 1,600,509 | 2,589,416 |
 | throughput, fsync, EBS | 261,072 | 225,137 | 278,213 |
 
-On AWS c9gd.2xlarge (Graviton5): every run, nodes apart, the median of three. The site's landing
+On AWS c9gd.2xlarge (Graviton5): every run, nodes apart, the median of three, at `4332231`
+(0.12.1), the NICs' interrupt moderation off (see above, `NIC_COALESCE_OFF=1`). The site's landing
 page shows these.
 
 | run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
 |---|---|---:|---:|---:|---:|
-| latency | 1 × 1 | 13,069 | 75 µs | 85 µs | 117 µs |
-| throughput | 8 × 256 | 2,717,578 | 686 µs | 2.10 ms | 5.36 ms |
-| query latency | 1 × 1 | 7,658 | 130 µs | 133 µs | 135 µs |
-| query throughput | 8 × 256 | 4,415,206 | 458 µs | 774 µs | 890 µs |
-| latency, fsync | 1 × 1 | 7,358 | 135 µs | 152 µs | 173 µs |
-| throughput, fsync | 8 × 256 | 2,502,024 | 749 µs | 2.12 ms | 4.90 ms |
-| latency, TLS | 1 × 1 | 9,555 | 104 µs | 112 µs | 135 µs |
-| throughput, TLS | 8 × 256 | 2,696,146 | 684 µs | 2.18 ms | 5.56 ms |
-| query latency, TLS | 1 × 1 | 8,119 | 137 µs | 147 µs | 151 µs |
-| query throughput, TLS | 8 × 256 | 4,347,904 | 468 µs | 765 µs | 848 µs |
-| latency, TLS, fsync | 1 × 1 | 7,218 | 137 µs | 157 µs | 201 µs |
-| throughput, TLS, fsync | 8 × 256 | 2,589,416 | 729 µs | 2.22 ms | 4.98 ms |
+| latency | 1 × 1 | 13,332 | 73 µs | 86 µs | 92 µs |
+| throughput | 8 × 256 | 2,794,749 | 641 µs | 2.06 ms | 5.55 ms |
+| query latency | 1 × 1 | 13,680 | 72 µs | 82 µs | 90 µs |
+| query throughput | 8 × 256 | 4,214,653 | 481 µs | 729 µs | 869 µs |
+| latency, fsync | 1 × 1 | 7,560 | 131 µs | 149 µs | 156 µs |
+| throughput, fsync | 8 × 256 | 2,754,102 | 686 µs | 2.13 ms | 4.90 ms |
+| latency, TLS | 1 × 1 | 12,818 | 77 µs | 86 µs | 92 µs |
+| throughput, TLS | 8 × 256 | 2,756,549 | 661 µs | 2.08 ms | 5.61 ms |
+| query latency, TLS | 1 × 1 | 13,032 | 76 µs | 85 µs | 90 µs |
+| query throughput, TLS | 8 × 256 | 4,222,423 | 477 µs | 744 µs | 893 µs |
+| latency, TLS, fsync | 1 × 1 | 7,456 | 133 µs | 152 µs | 158 µs |
+| throughput, TLS, fsync | 8 × 256 | 2,793,902 | 674 µs | 2.41 ms | 4.94 ms |
+
+With moderation on, as in the first table, a query on its own took 130 µs (7,658 a second in each
+of the three runs) and queries a second were 4,415,206; messages 2,717,578, synced 2,502,024.
 
 Throughput, messages and queries a second, varies by a few per cent from one run to the next. A
 message on its own doesn't: it's a round trip over the network, client to leader and leader to
