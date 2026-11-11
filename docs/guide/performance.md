@@ -54,6 +54,19 @@ commit. The busier the cluster, the bigger the batches.
 - **The build.** `lto = "fat"` and `codegen-units = 1` in the service's `[profile.release]` give
   10 to 18% more throughput, for a slower build; the profile is the service's own, not inherited
   from turbofan's.
+- **Graviton.** Rust's default for 64-bit Arm Linux calls a function for every atomic operation,
+  and for the log's checksum instruction, in case the CPU lacks them. Every Graviton since the
+  second has both, so build for them, in the service's `.cargo/config.toml`:
+
+  ```toml
+  [target.aarch64-unknown-linux-gnu]
+  rustflags = ["-C", "target-feature=+lse,+crc"]
+  ```
+
+  On `c9gd` that's 8 to 10% more messages a second over the network. It applies only to that
+  target, so x86 and Mac builds are unchanged: x86 has both inline already. A binary built this
+  way stops with an illegal instruction on the first Graviton (`a1`). A `RUSTFLAGS` variable, if
+  set, replaces these.
 
 ## The benchmark
 
@@ -103,68 +116,73 @@ which comes from the nodes' own metrics.
 
 Three nodes on machines of their own, and the benchmark driving them from a fourth
 (`BENCH_CLUSTER`), on three AWS types of 8 vCPUs with local NVMe instance storage, one cluster
-placement group in us-east-1, Linux 7.0, Rust 1.99.1, at commit `07ea8ba`, November 2026: fat LTO,
-nodes and clients on jemalloc (see the allocator, above), with `scripts/aws-bench.sh`. `c8id` and
-`c9gd` are the median of three runs of 10 s, each on instances of its own; `c6id` one run, at
-`f50fb3d`. The nodes' logs on the instance storage, except the EBS row, on the root volume (gp3).
+placement group in us-east-1, Linux 7.0, Rust 1.99.1, at commit `c4d1f5f`, November 2026: fat LTO,
+nodes and clients on jemalloc (see the allocator, above), `c9gd` built for its CPU (see Graviton,
+above), with `scripts/aws-bench.sh`. `c8id` and `c9gd` are the median of three runs of 10 s, each
+on instances of its own; `c6id` one run. The nodes' logs on the instance storage, except the EBS
+row, on the root volume (gp3).
 
 | run, nodes apart | `c6id`, Xeon Ice Lake | `c8id`, Xeon Granite Rapids | `c9gd`, Graviton5 |
 |---|---:|---:|---:|
-| latency, 1 × 1 (p50) | 232 µs | 326 µs | 130 µs |
-| throughput, 8 × 256 | 1,083,686 | 1,285,232 | 1,535,851 |
-| query throughput | 2,135,321 | 2,356,813 | 3,142,472 |
-| latency, fsync (p50) | 340 µs | 450 µs | 134 µs |
-| throughput, fsync | 971,121 | 1,130,939 | 1,403,091 |
-| throughput, TLS | 1,093,138 | 1,273,055 | 1,547,213 |
-| throughput, TLS, fsync | 946,607 | 1,139,758 | 1,414,762 |
-| throughput, fsync, EBS | 260,191 | 223,386 | 281,898 |
+| latency, 1 × 1 (p50) | 212 µs | 282 µs | 75 µs |
+| throughput, 8 × 256 | 1,300,327 | 1,773,523 | 2,717,578 |
+| query throughput | 2,517,234 | 2,834,325 | 4,415,206 |
+| latency, fsync (p50) | 355 µs | 442 µs | 135 µs |
+| throughput, fsync | 1,254,172 | 1,656,306 | 2,502,024 |
+| throughput, TLS | 1,324,590 | 1,816,690 | 2,696,146 |
+| throughput, TLS, fsync | 1,339,659 | 1,600,509 | 2,589,416 |
+| throughput, fsync, EBS | 261,072 | 225,137 | 278,213 |
 
 On AWS c9gd.2xlarge (Graviton5): every run, nodes apart, the median of three. The site's landing
 page shows these.
 
 | run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
 |---|---|---:|---:|---:|---:|
-| latency | 1 × 1 | 8,812 | 130 µs | 142 µs | 148 µs |
-| throughput | 8 × 256 | 1,535,851 | 1.27 ms | 2.26 ms | 4.67 ms |
+| latency | 1 × 1 | 13,069 | 75 µs | 85 µs | 117 µs |
+| throughput | 8 × 256 | 2,717,578 | 686 µs | 2.10 ms | 5.36 ms |
 | query latency | 1 × 1 | 7,658 | 130 µs | 133 µs | 135 µs |
-| query throughput | 8 × 256 | 3,142,472 | 635 µs | 986 µs | 1.11 ms |
-| latency, fsync | 1 × 1 | 7,373 | 134 µs | 154 µs | 198 µs |
-| throughput, fsync | 8 × 256 | 1,403,091 | 1.40 ms | 2.24 ms | 4.78 ms |
-| latency, TLS | 1 × 1 | 9,823 | 88 µs | 204 µs | 212 µs |
-| throughput, TLS | 8 × 256 | 1,547,213 | 1.28 ms | 2.27 ms | 4.80 ms |
-| query latency, TLS | 1 × 1 | 11,278 | 80 µs | 201 µs | 205 µs |
-| query throughput, TLS | 8 × 256 | 3,229,133 | 614 µs | 961 µs | 1.10 ms |
-| latency, TLS, fsync | 1 × 1 | 3,829 | 260 µs | 266 µs | 270 µs |
-| throughput, TLS, fsync | 8 × 256 | 1,414,762 | 1.41 ms | 2.22 ms | 4.80 ms |
+| query throughput | 8 × 256 | 4,415,206 | 458 µs | 774 µs | 890 µs |
+| latency, fsync | 1 × 1 | 7,358 | 135 µs | 152 µs | 173 µs |
+| throughput, fsync | 8 × 256 | 2,502,024 | 749 µs | 2.12 ms | 4.90 ms |
+| latency, TLS | 1 × 1 | 9,555 | 104 µs | 112 µs | 135 µs |
+| throughput, TLS | 8 × 256 | 2,696,146 | 684 µs | 2.18 ms | 5.56 ms |
+| query latency, TLS | 1 × 1 | 8,119 | 137 µs | 147 µs | 151 µs |
+| query throughput, TLS | 8 × 256 | 4,347,904 | 468 µs | 765 µs | 848 µs |
+| latency, TLS, fsync | 1 × 1 | 7,218 | 137 µs | 157 µs | 201 µs |
+| throughput, TLS, fsync | 8 × 256 | 2,589,416 | 729 µs | 2.22 ms | 4.98 ms |
 
 Throughput, messages and queries a second, varies by a few per cent from one run to the next. A
 message on its own doesn't: it's a round trip over the network, client to leader and leader to
-follower, and that depends on where the placement group lands. On `c9gd` its p50 was 83 µs, 130 µs and
-261 µs in the three runs, steady within each; on `c8id`, 326 µs every time, with a long tail
-(p99 642 µs). The Mac's 53 µs (below) is over loopback.
+follower, and that depends on where the placement group lands. On `c9gd` its p50 was 75 to 80 µs
+in the three runs, all in one zone (at `07ea8ba`, in three placements, 83 µs, 130 µs and
+261 µs); on `c8id`, 282 µs at the median, with a long tail (p99 695 µs). The Mac's 53 µs (below)
+is over loopback.
 
 A sync on the instances' NVMe drives takes about a tenth of a millisecond, where the Mac's
-`F_FULLFSYNC` took milliseconds: fsync costs a tenth of the throughput, where on the Mac it cost
-nine tenths. On `c9gd` it adds next to nothing to a message on its own, the leader's sync
-overlapping its round trip to a follower. On EBS, network storage, a sync is a round trip of its
-own, some milliseconds: throughput with fsync falls to a fifth, group commit still filling each
-sync. TLS costs next to nothing.
+`F_FULLFSYNC` took milliseconds: fsync costs a tenth of the throughput or less, where on the Mac
+it cost nine tenths. On `c9gd` it adds 60 µs to a message on its own, 135 µs against 75: the
+leader's sync overlaps its round trip to a follower, but the follower's own sync is in it. On EBS,
+network storage, a sync is a round trip of its own, some milliseconds: throughput with fsync falls
+to a tenth, group commit still filling each sync. TLS costs next to nothing.
 
 The same benchmark in one process on the clients' machine, the three nodes and the clients sharing
-its 8 vCPUs, as on the Mac (12 cores):
+its 8 vCPUs, as on the Mac (12 cores, at `50418c5`, below):
 
 | run, one machine | `c6id` | `c8id` | `c9gd` | Mac mini, M4 Pro |
 |---|---:|---:|---:|---:|
-| throughput, in memory | 213,606 | 318,156 | 379,289 | 536,371 |
-| latency, 1 × 1 (p50) | 82 µs | 75 µs | 40 µs | 53 µs |
-| throughput, 8 × 256 | 791,108 | 1,130,083 | 1,558,024 | 1,177,211 |
-| query throughput | 1,871,507 | 2,390,634 | 3,560,196 | 3,039,131 |
-| latency, fsync (p50) | 194 µs | 207 µs | 83 µs | 8.00 ms |
+| throughput, in memory | 235,520 | 335,052 | 398,336 | 536,371 |
+| latency, 1 × 1 (p50) | 51 µs | 49 µs | 29 µs | 53 µs |
+| throughput, 8 × 256 | 768,357 | 1,191,734 | 1,474,389 | 1,177,211 |
+| query throughput | 2,083,319 | 2,683,653 | 3,923,032 | 3,039,131 |
+| latency, fsync (p50) | 195 µs | 209 µs | 84 µs | 8.00 ms |
 
-The core alone, `in memory`, on one thread, follows each CPU's speed on one core: Graviton5 is
-seven tenths of the M4's, the newest Xeon three fifths, Ice Lake two fifths. Over TCP Graviton5 passes
-the Mac, Linux's loopback and wake-ups being cheaper than macOS's. With the clients on a machine
-of their own, the Xeons' nodes go faster again; Graviton5's don't, already as fast sharing it.
+The core alone, `in memory`, on one thread, follows each CPU's speed on one core: the newest Xeon
+does five sixths of Graviton5's, Ice Lake three fifths. Over TCP Graviton5 passes the Mac,
+Linux's loopback and wake-ups being cheaper than macOS's. With the clients on a machine of their
+own, every type's nodes go faster: the Xeons' half again, Graviton5's nearly twice as fast. Sharing
+one machine's CPUs, the nodes take smaller batches at a cost (see `MAX_BATCH_INPUTS` in
+`driver.rs`): at `c4d1f5f`, `c9gd` did a few per cent fewer messages a second on one machine than
+at `07ea8ba`, and nearly twice as many apart.
 
 On glibc's malloc and without LTO (`c6id`, at `ee40689`), the cluster did 699,316 messages a second
 nodes apart, and 1,024,529 queries: the allocator and the build are half again the throughput, and
