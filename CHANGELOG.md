@@ -4,6 +4,26 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Changed
+
+- Faster, with nothing to change in a service: over the network, on AWS, 20 to 77% more messages a
+  second than 0.12.0 (`c9gd`, Graviton, 1.54 to 2.72 million; synced, 1.40 to 2.50 million), and
+  18 to 41% more queries. The guide's figures are new.
+  - A log entry's checksum is summed once, as it arrives from the network or the disk, where a
+    follower summed it five times and a leader three.
+  - A connection's responses from one batch are sent to its writer together, not one by one.
+  - The node takes up to 256 inputs a batch, not 1024, so what arrives meanwhile, followers'
+    acknowledgements among it, waits less. Sharing one machine's CPUs, a cluster does a few per
+    cent fewer messages a second.
+  - Without fsync, a batch of appends up to 4 KiB is written on the node's own task, not handed
+    to a thread: a message on its own is about a sixth quicker.
+  - `ClusterClient` takes up to 64 commands, or frames from the node, a turn, and writes what they
+    make together: 8% more queries a second.
+- The guide says to build a service for Graviton with `-C target-feature=+lse,+crc`, in its
+  `.cargo/config.toml` for `aarch64-unknown-linux-gnu`: 8 to 10% more messages a second.
+
 ## 0.12.0 (2026-11-09)
 
 ### Breaking
