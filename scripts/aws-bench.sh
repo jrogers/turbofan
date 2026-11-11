@@ -24,6 +24,12 @@
 #   AZ           a zone that offers TYPE, should one be out of capacity (us-east-1b)
 #   BENCH_SECS   10                  MAX_MINUTES  180
 #   RUNS         the runs above, or some of them, space-separated
+#   PROFILE      1: profile every run with samply, each node and the benchmark, the build with
+#                frame pointers and line tables. Each run's profiles go beside its table
+#                (<run>-node<i>.json.gz, <run>-bench.json.gz, with their .syms.json), and its
+#                cluster's status, which names the leader (<run>-status.txt): `samply load` one,
+#                or read it as JSON. The profiler costs a few per cent: its tables aren't the
+#                guide's figures.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,6 +38,13 @@ TYPE=${TYPE:-c6id.2xlarge}
 BENCH_SECS=${BENCH_SECS:-10}
 MAX_MINUTES=${MAX_MINUTES:-180}
 RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
+PROFILE=${PROFILE:-0}
+[[ $PROFILE == 0 || $PROFILE == 1 ]] || { echo "PROFILE is 0 or 1, not $PROFILE" >&2; exit 2; }
+# The clients' machine's builds: with PROFILE, stacks samply can walk and name. The same for
+# every cargo command there, else it rebuilds without.
+CARGO_ENV=''
+[[ $PROFILE == 1 ]] && CARGO_ENV="RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
+SAMPLY_VERSION=0.13.1
 TAG=turbofan-bench
 HOME_DIR=/home/ubuntu
 ADMIN_TOKEN=bench-admin
@@ -191,16 +204,27 @@ done
 for pid in "${PIDS[@]}"; do wait "$pid"; done
 git archive --format=tar HEAD | on "$CLIENT" 'mkdir -p src && tar -x -C src'
 log "building $(git rev-parse --short HEAD) on the clients' machine"
-on "$CLIENT" 'set -e
+on "$CLIENT" "set -e
     sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get -qq install -y build-essential >/dev/null
     curl -fsS https://sh.rustup.rs | sh -s -- -y -q --profile minimal >/dev/null
-    . ~/.cargo/env && cd src
+    . ~/.cargo/env && cd src ${CARGO_ENV:+&& export $CARGO_ENV}
     cargo build -q --release -p turbofan --example echo --features tls
-    cargo bench -q --no-run -p turbofan --bench cluster --features tls'
-# The binary to the nodes, from the clients' machine, by the nodes' private addresses.
+    cargo bench -q --no-run -p turbofan --bench cluster --features tls"
+if [[ $PROFILE == 1 ]]; then
+    log "building samply $SAMPLY_VERSION"
+    on "$CLIENT" ". ~/.cargo/env && cargo install -q --locked samply@$SAMPLY_VERSION"
+    # Every process sampled, the kernel's stacks named, without root.
+    for host in "${PUBLIC[@]}"; do
+        on "$host" 'sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0'
+    done
+fi
+# The binaries to the nodes, from the clients' machine, by the nodes' private addresses.
 scp -q -i "$KEY" -o UserKnownHostsFile="$OUT/known_hosts" "$KEY" "ubuntu@$CLIENT:.ssh/id_ed25519"
 for ip in "${PRIVATE[@]:0:3}"; do
     on "$CLIENT" "scp -q -o StrictHostKeyChecking=accept-new src/target/release/examples/echo ubuntu@$ip:echo"
+    if [[ $PROFILE == 1 ]]; then
+        on "$CLIENT" "scp -q .cargo/bin/samply ubuntu@$ip:samply"
+    fi
 done
 
 # TLS: one certificate for every node, naming their private addresses, signed by a CA of this run.
@@ -228,6 +252,29 @@ CLIENTS=$(list 7101 | sed 's/[0-9]=//g')
 # Expanded on each machine: its own architecture's path.
 JEMALLOC='LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2'
 
+# The benchmark's command on the clients' machine, `envs` before it: with PROFILE, its binary run
+# under samply, the profile to `profile` there.
+bench() {
+    local envs=$1 profile=$2
+    if [[ $PROFILE == 1 ]]; then
+        # cargo runs a benchmark in its package's directory: so does this.
+        echo ". ~/.cargo/env && cd src/crates/turbofan && export $CARGO_ENV && $envs ~/.cargo/bin/samply record \
+            --save-only --unstable-presymbolicate -o $profile -- \
+            \$(ls -t ../../target/release/deps/cluster-* | grep -v '\.d\$' | head -1) --bench"
+    else
+        echo ". ~/.cargo/env && cd src && $envs cargo bench -q -p turbofan --bench cluster --features tls"
+    fi
+}
+
+# A profile samply wrote on `host`, `file` there without its extension, to `out` here, and gone
+# from there.
+fetch_profile() {
+    local host=$1 file=$2 out=$3
+    on "$host" "cat $file.json.gz" >"$out.json.gz"
+    on "$host" "cat $file.json.syms.json" >"$out.json.syms.json"
+    on "$host" "rm -f $file.json.gz $file.json.syms.json"
+}
+
 # One remote run: the nodes started with `extra` flags and their logs under `data`, a leader
 # waited for, the benchmark run against them, and the nodes stopped and their data removed.
 remote() {
@@ -253,23 +300,44 @@ remote() {
         on "${PUBLIC[i-1]}" 'grep -q libjemalloc /proc/$(pgrep -x echo)/maps' ||
             { echo "$name: node $i isn't on jemalloc" >&2; return 1; }
     done
+    if [[ $PROFILE == 1 ]]; then
+        for i in 1 2 3; do
+            on "${PUBLIC[i-1]}" 'nohup ./samply record --save-only --unstable-presymbolicate -o profile.json.gz \
+                -p "$(pgrep -x echo)" >samply.log 2>&1 </dev/null &'
+        done
+        # Which node's profile is the leader's.
+        on "$CLIENT" "TURBOFAN_ADMIN_TOKEN=$ADMIN_TOKEN src/target/release/examples/echo status \
+            --admin ${PRIVATE[0]}:7201 $status_tls" >"$OUT/$name-status.txt"
+    fi
     log "run $name"
-    on "$CLIENT" ". ~/.cargo/env && cd src && BENCH_SECS=$BENCH_SECS BENCH_CLUSTER=$CLIENTS BENCH_FSYNC=$fsync \
-        $bench_tls $JEMALLOC cargo bench -q -p turbofan --bench cluster --features tls" | tee "$OUT/$name.md"
+    on "$CLIENT" "$(bench "BENCH_SECS=$BENCH_SECS BENCH_CLUSTER=$CLIENTS BENCH_FSYNC=$fsync $bench_tls $JEMALLOC" \
+        "$HOME_DIR/bench.json.gz")" | tee "$OUT/$name.md"
     for i in 1 2 3; do
         # By name: `-f 'echo serve'` matches this command's own shell too, and kills it.
         on "${PUBLIC[i-1]}" "pkill -TERM -x echo || true
             while pgrep -x echo >/dev/null; do sleep 0.2; done
             rm -rf $data/n$i"
+        if [[ $PROFILE == 1 ]]; then
+            # samply stops once what it samples does; told to, should it not have.
+            on "${PUBLIC[i-1]}" 'pkill -INT -x samply || true
+                while pgrep -x samply >/dev/null; do sleep 0.2; done'
+            fetch_profile "${PUBLIC[i-1]}" profile "$OUT/$name-node$i"
+        fi
     done
+    if [[ $PROFILE == 1 ]]; then
+        fetch_profile "$CLIENT" bench "$OUT/$name-bench"
+    fi
 }
 
 for run in $RUNS; do
     case $run in
         local)
             log "run local"
-            on "$CLIENT" ". ~/.cargo/env && cd src && mkdir -p /data/tmp && TMPDIR=/data/tmp BENCH_SECS=$BENCH_SECS \
-                $JEMALLOC cargo bench -q -p turbofan --bench cluster --features tls" | tee "$OUT/local.md"
+            on "$CLIENT" "mkdir -p /data/tmp && $(bench "TMPDIR=/data/tmp BENCH_SECS=$BENCH_SECS $JEMALLOC" \
+                "$HOME_DIR/bench.json.gz")" | tee "$OUT/local.md"
+            if [[ $PROFILE == 1 ]]; then
+                fetch_profile "$CLIENT" bench "$OUT/local-bench"
+            fi
             ;;
         nvme) remote nvme /data --no-fsync 0 0 ;;
         nvme-fsync) remote nvme-fsync /data '' 1 0 ;;
@@ -285,6 +353,10 @@ done
     echo "# $RUN"
     echo
     echo "turbofan $(git rev-parse --short HEAD), $TYPE in $AZ ($AWS_REGION), $BENCH_SECS s a run, on jemalloc."
+    if [[ $PROFILE == 1 ]]; then
+        echo
+        echo "Profiled (PROFILE=1), with frame pointers: a few per cent slower, not figures for the guide."
+    fi
     on "$CLIENT" 'echo; lscpu | grep "Model name"; uname -sr; . ~/.cargo/env && rustc --version
         lsblk -dno NAME,MODEL,SIZE | grep -v loop'
     for run in $RUNS; do
