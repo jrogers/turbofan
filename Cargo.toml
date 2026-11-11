@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.12.0"
+version = "0.12.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/jrogers/turbofan"
@@ -23,9 +23,9 @@ cast_possible_wrap = "warn"
 cast_lossless = "warn"
 
 [workspace.dependencies]
-turbofan = { path = "crates/turbofan", version = "0.12.0" }
+turbofan = { path = "crates/turbofan", version = "0.12.1" }
 # The SBE runtime the generated codecs call, and the generator their build.rs runs.
-turbofan-sbe = { path = "crates/turbofan-sbe", version = "0.12.0" }
+turbofan-sbe = { path = "crates/turbofan-sbe", version = "0.12.1" }
 roxmltree = "0.21"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
 tempfile = "3"
