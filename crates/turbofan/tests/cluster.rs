@@ -211,6 +211,40 @@ async fn a_batch_is_answered_in_order() {
     exchange(&mut cluster, &mut client, 1001, 1010).await;
 }
 
+/// Unsynced, a small write is made on the node's task and a big one on a thread: messages one at
+/// a time and a batch alike are answered in order, and what was answered is still there once each
+/// node in turn, the leader among them, is killed and started again from its files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cluster_without_fsync_keeps_what_it_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::unsynced(dir.path());
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 10).await;
+    let seqs = client.send_batch((11..=1000_u64).map(|k| k.to_string().into_bytes())).await.unwrap();
+    assert_eq!(seqs, 11..1001);
+    let (mut events, mut expected) = (Vec::new(), 11);
+    while expected <= 1000 {
+        let read = tokio::time::timeout(Duration::from_secs(20), client.recv_many(&mut events, 256)).await;
+        assert!(read.expect("answered in time") > 0, "session open");
+        for event in events.drain(..) {
+            let Event::Message(payload) = event else { panic!("{event:?}") };
+            assert_eq!(String::from_utf8(payload).unwrap(), expected.to_string(), "answered out of order");
+            expected += 1;
+        }
+    }
+    let mut next = 1001;
+    for i in 0..3 {
+        cluster.kill(i).await;
+        exchange(&mut cluster, &mut client, next, next + 9).await;
+        cluster.start(i);
+        next += 10;
+    }
+    exchange(&mut cluster, &mut client, next, next + 9).await;
+    let answer = tokio::time::timeout(Duration::from_secs(10), client.query(b"last".to_vec())).await;
+    assert_eq!(answer.expect("answered in time"), Ok((next + 9).to_string().into_bytes()));
+}
+
 /// A gateway's query sees every message it has had answered, without logging it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_query_sees_what_was_applied() {

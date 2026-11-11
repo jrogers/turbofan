@@ -285,7 +285,7 @@ pub async fn serve_until<S: Service + 'static>(
         storage: Some(storage),
         pipeline: Pipeline::default(),
         writing: None,
-        write_inline: config.log_fsync == Fsync::Never,
+        fsync: config.log_fsync,
         written_inline: None,
         snapshots,
         lock,
@@ -315,10 +315,9 @@ struct Core<S> {
     pipeline: Pipeline,
     /// The write under way, and the storage back with it.
     writing: Option<JoinHandle<Written>>,
-    /// Whether small writes are made on the node's task ([`small_appends`]): with
-    /// [`Fsync::Never`] one is only a copy into the page cache, quicker than handing it to a
-    /// blocking thread and waking it.
-    write_inline: bool,
+    /// How the log is synced, which says which writes are made on the node's task
+    /// ([`writes_inline`]).
+    fsync: Fsync,
     /// A write made on the node's task, for the loop to hand back before it waits on anything.
     written_inline: Option<Written>,
     /// Where snapshots are saved, apart from the batches, reporting back on `inputs`.
@@ -478,7 +477,7 @@ impl<S: Service + 'static> Core<S> {
         }
         if let Some(batches) = taken.write {
             let mut storage = self.storage.take().expect("storage is back between writes");
-            if self.write_inline && small_appends(&batches) {
+            if writes_inline(self.fsync, &batches) {
                 let done = storage.write(&batches);
                 self.written_inline = Some(Written { storage, done });
                 return;
@@ -693,9 +692,13 @@ impl Storage {
 /// 3% and an eighth; up to 4 KiB, within the runs' noise.
 const MAX_INLINE_WRITE_BYTES: usize = 4 << 10;
 
-/// Whether `batches` are appends alone, and few: nothing read, compacted or installed, which
-/// may take a while.
-fn small_appends(batches: &[pipeline::Batch]) -> bool {
+/// Whether `batches` are written on the node's task: unsynced (with [`Fsync::Never`] a write is
+/// only a copy into the page cache, quicker than handing it to a blocking thread and waking it),
+/// and appends alone, few: nothing read, compacted or installed, which may take a while.
+fn writes_inline(fsync: Fsync, batches: &[pipeline::Batch]) -> bool {
+    if fsync != Fsync::Never {
+        return false;
+    }
     let mut bytes = 0;
     for batch in batches {
         if !batch.reads.is_empty() || !batch.snapshot_reads.is_empty() || !batch.captures.is_empty() {
@@ -1212,6 +1215,38 @@ async fn dial_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch of `persist` and nothing to read.
+    fn batch(persist: Vec<Persist>) -> pipeline::Batch {
+        pipeline::Batch { persist, reads: Vec::new(), snapshot_reads: Vec::new(), captures: Vec::new() }
+    }
+
+    /// Appends of `bytes`, in one batch.
+    fn appends(bytes: usize) -> pipeline::Batch {
+        batch(vec![Persist::Append(vec![0; bytes])])
+    }
+
+    /// Unsynced appends are written on the node's task up to MAX_INLINE_WRITE_BYTES, counted
+    /// across batches; anything synced, bigger, read or not an append goes to a thread.
+    #[test]
+    fn only_small_unsynced_appends_are_written_inline() {
+        let small = MAX_INLINE_WRITE_BYTES / 2;
+        assert!(writes_inline(Fsync::Never, &[appends(100)]));
+        assert!(writes_inline(Fsync::Never, &[appends(small), appends(MAX_INLINE_WRITE_BYTES - small)]));
+        assert!(!writes_inline(Fsync::Never, &[appends(small), appends(MAX_INLINE_WRITE_BYTES - small + 1)]));
+        assert!(!writes_inline(Fsync::Never, &[appends(MAX_INLINE_WRITE_BYTES + 1)]));
+        assert!(!writes_inline(Fsync::EachBatch, &[appends(100)]));
+        assert!(!writes_inline(Fsync::Never, &[batch(vec![Persist::Compact { log: 1, snapshot: 1 }])]));
+        let mut read = appends(100);
+        read.reads.push(1);
+        assert!(!writes_inline(Fsync::Never, &[read]));
+        let mut snapshot_read = appends(100);
+        snapshot_read.snapshot_reads.push(SnapshotRead { index: 1, offset: 0 });
+        assert!(!writes_inline(Fsync::Never, &[snapshot_read]));
+        let mut capture = appends(100);
+        capture.captures.push(node::Capture { conn: 1, request_id: 1, to: 1 });
+        assert!(!writes_inline(Fsync::Never, &[capture]));
+    }
 
     /// Appends from several batches are written together, and a batch's read still sees every
     /// append before it, its own included.

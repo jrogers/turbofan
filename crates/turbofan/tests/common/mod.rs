@@ -138,17 +138,22 @@ impl Pause {
 impl Cluster {
     /// Three members started, and a fourth that can join.
     pub fn new(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>) -> Self {
-        Self::with(dir, tls, false)
+        Self::with(dir, tls, false, driver::Fsync::default())
+    }
+
+    /// As [`Cluster::new`], the logs never synced, as `serve --no-fsync`.
+    pub fn unsynced(dir: &Path) -> Self {
+        Self::with(dir, |_| None, false, driver::Fsync::Never)
     }
 
     /// As [`Cluster::new`], with a [`proxy::Proxy`] between the nodes, and between them and their
     /// clients: the members' peer and client addresses are the proxy's, which forwards to each
     /// node's own. Over TLS, every node's must be the same.
     pub fn proxied(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>) -> Self {
-        Self::with(dir, tls, true)
+        Self::with(dir, tls, true, driver::Fsync::default())
     }
 
-    fn with(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>, proxied: bool) -> Self {
+    fn with(dir: &Path, tls: impl Fn(NodeId) -> Option<NodeTls>, proxied: bool, fsync: driver::Fsync) -> Self {
         let addrs = ports(if proxied { 20 } else { 12 });
         let ids: Vec<NodeId> = [1, 2, 3, 4].map(NodeId).into();
         let addr = |offset: usize, id: NodeId| addrs[offset + usize::from(id) - 1];
@@ -169,6 +174,7 @@ impl Cluster {
                 config.admin_token = Some(TOKEN.to_vec());
                 config.peer_token = Some(PEER_TOKEN.to_vec());
                 config.tls = tls(id);
+                config.log_fsync = fsync;
                 config
             })
             .collect();
