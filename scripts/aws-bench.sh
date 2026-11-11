@@ -27,6 +27,9 @@
 #   RUSTFLAGS    the build's on the clients' machine. On Graviton by default -C target-feature=+lse,+crc,
 #                its atomics and CRC instructions inline, not called (~8% more writes on c9gd);
 #                on x86 none, which has both inline already. RUSTFLAGS= builds without.
+#   NIC_COALESCE_OFF  1: every machine's NIC without interrupt moderation (ethtool -C, adaptive-rx
+#                off, rx-usecs 0, tx-usecs 0; ENA's defaults are adaptive, 20 and 64 µs), its settings
+#                before and after in nic.txt. On c9gd a query on its own goes from 130 µs to 71 µs.
 #   PROFILE      1: profile every run with samply, each node and the benchmark, the build with
 #                frame pointers and line tables. Each run's profiles go beside its table
 #                (<run>-node<i>.json.gz, <run>-bench.json.gz, with their .syms.json), and its
@@ -43,6 +46,8 @@ BENCH_SECS=${BENCH_SECS:-10}
 MAX_MINUTES=${MAX_MINUTES:-180}
 RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
 PROFILE=${PROFILE:-0}
+NIC_COALESCE_OFF=${NIC_COALESCE_OFF:-0}
+[[ $NIC_COALESCE_OFF == 0 || $NIC_COALESCE_OFF == 1 ]] || { echo "NIC_COALESCE_OFF is 0 or 1" >&2; exit 2; }
 [[ $PROFILE == 0 || $PROFILE == 1 ]] || { echo "PROFILE is 0 or 1, not $PROFILE" >&2; exit 2; }
 SAMPLY_VERSION=0.13.1
 TAG=turbofan-bench
@@ -213,6 +218,20 @@ for host in "${PUBLIC[@]}"; do
     PIDS+=($!)
 done
 for pid in "${PIDS[@]}"; do wait "$pid"; done
+# Each machine's NIC interrupt moderation, recorded, and with NIC_COALESCE_OFF turned off: the NIC
+# the private addresses go out of.
+for i in "${!PUBLIC[@]}"; do
+    on "${PUBLIC[i]}" "set -e
+        dev=\$(ip -o route get ${PRIVATE[0]} | awk '{for (i = 1; i < NF; i++) if (\$i == \"dev\") print \$(i + 1)}')
+        echo \"machine $i: \$dev, \$(ethtool -i \$dev | awk '/^driver/ {print \$2}')\"
+        sudo ethtool -c \$dev | grep -E 'Adaptive|rx-usecs:|tx-usecs:'
+        if [ $NIC_COALESCE_OFF = 1 ]; then
+            sudo ethtool -C \$dev adaptive-rx off 2>/dev/null || true
+            sudo ethtool -C \$dev rx-usecs 0 tx-usecs 0
+            echo after:
+            sudo ethtool -c \$dev | grep -E 'Adaptive|rx-usecs:|tx-usecs:'
+        fi"
+done >"$OUT/nic.txt"
 git archive --format=tar HEAD | on "$CLIENT" 'mkdir -p src && tar -x -C src'
 log "building $(git rev-parse --short HEAD) on the clients' machine"
 on "$CLIENT" "set -e
@@ -365,6 +384,7 @@ done
     echo
     echo "turbofan $(git rev-parse --short HEAD), $TYPE in $AZ ($AWS_REGION), $BENCH_SECS s a run, on jemalloc."
     [[ -n $RUSTFLAGS ]] && echo && echo "RUSTFLAGS=${RUSTFLAGS% }"
+    [[ $NIC_COALESCE_OFF == 1 ]] && echo && echo "NIC interrupt moderation off (NIC_COALESCE_OFF=1)."
     if [[ $PROFILE == 1 ]]; then
         echo
         echo "Profiled (PROFILE=1), with frame pointers: a fifth to a third slower, not figures for the guide."
