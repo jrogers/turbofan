@@ -218,11 +218,11 @@ for host in "${PUBLIC[@]}"; do
     PIDS+=($!)
 done
 for pid in "${PIDS[@]}"; do wait "$pid"; done
-# Each machine's NIC interrupt moderation, recorded, and with NIC_COALESCE_OFF turned off: the NIC
-# the private addresses go out of.
+# Each machine's NIC interrupt moderation, recorded, and with NIC_COALESCE_OFF turned off: the
+# default route's, its one NIC (a route to one of its own addresses is loopback's).
 for i in "${!PUBLIC[@]}"; do
     on "${PUBLIC[i]}" "set -e
-        dev=\$(ip -o route get ${PRIVATE[0]} | awk '{for (i = 1; i < NF; i++) if (\$i == \"dev\") print \$(i + 1)}')
+        dev=\$(ip -o route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if (\$i == \"dev\") print \$(i + 1)}')
         echo \"machine $i: \$dev, \$(ethtool -i \$dev | awk '/^driver/ {print \$2}')\"
         sudo ethtool -c \$dev | grep -E 'Adaptive|rx-usecs:|tx-usecs:'
         if [ $NIC_COALESCE_OFF = 1 ]; then
