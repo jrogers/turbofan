@@ -242,10 +242,8 @@ impl Log {
         // Written a segment's run at a time, not a record: one syscall for a batch.
         let (mut at, mut run, mut count) = (0, 0, 0);
         while at < records.len() {
-            let (record, len) = Record::decode(&records[at..])
-                .ok()
-                .flatten()
-                .expect("append is given whole, valid records by the node");
+            // Whole, valid records, from the node: checked as they came in.
+            let (record, len) = Record::decode_trusted(&records[at..]);
             assert_eq!(record.index, self.next_index + count, "records must continue the log");
             if self.file_len + crate::widen(at - run) >= self.segment_bytes {
                 self.write_run(&records[run..at], count)?;

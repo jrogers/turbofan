@@ -9,8 +9,7 @@ impl Raft {
     /// [`Raft::fetch`] it.
     #[must_use]
     pub fn entry(&self, index: u64) -> Option<&[u8]> {
-        let (record, _) = Record::decode(self.record(index)?).ok().flatten().expect("records are checked");
-        Some(record.payload)
+        Some(Record::decode_trusted(self.record(index)?).0.payload)
     }
 
     /// Asks for the records from `index` on, if the log holds them only on disk: see
@@ -97,8 +96,12 @@ impl Raft {
         if expected - prev - 1 != u64::from(m.count()) {
             return None;
         }
-        for record in codec::records(m.entries()) {
-            let record = record.expect("checked above");
+        // Checked above: kept as they came, not summed again.
+        let (entries, mut at) = (m.entries(), 0);
+        while at < entries.len() {
+            let (record, len) = Record::decode_trusted(&entries[at..]);
+            let bytes = &entries[at..at + len];
+            at += len;
             if record.index < self.log.first {
                 continue;
             }
@@ -108,7 +111,7 @@ impl Raft {
                 }
                 self.truncate_from(record.index);
             }
-            self.append(record);
+            self.append(bytes.to_vec());
         }
         Some(prev + u64::from(m.count()))
     }
@@ -313,16 +316,18 @@ impl Raft {
         self.transfer.map_or(self.last_index(), |t| t.upto)
     }
 
-    pub(super) fn append(&mut self, record: Record<'_>) {
-        assert_eq!(record.index, self.last_index() + 1);
-        assert!(record.term >= self.last_term());
+    /// Appends the record `bytes` encode, checked as they came in.
+    pub(super) fn append(&mut self, bytes: Vec<u8>) {
+        let (Record { index, term, .. }, _) = Record::decode_trusted(&bytes);
+        assert_eq!(index, self.last_index() + 1);
+        assert!(term >= self.last_term());
         let configs = self.log.configs.len();
-        let bytes = self.log.push(record);
+        let bytes = self.log.push_encoded(bytes);
         match self.out.persist.last_mut() {
             Some(Persist::Append(batch)) => batch.extend_from_slice(bytes),
             _ => self.out.persist.push(Persist::Append(bytes.to_vec())),
         }
-        self.trust(record.term);
+        self.trust(term);
         if self.log.configs.len() != configs {
             self.peers_changed();
         }

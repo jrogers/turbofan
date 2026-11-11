@@ -167,6 +167,22 @@ impl<'a> Record<'a> {
     ///
     /// If its length is impossible or its checksum doesn't match.
     pub fn decode(bytes: &'a [u8]) -> Result<Option<(Self, usize)>, CodecError> {
+        Self::parse(bytes, true)
+    }
+
+    /// The record at the start of `bytes`, and how many bytes it took, where they were checked as
+    /// they came in ([`Record::decode`]): the log's own records in memory, or those the node hands
+    /// its log on disk. Their checksum isn't summed again, which on the per-entry path cost a
+    /// follower a quarter of its CPU, but in debug builds, which the tests and the simulator run.
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` don't start with a whole record.
+    pub(crate) fn decode_trusted(bytes: &'a [u8]) -> (Self, usize) {
+        Self::parse(bytes, cfg!(debug_assertions)).ok().flatten().expect("records are checked as they come in")
+    }
+
+    fn parse(bytes: &'a [u8], verify: bool) -> Result<Option<(Self, usize)>, CodecError> {
         let Some(len) = bytes.get(..4) else { return Ok(None) };
         let len = usize::try_from(u32::from_le_bytes(len.try_into().expect("four bytes"))).expect("u32 fits usize");
         if len + 4 > MAX_RECORD_BYTES {
@@ -177,7 +193,7 @@ impl<'a> Record<'a> {
         }
         let Some(record) = bytes.get(4..4 + len) else { return Ok(None) };
         let sum = u64::from_le_bytes(record[..8].try_into().expect("eight bytes"));
-        if checksum(&record[8..]) != sum {
+        if verify && checksum(&record[8..]) != sum {
             return Err(CodecError::Checksum);
         }
         let term = u64::from_le_bytes(record[8..16].try_into().expect("eight bytes"));
@@ -237,6 +253,21 @@ mod tests {
     fn the_checksum_is_crc32c_and_streams() {
         assert_eq!(checksum(b"123456789"), 0xe306_9283);
         assert_eq!(checksum_on(checksum(b"1234"), b"56789"), checksum(b"123456789"));
+    }
+
+    /// A record trusted as checked reads as decoding it does, and in debug builds, which tests
+    /// and the simulator run, one that isn't is still caught: its checksum is summed there.
+    #[test]
+    fn a_trusted_record_is_still_summed_in_debug_builds() {
+        let mut bytes = Vec::new();
+        Record { term: 2, index: 5, payload: b"entry" }.encode_into(&mut bytes);
+        let (record, len) = Record::decode_trusted(&bytes);
+        assert_eq!((record.term, record.index, record.payload, len), (2, 5, &b"entry"[..], bytes.len()));
+        *bytes.last_mut().unwrap() ^= 1;
+        assert_eq!(Record::decode(&bytes).unwrap_err(), CodecError::Checksum);
+        if cfg!(debug_assertions) {
+            assert!(std::panic::catch_unwind(|| Record::decode_trusted(&bytes)).is_err());
+        }
     }
 
     /// From a newer version: more after the message than this version knows is read past, and

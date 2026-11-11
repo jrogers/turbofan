@@ -88,6 +88,16 @@ impl Entries {
 
     /// Appends `record`, returning its bytes as stored and shipped.
     pub(super) fn push(&mut self, record: Record<'_>) -> &[u8] {
+        let mut bytes = Vec::with_capacity(codec::RECORD_HEADER + record.payload.len());
+        record.encode_into(&mut bytes);
+        self.push_encoded(bytes)
+    }
+
+    /// Appends the record `bytes` encode, which were checked as they came in, returning them:
+    /// not encoded again, which would sum their checksum again.
+    pub(super) fn push_encoded(&mut self, bytes: Vec<u8>) -> &[u8] {
+        let (record, len) = Record::decode_trusted(&bytes);
+        debug_assert_eq!(len, bytes.len(), "one record");
         assert_eq!(record.index, self.last() + 1, "records continue the log");
         if self.terms.last().is_none_or(|&(_, term)| term != record.term) {
             self.terms.push((record.index, record.term));
@@ -103,8 +113,6 @@ impl Entries {
                 .collect();
             self.configs.push((record.index, members));
         }
-        let mut bytes = Vec::with_capacity(codec::RECORD_HEADER + record.payload.len());
-        record.encode_into(&mut bytes);
         self.bytes += bytes.len();
         self.records.push_back(bytes);
         self.records.back().expect("just pushed")

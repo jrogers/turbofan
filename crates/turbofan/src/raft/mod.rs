@@ -746,7 +746,9 @@ impl Raft {
             return None;
         }
         let index = self.last_index() + 1;
-        self.append(Record { term: self.meta.term, index, payload });
+        let mut bytes = Vec::with_capacity(codec::RECORD_HEADER + payload.len());
+        Record { term: self.meta.term, index, payload }.encode_into(&mut bytes);
+        self.append(bytes);
         self.proposed_at.push_back((index, self.now, payload.len()));
         self.unpersisted.push_back((index, self.now));
         self.unapplied.push_back((index, self.now));
