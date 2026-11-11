@@ -229,12 +229,12 @@ async fn run(
             let wake = (start + Duration::from_nanos(client.next_deadline())).into();
             (sleep.deadline() != wake).then(|| sleep.as_mut().reset(wake));
             tokio::select! {
-                command = commands.recv() => match command {
-                    None => return,
-                    Some(command) => carry_out(&mut client, &mut queries, command),
-                },
+                command = commands.recv() => {
+                    let Some(command) = command else { return };
+                    carry_out_queued(&mut client, &mut queries, command, &mut commands);
+                }
                 frame = conn.frames.recv() => {
-                    if frame.is_none_or(|frame| client.on_frame(&frame).is_err()) {
+                    if !take_frames(&mut client, frame, &mut conn.frames) {
                         client.on_disconnected();
                         break;
                     }
@@ -281,6 +281,11 @@ async fn run(
     }
 }
 
+/// At most this many commands, or frames, a turn of a client's task, before what they make is
+/// written and answered: one at a time, a busy client paid a write, a flush and a wake of the
+/// writer for each.
+const MAX_TURN_INPUTS: usize = 64;
+
 /// A query's caller, by the query's ID until it's answered: dropped with the client's task, which
 /// answers it as closed.
 type Queries = BTreeMap<u64, oneshot::Sender<Result<Vec<u8>, QueryError>>>;
@@ -305,6 +310,36 @@ fn carry_out(client: &mut Client, queries: &mut Queries, command: Command) {
         },
         Command::Close => client.close(),
     }
+}
+
+/// Carries out `command`, then those queued behind it, up to [`MAX_TURN_INPUTS`].
+fn carry_out_queued(
+    client: &mut Client,
+    queries: &mut Queries,
+    command: Command,
+    commands: &mut mpsc::Receiver<Command>,
+) {
+    carry_out(client, queries, command);
+    for _ in 1..MAX_TURN_INPUTS {
+        let Ok(command) = commands.try_recv() else { return };
+        carry_out(client, queries, command);
+    }
+}
+
+/// Hands the client `frame`, then those queued behind it, up to [`MAX_TURN_INPUTS`]. False if
+/// the connection's gone, or a frame was one the client refuses.
+fn take_frames(client: &mut Client, frame: Option<Vec<u8>>, frames: &mut mpsc::Receiver<Vec<u8>>) -> bool {
+    let Some(frame) = frame else { return false };
+    if client.on_frame(&frame).is_err() {
+        return false;
+    }
+    for _ in 1..MAX_TURN_INPUTS {
+        let Ok(frame) = frames.try_recv() else { break };
+        if client.on_frame(&frame).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Hands each query answered to its caller, who may have stopped waiting.
