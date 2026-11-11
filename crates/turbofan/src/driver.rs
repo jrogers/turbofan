@@ -47,8 +47,9 @@ const MAX_QUEUED_INPUTS: usize = 4096;
 const MAX_BATCH_INPUTS: usize = 1024;
 /// The most frames a connection hands the node at once: those it has read whole, together.
 const MAX_FRAMES_AN_INPUT: usize = 256;
-/// Frames waiting to go to one peer or connection. Past this a peer's are dropped (Raft resends)
-/// and a client too slow to read is disconnected.
+/// Frames waiting to go to one peer, or sends of them to one connection, each up to a frame's
+/// limit of bytes ([`by_connection`]). Past this a peer's are dropped (Raft resends) and a client
+/// too slow to read is disconnected.
 const MAX_QUEUED_FRAMES: usize = 4096;
 /// How long to wait before dialling a peer again, doubled each time it fails, up to
 /// [`MAX_REDIAL`], and back to this once it's connected.
@@ -511,9 +512,9 @@ impl<S: Service + 'static> Core<S> {
     }
 
     fn send_clients(&mut self, sends: Vec<(ConnId, Vec<u8>)>) {
-        for (conn, frame) in sends {
+        for (conn, frames) in by_connection(sends) {
             let Some(tx) = self.conns.get(&conn) else { continue };
-            if tx.try_send(frame).is_err() {
+            if tx.try_send(frames).is_err() {
                 // Too slow to read, or gone: its task ends when its sender is dropped.
                 self.conns.remove(&conn);
                 self.node.on_disconnect(conn);
@@ -1143,6 +1144,28 @@ fn open_node<S: Service>(config: &Config, service: S) -> io::Result<(Node<S>, St
     Ok((node, storage, lock, clock))
 }
 
+/// `sends` joined by connection, each connection's frames in order, for one send on its queue
+/// rather than one a frame: a send each was a fifth of a busy leader's task, in the queue's
+/// atomics, and woke the connection's writer as often. Each joined up to a frame's limit of bytes,
+/// so that what a queue holds is bounded as it was, [`MAX_QUEUED_FRAMES`] of them.
+fn by_connection(sends: Vec<(ConnId, Vec<u8>)>) -> Vec<(ConnId, Vec<u8>)> {
+    let mut joined: Vec<(ConnId, Vec<u8>)> = Vec::new();
+    // Where each connection's latest is in `joined`.
+    let mut latest: HashMap<ConnId, usize> = HashMap::new();
+    for (conn, frame) in sends {
+        match latest.get(&conn) {
+            Some(&at) if joined[at].1.len() + frame.len() <= MAX_FRAME_BYTES => {
+                joined[at].1.extend_from_slice(&frame);
+            }
+            _ => {
+                latest.insert(conn, joined.len());
+                joined.push((conn, frame));
+            }
+        }
+    }
+    joined
+}
+
 /// Into `batch`, `first` and what else is queued, until they come to a frame's limit.
 fn gather(first: Frame, rx: &mut mpsc::Receiver<Frame>, batch: &mut Vec<Frame>) {
     batch.clear();
@@ -1219,6 +1242,21 @@ mod tests {
     /// A batch of `persist` and nothing to read.
     fn batch(persist: Vec<Persist>) -> pipeline::Batch {
         pipeline::Batch { persist, reads: Vec::new(), snapshot_reads: Vec::new(), captures: Vec::new() }
+    }
+
+    /// Interleaved connections' frames are joined by connection, each in order, and a join stops
+    /// short of a frame's limit: what follows starts the next, sent after it.
+    #[test]
+    fn client_frames_are_joined_by_connection_in_order() {
+        let sends = vec![(1, vec![1]), (2, vec![2]), (1, vec![3]), (2, vec![4]), (1, vec![5])];
+        assert_eq!(by_connection(sends), vec![(1, vec![1, 3, 5]), (2, vec![2, 4])]);
+
+        let half = MAX_FRAME_BYTES / 2;
+        let sends = vec![(1, vec![1; half]), (1, vec![2; half]), (1, vec![3]), (2, vec![4])];
+        let joined = by_connection(sends);
+        let shape: Vec<(ConnId, usize)> = joined.iter().map(|(c, b)| (*c, b.len())).collect();
+        assert_eq!(shape, vec![(1, MAX_FRAME_BYTES), (1, 1), (2, 1)]);
+        assert_eq!(joined[1].1, vec![3], "after the full one");
     }
 
     /// Appends of `bytes`, in one batch.
