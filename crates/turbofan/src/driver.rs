@@ -43,8 +43,11 @@ use crate::{snapshot, wire};
 /// Inputs waiting for the node, from clients and from the rest: past this, connections wait to
 /// hand theirs over.
 const MAX_QUEUED_INPUTS: usize = 4096;
-/// Inputs taken into one batch before persisting it, a connection's counted by its frames.
-const MAX_BATCH_INPUTS: usize = 1024;
+/// Inputs taken into one batch before persisting it, a connection's counted by its frames. What
+/// arrives meanwhile, a follower's acks among them, waits for the batch, so a smaller one is
+/// sooner sent and committed: on c9gd at 256, not 1024, writes over the network did 17-24% more
+/// at a lower p50, for a little more CPU a message on one machine, where the nodes share it.
+const MAX_BATCH_INPUTS: usize = 256;
 /// The most frames a connection hands the node at once: those it has read whole, together.
 const MAX_FRAMES_AN_INPUT: usize = 256;
 /// Frames waiting to go to one peer, or sends of them to one connection, each up to a frame's
