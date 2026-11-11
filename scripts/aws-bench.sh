@@ -196,10 +196,13 @@ CLIENT=${PUBLIC[3]}
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$OUT/known_hosts"
     -o ConnectTimeout=5 -o ServerAliveInterval=15 -o BatchMode=yes)
 on() { local host=$1; shift; "${SSH[@]}" "ubuntu@$host" "$@"; }
-# Up once cloud-init is done: until then it may restart sshd, and a first connection's success
-# doesn't last.
+# Up once cloud-init is done and a second connection works too: until then sshd may restart, and a
+# first connection's success doesn't last (it had, cloud-init said done, and the next timed out).
 for host in "${PUBLIC[@]}"; do
-    for _ in $(seq 60); do on "$host" 'cloud-init status --wait >/dev/null; true' 2>/dev/null && break; sleep 5; done
+    for _ in $(seq 60); do
+        on "$host" 'cloud-init status --wait >/dev/null; true' 2>/dev/null && on "$host" true 2>/dev/null && break
+        sleep 5
+    done
     on "$host" true
 done
 log "SSH up"
