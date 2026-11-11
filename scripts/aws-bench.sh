@@ -31,8 +31,9 @@
 #                frame pointers and line tables. Each run's profiles go beside its table
 #                (<run>-node<i>.json.gz, <run>-bench.json.gz, with their .syms.json), and its
 #                cluster's status, which names the leader (<run>-status.txt): `samply load` one,
-#                or read it as JSON. The profiler costs a few per cent: its tables aren't the
-#                guide's figures.
+#                or read it as JSON. The profiler costs a fifth to a third of the throughput
+#                (c9gd at c4d1f5f: writes 2.14M msgs/s profiled, 2.71M not; queries 2.98M, 4.35M):
+#                compare profiled runs only with each other, and never use them for the guide's figures.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -366,7 +367,7 @@ done
     [[ -n $RUSTFLAGS ]] && echo && echo "RUSTFLAGS=${RUSTFLAGS% }"
     if [[ $PROFILE == 1 ]]; then
         echo
-        echo "Profiled (PROFILE=1), with frame pointers: a few per cent slower, not figures for the guide."
+        echo "Profiled (PROFILE=1), with frame pointers: a fifth to a third slower, not figures for the guide."
     fi
     on "$CLIENT" 'echo; lscpu | grep "Model name"; uname -sr; . ~/.cargo/env && rustc --version
         lsblk -dno NAME,MODEL,SIZE | grep -v loop'
