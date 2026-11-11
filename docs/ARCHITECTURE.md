@@ -309,11 +309,12 @@ later term.
   trusting bounded clock drift, which the simulation's stepped clocks argue against. Add either if
   a service needs it.
 - **Several services per cluster.** Run one cluster per service.
-- **Fewer hops between a client and the leader.** Of a quiet cluster's 64 µs a message, about 25
+- **Fewer hops between a client and the leader.** Of a quiet cluster's 53 µs a message, about 25
   are tasks waking each other: a connection's reader and writer are tasks of their own, at both
-  ends, so a peer slow to read never stops one writing, nor one slow to write one reading. About
-  10 more are a write handed to a thread and back, on the leader and on the follower whose ack
-  commits it, so a write the disk holds up never holds up the node. Fewer would cost those.
+  ends, so a peer slow to read never stops one writing, nor one slow to write one reading. Fewer
+  would cost that. A write that syncs, or a big one, is handed to a thread and back, so a write
+  the disk holds up never holds up the node; a small one without fsync is written on the node's
+  task, which took 11 µs off a message.
 
 ## How it's tested
 

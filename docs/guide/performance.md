@@ -28,9 +28,11 @@ commit. The busier the cluster, the bigger the batches.
 - **fsync.** By default every batch waits for the disk: on a local NVMe drive a little, on
   network storage a lot. With `--no-fsync`, a write is the page cache's, and the follower's copy
   is the redundancy (see [Running a cluster][running]). Choose with the benchmark on your
-  hardware. Either way, a write is made on a thread of its own, the node going on meanwhile, so
-  a write the disk holds up (Linux throttles writers when too much is waiting to be written back)
-  never holds up the node's heartbeats, and with them the cluster's leader.
+  hardware. A write that syncs, or a big one, is made on a thread of its own, the node going on
+  meanwhile, so a write the disk holds up (Linux throttles writers when too much is waiting to be
+  written back) doesn't hold up the node's heartbeats, and with them the cluster's leader. Without
+  fsync, a batch of appends up to 4 KiB is written on the node's own task, quicker than waking a
+  thread for it; the log is synced behind the writes, every 4 MiB, so little is ever waiting.
 - **The service.** Every message is applied on every node, one at a time, on the node's one task.
   A slow callback holds up everything after it. Keep callbacks to the state change and the
   responses; work that can wait goes in a proposal of its own, and work outside the state machine
@@ -139,7 +141,7 @@ Throughput, messages and queries a second, varies by a few per cent from one run
 message on its own doesn't: it's a round trip over the network, client to leader and leader to
 follower, and that depends on where the placement group lands. On `c9gd` its p50 was 83 µs, 130 µs and
 261 µs in the three runs, steady within each; on `c8id`, 326 µs every time, with a long tail
-(p99 642 µs). The Mac's 64 µs (below) is over loopback.
+(p99 642 µs). The Mac's 53 µs (below) is over loopback.
 
 A sync on the instances' NVMe drives takes about a tenth of a millisecond, where the Mac's
 `F_FULLFSYNC` took milliseconds: fsync costs a tenth of the throughput, where on the Mac it cost
@@ -153,14 +155,14 @@ its 8 vCPUs, as on the Mac (12 cores):
 
 | run, one machine | `c6id` | `c8id` | `c9gd` | Mac mini, M4 Pro |
 |---|---:|---:|---:|---:|
-| throughput, in memory | 213,606 | 318,156 | 379,289 | 499,097 |
-| latency, 1 × 1 (p50) | 82 µs | 75 µs | 40 µs | 64 µs |
-| throughput, 8 × 256 | 791,108 | 1,130,083 | 1,558,024 | 1,198,294 |
-| query throughput | 1,871,507 | 2,390,634 | 3,560,196 | 2,830,641 |
-| latency, fsync (p50) | 194 µs | 207 µs | 83 µs | 7.84 ms |
+| throughput, in memory | 213,606 | 318,156 | 379,289 | 536,371 |
+| latency, 1 × 1 (p50) | 82 µs | 75 µs | 40 µs | 53 µs |
+| throughput, 8 × 256 | 791,108 | 1,130,083 | 1,558,024 | 1,177,211 |
+| query throughput | 1,871,507 | 2,390,634 | 3,560,196 | 3,039,131 |
+| latency, fsync (p50) | 194 µs | 207 µs | 83 µs | 8.00 ms |
 
-The core alone, `in memory`, on one thread, follows each CPU's speed on one core: Graviton5 is three
-quarters of the M4's, the newest Xeon two thirds, Ice Lake under half. Over TCP Graviton5 passes
+The core alone, `in memory`, on one thread, follows each CPU's speed on one core: Graviton5 is
+seven tenths of the M4's, the newest Xeon three fifths, Ice Lake two fifths. Over TCP Graviton5 passes
 the Mac, Linux's loopback and wake-ups being cheaper than macOS's. With the clients on a machine
 of their own, the Xeons' nodes go faster again; Graviton5's don't, already as fast sharing it.
 
@@ -171,25 +173,25 @@ twice the queries'.
 ### On a Mac
 
 On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2, Rust 1.98.1, at
-commit `93195a5` (0.10.0), November 2026. Each figure is the median of three runs of 10 s,
+commit `50418c5` (after 0.12.0), November 2026. Each figure is the median of three runs of 10 s,
 `--features tls`.
 
 | run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
 |---|---|---:|---:|---:|---:|
-| latency, in memory | 1 × 1 | 433,625 | 2 µs | 2 µs | 2 µs |
-| throughput, in memory | 8 × 256 | 499,097 | 3.83 ms | 11.98 ms | 12.82 ms |
-| latency | 1 × 1 | 14,956 | 64 µs | 101 µs | 131 µs |
-| throughput | 8 × 256 | 1,198,294 | 894 µs | 7.95 ms | 10.73 ms |
-| query latency | 1 × 1 | 22,650 | 44 µs | 61 µs | 109 µs |
-| query throughput | 8 × 256 | 2,830,641 | 706 µs | 1.17 ms | 1.43 ms |
-| latency, fsync | 1 × 1 | 125 | 7.84 ms | 14.02 ms | 16.10 ms |
-| throughput, fsync | 8 × 256 | 114,939 | 17.76 ms | 31.96 ms | 38.17 ms |
-| latency, TLS | 1 × 1 | 14,436 | 66 µs | 105 µs | 137 µs |
-| throughput, TLS | 8 × 256 | 1,170,253 | 919 µs | 8.09 ms | 11.17 ms |
-| query latency, TLS | 1 × 1 | 22,713 | 43 µs | 61 µs | 112 µs |
-| query throughput, TLS | 8 × 256 | 2,721,277 | 735 µs | 1.21 ms | 1.48 ms |
-| latency, TLS, fsync | 1 × 1 | 128 | 7.89 ms | 13.97 ms | 16.09 ms |
-| throughput, TLS, fsync | 8 × 256 | 113,730 | 17.94 ms | 32.29 ms | 38.20 ms |
+| latency, in memory | 1 × 1 | 448,573 | 2 µs | 2 µs | 2 µs |
+| throughput, in memory | 8 × 256 | 536,371 | 3.64 ms | 9.00 ms | 9.40 ms |
+| latency | 1 × 1 | 18,238 | 53 µs | 78 µs | 135 µs |
+| throughput | 8 × 256 | 1,177,211 | 867 µs | 8.15 ms | 11.55 ms |
+| query latency | 1 × 1 | 22,537 | 44 µs | 61 µs | 109 µs |
+| query throughput | 8 × 256 | 3,039,131 | 655 µs | 1.11 ms | 1.34 ms |
+| latency, fsync | 1 × 1 | 120 | 8.00 ms | 14.09 ms | 16.78 ms |
+| throughput, fsync | 8 × 256 | 115,272 | 17.85 ms | 29.92 ms | 41.33 ms |
+| latency, TLS | 1 × 1 | 16,979 | 57 µs | 83 µs | 143 µs |
+| throughput, TLS | 8 × 256 | 1,187,430 | 864 µs | 8.40 ms | 12.36 ms |
+| query latency, TLS | 1 × 1 | 22,732 | 43 µs | 62 µs | 115 µs |
+| query throughput, TLS | 8 × 256 | 2,880,027 | 691 µs | 1.17 ms | 1.43 ms |
+| latency, TLS, fsync | 1 × 1 | 125 | 7.93 ms | 14.03 ms | 16.13 ms |
+| throughput, TLS, fsync | 8 × 256 | 113,817 | 17.93 ms | 30.00 ms | 38.04 ms |
 
 Without fsync, a message is committed in tens of microseconds, and no one task is busy: the
 throughput run is bound by its own window, 2,048 messages in flight over a round trip of about a
@@ -201,13 +203,13 @@ the most from one to the next. Group commit is why throughput with fsync is stil
 second: each sync covers every message that arrived during the one before. A Linux server's NVMe
 drive syncs much faster (above); measure yours.
 
-A query skips the write, so one on its own takes two thirds of a message's time, and with many in
-flight they go more than twice as fast as messages: 2.8 million a second.
+A query skips the write, so one on its own takes four fifths of a message's time, and with many in
+flight they go more than twice as fast as messages: 3.0 million a second.
 
-The core alone, the `in memory` runs: 433,625 messages a second one at a time, a commit through
-all three nodes in 2 µs at p50, and 499,097 a second at 8 × 256, on its one thread (openraft's
+The core alone, the `in memory` runs: 448,573 messages a second one at a time, a commit through
+all three nodes in 2 µs at p50, and 536,371 a second at 8 × 256, on its one thread (openraft's
 benchmark, on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without
-fsync, nearly all of a message's 64 µs on its own over TCP is the driver's and the loopback's,
+fsync, nearly all of a message's 53 µs on its own over TCP is the driver's and the loopback's,
 not the core's.
 
 [clients]: clients.md
