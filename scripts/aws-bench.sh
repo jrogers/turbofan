@@ -24,6 +24,9 @@
 #   AZ           a zone that offers TYPE, should one be out of capacity (us-east-1b)
 #   BENCH_SECS   10                  MAX_MINUTES  180
 #   RUNS         the runs above, or some of them, space-separated
+#   RUSTFLAGS    the build's on the clients' machine. On Graviton by default -C target-feature=+lse,+crc,
+#                its atomics and CRC instructions inline, not called (~8% more writes on c9gd);
+#                on x86 none, which has both inline already. RUSTFLAGS= builds without.
 #   PROFILE      1: profile every run with samply, each node and the benchmark, the build with
 #                frame pointers and line tables. Each run's profiles go beside its table
 #                (<run>-node<i>.json.gz, <run>-bench.json.gz, with their .syms.json), and its
@@ -40,10 +43,6 @@ MAX_MINUTES=${MAX_MINUTES:-180}
 RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
 PROFILE=${PROFILE:-0}
 [[ $PROFILE == 0 || $PROFILE == 1 ]] || { echo "PROFILE is 0 or 1, not $PROFILE" >&2; exit 2; }
-# The clients' machine's builds: with PROFILE, stacks samply can walk and name. The same for
-# every cargo command there, else it rebuilds without.
-CARGO_ENV=''
-[[ $PROFILE == 1 ]] && CARGO_ENV="RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
 SAMPLY_VERSION=0.13.1
 TAG=turbofan-bench
 HOME_DIR=/home/ubuntu
@@ -141,6 +140,15 @@ ARCH=$(aws ec2 describe-instance-types --instance-types "$TYPE" \
     --query 'InstanceTypes[0].ProcessorInfo.SupportedArchitectures[0]' --output text)
 [[ $ARCH == x86_64 ]] && ARCH=amd64
 AMI=resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/$ARCH/hvm/ebs-gp3/ami-id
+# The build's flags, for the architecture: unset, Graviton's instructions, which every Graviton
+# since the second has. With PROFILE, stacks samply can walk and name; the same for every cargo
+# command there, else it rebuilds without.
+[[ $ARCH == arm64 ]] && RUSTFLAGS=${RUSTFLAGS--C target-feature=+lse,+crc}
+RUSTFLAGS=${RUSTFLAGS:-}
+[[ $PROFILE == 1 ]] && RUSTFLAGS="-C force-frame-pointers=yes $RUSTFLAGS"
+CARGO_ENV=''
+[[ -n $RUSTFLAGS ]] && CARGO_ENV="RUSTFLAGS='${RUSTFLAGS% }'"
+[[ $PROFILE == 1 ]] && CARGO_ENV+=" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
 MY_IP=$(curl -fsS https://checkip.amazonaws.com)
 log "$RUN: 4 × $TYPE in $AZ, SSH from $MY_IP"
 
@@ -264,7 +272,7 @@ bench() {
             --save-only --unstable-presymbolicate -o $profile -- \
             \$(ls -t ../../target/release/deps/cluster-* | grep -v '\.d\$' | head -1) --bench"
     else
-        echo ". ~/.cargo/env && cd src && $envs cargo bench -q -p turbofan --bench cluster --features tls"
+        echo ". ~/.cargo/env && cd src ${CARGO_ENV:+&& export $CARGO_ENV} && $envs cargo bench -q -p turbofan --bench cluster --features tls"
     fi
 }
 
@@ -355,6 +363,7 @@ done
     echo "# $RUN"
     echo
     echo "turbofan $(git rev-parse --short HEAD), $TYPE in $AZ ($AWS_REGION), $BENCH_SECS s a run, on jemalloc."
+    [[ -n $RUSTFLAGS ]] && echo && echo "RUSTFLAGS=${RUSTFLAGS% }"
     if [[ $PROFILE == 1 ]]; then
         echo
         echo "Profiled (PROFILE=1), with frame pointers: a few per cent slower, not figures for the guide."
