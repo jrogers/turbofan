@@ -135,6 +135,10 @@ impl Pipeline {
         if waiting.iter().any(|w| w.restore.is_some()) {
             node.restore(from.expect("the snapshot to restore from"))?;
             self.restore_waits = false;
+            // Batches taken since carry the same restore: it's done.
+            for (_, waiting) in &mut self.queued {
+                waiting.restore = None;
+            }
         }
         node.on_persisted(waiting.last().expect("a write has batches").log_end, now);
         Ok(waiting.into_iter().flat_map(|w| w.peer_sends).collect())

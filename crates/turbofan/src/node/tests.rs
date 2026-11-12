@@ -727,6 +727,31 @@ fn a_snapshot_restores_the_whole_state_as_it_was_taken() {
     assert_eq!(restored.service.0, service);
 }
 
+/// Outputs taken while the write that restores is under way (a stop, say) restore nothing more
+/// once it's done.
+#[test]
+fn a_restore_is_done_once_however_often_outputs_are_taken_meanwhile() {
+    let mut node = leader();
+    node.take_snapshot();
+    let save = node.take_outputs().save.unwrap();
+    let (index, term, members) = (save.index, save.term, save.members.clone());
+    let bytes = written(save);
+    let snapshot = Snapshot { index, term, len: crate::widen(bytes.len()), checksum: 0, members };
+    let config = node.config.clone();
+    let mut node = Node::new(config, Recorder::default(), Meta::default(), Some(snapshot), Entries::default(), 0);
+
+    let mut pipeline = crate::pipeline::Pipeline::default();
+    assert!(pipeline.take(&mut node).write.is_some());
+    assert!(pipeline.take(&mut node).write.is_none(), "queued behind the write under way");
+    assert_eq!(pipeline.restore(), Some(index));
+    pipeline.written(&mut node, &[], &[], Some(&mut &bytes[..]), 0).unwrap();
+    assert!(pipeline.takes_inputs());
+
+    assert!(pipeline.take(&mut node).write.is_some(), "the queued batch");
+    assert_eq!(pipeline.restore(), None);
+    pipeline.written(&mut node, &[], &[], None, 0).unwrap();
+}
+
 /// A snapshot cut short anywhere is refused, never misread or a panic.
 #[test]
 fn a_truncated_snapshot_is_refused() {
