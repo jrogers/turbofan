@@ -30,16 +30,17 @@
 #   NIC_COALESCE_OFF  1: every machine's NIC without interrupt moderation (ethtool -C, adaptive-rx
 #                off, rx-usecs 0, tx-usecs 0; ENA's defaults are adaptive, 20 and 64 µs), its settings
 #                before and after in nic.txt. On c9gd a query on its own goes from 130 µs to 71 µs.
-#   PIN          1: on every machine the interrupts on CPU 0 (irqbalance stopped), and the nodes and
-#                the benchmark on the other CPUs, away from them; 0 (the default) leaves both to the
-#                kernel and irqbalance. "0 1": each run both ways, in turn. Turbojet's tokio driver's
-#                p99 halved so between two c9gd machines.
-#   BUSY_POLL    µs the kernel busy-polls the NIC for a socket with nothing to read
+#   PIN          1 (the default): on every machine the interrupts on CPU 0 (irqbalance stopped), and
+#                the nodes and the benchmark on the other CPUs, away from them; 0 leaves both to the
+#                kernel and irqbalance. "0 1": each run both ways, in turn.
+#   BUSY_POLL    50 (the default): µs the kernel busy-polls the NIC for a socket with nothing to read
 #                (net.core.busy_poll, for epoll, as tokio waits; net.core.busy_read), on every
-#                machine; 0 (the default) none. Several, space-separated: each run with each.
+#                machine; 0 none. Several, space-separated: each run with each. With PIN, on c9gd,
+#                8 µs off a request on its own and 3 to 5% more a second (the guide's chapter).
+#                PIN=0 BUSY_POLL=0 leaves the machines as they started.
 #   ROUNDS       1: how many times the runs go round, every PIN and BUSY_POLL in turn each time, so
 #                that they're compared on one cluster, interleaved. A run's table is <run>.md, with
-#                -pin, -bp<µs> and -r<round> when they apply.
+#                -pin, -bp<µs> and -r<round> where PIN, BUSY_POLL or ROUNDS has several.
 #   PROFILE      1: profile every run with samply, each node and the benchmark, the build with
 #                frame pointers and line tables. Each run's profiles go beside its table
 #                (<run>-node<i>.json.gz, <run>-bench.json.gz, with their .syms.json), and its
@@ -57,7 +58,7 @@ MAX_MINUTES=${MAX_MINUTES:-180}
 RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
 PROFILE=${PROFILE:-0}
 NIC_COALESCE_OFF=${NIC_COALESCE_OFF:-0}
-PIN=${PIN:-0} BUSY_POLL=${BUSY_POLL:-0} ROUNDS=${ROUNDS:-1}
+PIN=${PIN:-1} BUSY_POLL=${BUSY_POLL:-50} ROUNDS=${ROUNDS:-1}
 for pin in $PIN; do [[ $pin == 0 || $pin == 1 ]] || { echo "PIN is 0, 1 or both, not $pin" >&2; exit 2; }; done
 for us in $BUSY_POLL; do [[ $us =~ ^[0-9]+$ ]] || { echo "BUSY_POLL is in µs, not $us" >&2; exit 2; }; done
 [[ $ROUNDS =~ ^[1-9][0-9]*$ ]] || { echo "ROUNDS is a count, not $ROUNDS" >&2; exit 2; }
@@ -433,8 +434,8 @@ for round in $(seq "$ROUNDS"); do
             [[ $PIN$BUSY_POLL == 00 ]] || tune "$pin" "$us"
             for run in $RUNS; do
                 name=$run
-                [[ $pin == 1 ]] && name+=-pin
-                [[ $BUSY_POLL != 0 ]] && name+=-bp$us
+                [[ $PIN == *' '* && $pin == 1 ]] && name+=-pin
+                [[ $BUSY_POLL == *' '* ]] && name+=-bp$us
                 [[ $ROUNDS -gt 1 ]] && name+=-r$round
                 one "$run" "$name"
                 NAMES+=("$name")

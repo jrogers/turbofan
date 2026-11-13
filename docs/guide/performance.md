@@ -47,7 +47,7 @@ commit. The busier the cluster, the bigger the batches.
   `c9gd` (fe7346b, two rounds each): 75 µs to 67 µs p50 a message on its own, p99 89 µs to 79 µs;
   2.79 to 2.92 million messages a second, synced 2.75 to 2.85 million; queries 4.66 million to
   4.73 million. Pinning alone gives the throughput but not the latency. `scripts/aws-bench.sh` does
-  them with `PIN=1 BUSY_POLL=50`.
+  both by default (`PIN=0 BUSY_POLL=0` leaves them).
 - **fsync.** By default every batch waits for the disk: on a local NVMe drive a little, on
   network storage a lot. With `--no-fsync`, a write is the page cache's, and the follower's copy
   is the redundancy (see [Running a cluster][running]). Choose with the benchmark on your
