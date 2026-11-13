@@ -847,6 +847,40 @@ fn an_ack_of_an_older_snapshot_is_not_counted() {
     assert_eq!(acked(&rafts[0]), Some((10, 40)));
 }
 
+/// An ack from before the peer restarted, delayed past its restart, says it has more than it
+/// does: its acks since, behind that, look stale. Once it makes no progress for a heartbeat, the
+/// leader sends again from what its latest ack said, not the most it acked.
+#[test]
+fn an_ack_from_before_a_restart_does_not_stall_a_snapshot() {
+    let snapshot = Snapshot { index: 10, term: 1, len: 100, checksum: 0, members: vec![member(1), member(2)] };
+    let mut rafts = vec![
+        Raft::new(config(1, &[1, 2]), Meta { term: 1, vote: None }, Some(snapshot), Entries::default(), 0),
+        Raft::new(config(2, &[1, 2]), Meta::default(), None, Entries::default(), 0),
+    ];
+    let now = 1000 * MS;
+    elect(&mut rafts, &[1, 2], 1, now);
+    rafts[0].on_tick(now);
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2], 1, sends, now);
+    let acked = |raft: &Raft| raft.peers[0].sending.map(|s| s.acked);
+    let ack = |raft: &mut Raft, offset| {
+        let mut frame = Vec::new();
+        codec::encode_frame(&wire::SnapshotAck { term: raft.term(), offset, index: 10 }, &mut frame).unwrap();
+        raft.on_message(NodeId(2), &decode(&frame), now);
+    };
+    ack(&mut rafts[0], 40);
+    ack(&mut rafts[0], 80);
+    ack(&mut rafts[0], 40);
+    assert_eq!(acked(&rafts[0]), Some(80), "the stale ack counted");
+    // The first heartbeat sees the progress the stale ack made; the next, none since.
+    for _ in 0..2 {
+        let at = rafts[0].next_deadline();
+        rafts[0].on_tick(at);
+        flush(&mut rafts[0]);
+    }
+    assert_eq!(acked(&rafts[0]), Some(40), "sent again from what it last said");
+}
+
 fn ids(members: &[Member]) -> Vec<u8> {
     members.iter().map(|m| m.id.0).collect()
 }

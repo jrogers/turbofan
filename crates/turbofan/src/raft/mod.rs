@@ -448,8 +448,11 @@ struct CatchUp {
 struct Sending {
     /// Which, by index.
     index: u64,
-    /// How much of it the peer has, as it last said.
+    /// The most it has acked: how much of it the peer has, unless it restarted since.
     acked: u64,
+    /// What its latest ack said it has: less than `acked` if that ack was stale, or if one from
+    /// before it restarted, delayed, overtook its acks since.
+    heard: u64,
     /// How much has been sent it.
     sent: u64,
     /// It acked more since the last heartbeat.

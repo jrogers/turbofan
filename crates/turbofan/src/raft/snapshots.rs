@@ -71,17 +71,21 @@ impl Raft {
 
     /// A heartbeat, or a refused append, for a peer behind the snapshot: starts sending it the
     /// snapshot, or, if it acked nothing since the last heartbeat (a chunk was lost), sends again
-    /// from what it has.
+    /// from what its latest ack said it has. Not from the most it acked: that may be an ack from
+    /// before it restarted, delayed, and the acks it sends since, behind it, are taken as stale.
     pub(super) fn resume_snapshot(&mut self, peer: usize) {
         let index = self.snapshot.as_ref().expect("a log that starts past 1 has a snapshot").index;
         match &mut self.peers[peer].sending {
             Some(s) if s.index == index => {
                 if !s.progressed {
+                    s.acked = s.acked.min(s.heard);
                     s.sent = s.acked;
                 }
                 s.progressed = false;
             }
-            sending => *sending = Some(Sending { index, acked: 0, sent: 0, progressed: false, rewound: None }),
+            sending => {
+                *sending = Some(Sending { index, acked: 0, heard: 0, sent: 0, progressed: false, rewound: None })
+            }
         }
         self.send_snapshot_chunks(peer);
     }
@@ -147,6 +151,7 @@ impl Raft {
         // An ack of a snapshot this leader has moved on from says nothing of how much the peer has
         // of this one.
         let Some(s) = self.peers[peer].sending.as_mut().filter(|s| s.index == m.index()) else { return };
+        s.heard = m.offset();
         if m.offset() > s.acked {
             s.acked = m.offset();
             s.sent = s.sent.max(s.acked);
