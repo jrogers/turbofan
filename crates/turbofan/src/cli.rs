@@ -145,7 +145,6 @@ an operator's command, over TLS: [--tls-ca <pem> [--tls-cert <pem> --tls-key <pe
 
 /// Runs the command line for a node of `service`, which serves cluster `service_id`, with
 /// [`NodeConfig::new`](crate::NodeConfig::new)'s defaults: [`run_with`] to change them.
-#[must_use]
 pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
     run_with(service_id, service, |_| {})
 }
@@ -157,7 +156,6 @@ pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
 ///
 /// [`NodeConfig::session_timeout`]: crate::NodeConfig::session_timeout
 /// [`NodeConfig::egress_ring_entries`]: crate::NodeConfig::egress_ring_entries
-#[must_use]
 pub fn run_with<S: Service + 'static>(
     service_id: u32,
     service: S,
