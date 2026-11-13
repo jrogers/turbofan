@@ -23,7 +23,6 @@ cast_possible_wrap = "warn"
 cast_lossless = "warn"
 
 [workspace.dependencies]
-turbofan = { path = "crates/turbofan", version = "0.12.1" }
 # The SBE runtime the generated codecs call, and the generator their build.rs runs.
 turbofan-sbe = { path = "crates/turbofan-sbe", version = "0.12.1" }
 roxmltree = "0.21"

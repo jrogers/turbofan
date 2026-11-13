@@ -2420,8 +2420,8 @@ impl Sim {
     /// The standby, a learner, is cut off from the cluster: it falls behind.
     fn cut_standby(&mut self) {
         let standby = self.disaster.as_ref().unwrap().standby;
-        for from in 0..8 {
-            self.cut[from][usize::from(standby)] = true;
+        for row in &mut self.cut {
+            row[usize::from(standby)] = true;
         }
     }
 
