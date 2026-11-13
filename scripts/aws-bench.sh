@@ -27,9 +27,10 @@
 #   RUSTFLAGS    the build's on the clients' machine. On Graviton by default -C target-feature=+lse,+crc,
 #                its atomics and CRC instructions inline, not called (~8% more writes on c9gd);
 #                on x86 none, which has both inline already. RUSTFLAGS= builds without.
-#   NIC_COALESCE_OFF  1: every machine's NIC without interrupt moderation (ethtool -C, adaptive-rx
+#   NIC_COALESCE_OFF  1 (the default): every machine's NIC without interrupt moderation (ethtool -C, adaptive-rx
 #                off, rx-usecs 0, tx-usecs 0; ENA's defaults are adaptive, 20 and 64 µs), its settings
-#                before and after in nic.txt. On c9gd a query on its own goes from 130 µs to 71 µs.
+#                before and after in nic.txt. On c9gd a query on its own goes from 130 µs to 71 µs. 0 leaves
+#                the NIC's own.
 #   PIN          1 (the default): on every machine the interrupts on CPU 0 (irqbalance stopped), and
 #                the nodes and the benchmark on the other CPUs, away from them; 0 leaves both to the
 #                kernel and irqbalance. "0 1": each run both ways, in turn.
@@ -57,7 +58,7 @@ BENCH_SECS=${BENCH_SECS:-10}
 MAX_MINUTES=${MAX_MINUTES:-180}
 RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
 PROFILE=${PROFILE:-0}
-NIC_COALESCE_OFF=${NIC_COALESCE_OFF:-0}
+NIC_COALESCE_OFF=${NIC_COALESCE_OFF:-1}
 PIN=${PIN:-1} BUSY_POLL=${BUSY_POLL:-50} ROUNDS=${ROUNDS:-1}
 for pin in $PIN; do [[ $pin == 0 || $pin == 1 ]] || { echo "PIN is 0, 1 or both, not $pin" >&2; exit 2; }; done
 for us in $BUSY_POLL; do [[ $us =~ ^[0-9]+$ ]] || { echo "BUSY_POLL is in µs, not $us" >&2; exit 2; }; done

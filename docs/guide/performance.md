@@ -36,7 +36,7 @@ commit. The busier the cluster, the bigger the batches.
   sudo ethtool -C ens5 adaptive-rx off rx-usecs 0 tx-usecs 0   # its name: ip route get <a peer>
   ```
 
-  Measure it with your load. `scripts/aws-bench.sh` does this with `NIC_COALESCE_OFF=1`.
+  Measure it with your load. `scripts/aws-bench.sh` does this by default (`NIC_COALESCE_OFF=0` leaves it).
 - **Interrupts, pinning and busy polling, on Linux.** With moderation off, two more settings on
   every node, together. Busy polling (`sysctl net.core.busy_poll=50 net.core.busy_read=50`, in
   µs) has a thread waiting on its sockets poll the NIC for a while before it sleeps, rather than
