@@ -37,6 +37,17 @@ commit. The busier the cluster, the bigger the batches.
   ```
 
   Measure it with your load. `scripts/aws-bench.sh` does this with `NIC_COALESCE_OFF=1`.
+- **Interrupts, pinning and busy polling, on Linux.** With moderation off, two more settings on
+  every node, together. Busy polling (`sysctl net.core.busy_poll=50 net.core.busy_read=50`, in
+  µs) has a thread waiting on its sockets poll the NIC for a while before it sleeps, rather than
+  wait for an interrupt: a message or a query on its own takes about 8 µs less, a tenth. On its own
+  it costs a tenth of the queries a second, its polling taking CPU the node needed; with the NIC's
+  interrupts on one CPU (`irqbalance` stopped, `0` written to each `/proc/irq/*/smp_affinity_list`)
+  and the node on the others (`taskset -c 1-7` on 8 vCPUs), it costs none. On one cluster of
+  `c9gd` (fe7346b, two rounds each): 75 µs to 67 µs p50 a message on its own, p99 89 µs to 79 µs;
+  2.79 to 2.92 million messages a second, synced 2.75 to 2.85 million; queries 4.66 million to
+  4.73 million. Pinning alone gives the throughput but not the latency. `scripts/aws-bench.sh` does
+  them with `PIN=1 BUSY_POLL=50`.
 - **fsync.** By default every batch waits for the disk: on a local NVMe drive a little, on
   network storage a lot. With `--no-fsync`, a write is the page cache's, and the follower's copy
   is the redundancy (see [Running a cluster][running]). Choose with the benchmark on your

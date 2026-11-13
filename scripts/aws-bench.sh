@@ -318,9 +318,9 @@ tune() {
             fi
             for irq in /proc/irq/[0-9]*; do echo \$cpus | sudo tee \$irq/smp_affinity_list >/dev/null 2>&1 || true; done
             [ $pin = 1 ] || sudo systemctl start irqbalance 2>/dev/null || true
-            echo \"\$(hostname): pin $pin, busy_poll \$(sysctl -n net.core.busy_poll), busy_read \$(sysctl -n net.core.busy_read), \
-                the NIC's interrupts on \$(grep -E 'ena|Tx-Rx' /proc/interrupts | awk '{sub(\":\", \"\", \$1); print \$1}' |
-                    while read -r irq; do cat /proc/irq/\$irq/effective_affinity_list; done | sort -u | tr '\\n' ' ')\""
+            nic=\$(grep -E 'ena|Tx-Rx' /proc/interrupts | awk '{sub(\":\", \"\", \$1); print \$1}' |
+                while read -r irq; do cat /proc/irq/\$irq/effective_affinity_list; done | sort -u | tr '\\n' ' ')
+            echo \"\$(hostname): pin $pin, busy_poll \$(sysctl -n net.core.busy_poll), busy_read \$(sysctl -n net.core.busy_read), the NIC's interrupts on \$nic\""
     done >>"$OUT/tuning.txt"
     PINNED=''
     [[ $pin == 1 ]] && PINNED='taskset -c 1-$(($(nproc --all) - 1))'
