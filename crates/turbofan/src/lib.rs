@@ -39,6 +39,7 @@ pub mod client;
 // The cluster's framing, for the simulation, the fuzz targets and the tests: not part of the API.
 #[doc(hidden)]
 pub mod codec;
+mod drive_flush;
 pub mod driver;
 pub mod metrics;
 mod remote;

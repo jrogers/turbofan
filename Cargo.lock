@@ -667,6 +667,7 @@ dependencies = [
  "crc32c",
  "metrics",
  "rcgen",
+ "rustix",
  "socket2",
  "tempfile",
  "tokio",

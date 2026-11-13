@@ -25,6 +25,10 @@ tokio.workspace = true
 tokio-rustls = { workspace = true, optional = true }
 turbofan-sbe.workspace = true
 
+# macOS: a plain fsync, and one F_FULLFSYNC shared by the logs syncing at once (src/drive_flush.rs).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rustix.workspace = true
+
 [features]
 # TLS on the listeners and to peers (`tls`): rustls on ring, whose licences (ISC, BSD-3-Clause)
 # a service that doesn't use it needn't take on. Without it, plain TCP, and TLS configuration is

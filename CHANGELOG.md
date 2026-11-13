@@ -4,6 +4,16 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Changed
+
+- On macOS, nodes on one drive share its flushes: a log's sync `fsync`s its own file, then waits
+  for one `F_FULLFSYNC` started after that, issued by whichever finds none running, where each
+  issued its own and they ran one after another. On an Apple Mac, three nodes on one machine with
+  fsync: a message on its own 11.9 ms → 8.2 ms p50, and 100,000 → 116,000 to 122,000 messages a
+  second. Elsewhere a sync is still `fdatasync`.
+
 ## 0.12.1 (2026-11-11)
 
 ### Changed

@@ -35,6 +35,8 @@ crc32c = "0.6"
 metrics = "0.24"
 # Keepalive and TCP_USER_TIMEOUT, which tokio's TcpStream doesn't set: already tokio's own.
 socket2 = { version = "0.6", features = ["all"] }
+# macOS: a plain fsync, and one F_FULLFSYNC shared by the logs syncing at once (drive_flush.rs).
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 # TLS, optional, on all three listeners: rustls on ring, so no C toolchain beyond a compiler.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 # Certificates for the TLS tests.

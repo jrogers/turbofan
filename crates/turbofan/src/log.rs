@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use crate::codec::{CodecError, MAX_RECORD_BYTES, Record};
+use crate::drive_flush::DriveFlush;
 use crate::raft::Entries;
 
 /// A segment is closed and a new one started once it holds this much.
@@ -57,6 +58,8 @@ pub struct Log {
     segment_bytes: u64,
     /// Syncs are made: with [`Fsync::EachBatch`], never simulated.
     sync: bool,
+    /// How a sync of the segment being appended to is made, when `sync`.
+    flush: DriveFlush,
     /// A damaged tail was truncated, and the log hasn't been trusted since.
     doubt: bool,
     /// The index the next record must have.
@@ -153,6 +156,7 @@ impl Log {
             file_len,
             segment_bytes,
             sync,
+            flush: DriveFlush::for_dir(dir)?,
             doubt,
             next_index,
             dir_dirty: false,
@@ -345,7 +349,7 @@ impl Log {
         if !self.sync {
             return Ok(());
         }
-        self.file.sync_data()?;
+        self.flush.sync_data(&self.file)?;
         if self.dir_dirty {
             sync_dir(&self.dir)?;
             self.dir_dirty = false;
@@ -475,7 +479,7 @@ impl Log {
 
     fn roll(&mut self, first: u64) -> io::Result<()> {
         if self.sync {
-            self.file.sync_data()?;
+            self.flush.sync_data(&self.file)?;
         }
         self.file = OpenOptions::new().create_new(true).write(true).open(segment_path(&self.dir, first))?;
         self.segments.push(first);

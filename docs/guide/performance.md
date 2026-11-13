@@ -233,7 +233,9 @@ millisecond. More in flight goes faster (at `cf027a9`): 1,375,000 a second with 
 (`BENCH_THROUGHPUT=8x1024`), and 1,145,000 with 64 of 256. TLS costs little, its connections
 buffered as plain TCP's are. With fsync, the disk is what limits it: on macOS a sync is
 `F_FULLFSYNC`, which empties the drive's own cache, some milliseconds each, and its runs vary
-the most from one to the next. Group commit is why throughput with fsync is still over 100,000 a
+the most from one to the next. Nodes on one drive share those flushes (after 0.12.1): each log
+`fsync`s its own file, then waits for one flush started after that, rather than each flushing in
+turn. Group commit is why throughput with fsync is still over 100,000 a
 second: each sync covers every message that arrived during the one before. A Linux server's NVMe
 drive syncs much faster (above); measure yours.
 
