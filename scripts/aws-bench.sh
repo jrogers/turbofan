@@ -30,6 +30,16 @@
 #   NIC_COALESCE_OFF  1: every machine's NIC without interrupt moderation (ethtool -C, adaptive-rx
 #                off, rx-usecs 0, tx-usecs 0; ENA's defaults are adaptive, 20 and 64 µs), its settings
 #                before and after in nic.txt. On c9gd a query on its own goes from 130 µs to 71 µs.
+#   PIN          1: on every machine the interrupts on CPU 0 (irqbalance stopped), and the nodes and
+#                the benchmark on the other CPUs, away from them; 0 (the default) leaves both to the
+#                kernel and irqbalance. "0 1": each run both ways, in turn. Turbojet's tokio driver's
+#                p99 halved so between two c9gd machines.
+#   BUSY_POLL    µs the kernel busy-polls the NIC for a socket with nothing to read
+#                (net.core.busy_poll, for epoll, as tokio waits; net.core.busy_read), on every
+#                machine; 0 (the default) none. Several, space-separated: each run with each.
+#   ROUNDS       1: how many times the runs go round, every PIN and BUSY_POLL in turn each time, so
+#                that they're compared on one cluster, interleaved. A run's table is <run>.md, with
+#                -pin, -bp<µs> and -r<round> when they apply.
 #   PROFILE      1: profile every run with samply, each node and the benchmark, the build with
 #                frame pointers and line tables. Each run's profiles go beside its table
 #                (<run>-node<i>.json.gz, <run>-bench.json.gz, with their .syms.json), and its
@@ -47,6 +57,10 @@ MAX_MINUTES=${MAX_MINUTES:-180}
 RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
 PROFILE=${PROFILE:-0}
 NIC_COALESCE_OFF=${NIC_COALESCE_OFF:-0}
+PIN=${PIN:-0} BUSY_POLL=${BUSY_POLL:-0} ROUNDS=${ROUNDS:-1}
+for pin in $PIN; do [[ $pin == 0 || $pin == 1 ]] || { echo "PIN is 0, 1 or both, not $pin" >&2; exit 2; }; done
+for us in $BUSY_POLL; do [[ $us =~ ^[0-9]+$ ]] || { echo "BUSY_POLL is in µs, not $us" >&2; exit 2; }; done
+[[ $ROUNDS =~ ^[1-9][0-9]*$ ]] || { echo "ROUNDS is a count, not $ROUNDS" >&2; exit 2; }
 [[ $NIC_COALESCE_OFF == 0 || $NIC_COALESCE_OFF == 1 ]] || { echo "NIC_COALESCE_OFF is 0 or 1" >&2; exit 2; }
 [[ $PROFILE == 0 || $PROFILE == 1 ]] || { echo "PROFILE is 0 or 1, not $PROFILE" >&2; exit 2; }
 SAMPLY_VERSION=0.13.1
@@ -284,6 +298,34 @@ TLS_FLAGS='--tls-cert certs/node.pem --tls-key certs/node.key --tls-peer-ca cert
 CLIENTS=$(list 7101 | sed 's/[0-9]=//g')
 # Expanded on each machine: its own architecture's path.
 JEMALLOC='LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2'
+# With PIN=1, what starts the nodes and the benchmark on every CPU but 0 (tune's): expanded on
+# each machine. nproc --all, since plain nproc counts only the CPUs this shell may use.
+PINNED=''
+
+# Every machine's interrupts and busy polling, for a PIN and a BUSY_POLL: interrupts on CPU 0 with
+# irqbalance stopped, or back on every CPU and irqbalance running, as the machine started. An
+# interrupt that can't move (a per-CPU timer's) keeps its place. What it set, each time, is in
+# tuning.txt.
+tune() {
+    local pin=$1 us=$2 host
+    for host in "${PUBLIC[@]}"; do
+        on "$host" "set -e
+            sudo sysctl -q net.core.busy_poll=$us net.core.busy_read=$us
+            if [ $pin = 1 ]; then
+                sudo systemctl stop irqbalance 2>/dev/null || true; cpus=0
+            else
+                cpus=0-\$((\$(nproc --all) - 1))
+            fi
+            for irq in /proc/irq/[0-9]*; do echo \$cpus | sudo tee \$irq/smp_affinity_list >/dev/null 2>&1 || true; done
+            [ $pin = 1 ] || sudo systemctl start irqbalance 2>/dev/null || true
+            echo \"\$(hostname): pin $pin, busy_poll \$(sysctl -n net.core.busy_poll), busy_read \$(sysctl -n net.core.busy_read), \
+                the NIC's interrupts on \$(grep -E 'ena|Tx-Rx' /proc/interrupts | awk '{sub(\":\", \"\", \$1); print \$1}' |
+                    while read -r irq; do cat /proc/irq/\$irq/effective_affinity_list; done | sort -u | tr '\\n' ' ')\""
+    done >>"$OUT/tuning.txt"
+    PINNED=''
+    [[ $pin == 1 ]] && PINNED='taskset -c 1-$(($(nproc --all) - 1))'
+    return 0
+}
 
 # The benchmark's command on the clients' machine, `envs` before it: with PROFILE, its binary run
 # under samply, the profile to `profile` there.
@@ -291,11 +333,11 @@ bench() {
     local envs=$1 profile=$2
     if [[ $PROFILE == 1 ]]; then
         # cargo runs a benchmark in its package's directory: so does this.
-        echo ". ~/.cargo/env && cd src/crates/turbofan && export $CARGO_ENV && $envs ~/.cargo/bin/samply record \
+        echo ". ~/.cargo/env && cd src/crates/turbofan && export $CARGO_ENV && $envs $PINNED ~/.cargo/bin/samply record \
             --save-only --unstable-presymbolicate -o $profile -- \
             \$(ls -t ../../target/release/deps/cluster-* | grep -v '\.d\$' | head -1) --bench"
     else
-        echo ". ~/.cargo/env && cd src ${CARGO_ENV:+&& export $CARGO_ENV} && $envs cargo bench -q -p turbofan --bench cluster --features tls"
+        echo ". ~/.cargo/env && cd src ${CARGO_ENV:+&& export $CARGO_ENV} && $envs $PINNED cargo bench -q -p turbofan --bench cluster --features tls"
     fi
 }
 
@@ -314,7 +356,7 @@ remote() {
     local name=$1 data=$2 extra=$3 fsync=$4 tls=$5 i status_tls='' bench_tls=''
     for i in 1 2 3; do
         on "${PUBLIC[i-1]}" "TURBOFAN_ADMIN_TOKEN=$ADMIN_TOKEN TURBOFAN_PEER_TOKEN=$PEER_TOKEN $JEMALLOC \
-            nohup ./echo serve --id $i --data $data/n$i $FLAGS $extra >node.log 2>&1 </dev/null &"
+            $PINNED nohup ./echo serve --id $i --data $data/n$i $FLAGS $extra >node.log 2>&1 </dev/null &"
     done
     if [[ $tls == 1 ]]; then
         status_tls='--tls-ca certs/ca.pem'
@@ -362,23 +404,43 @@ remote() {
     fi
 }
 
-for run in $RUNS; do
+# One of RUNS, its table and profiles named `name`.
+one() {
+    local run=$1 name=$2
     case $run in
         local)
-            log "run local"
+            log "run $name"
             on "$CLIENT" "mkdir -p /data/tmp && $(bench "TMPDIR=/data/tmp BENCH_SECS=$BENCH_SECS $JEMALLOC" \
-                "$HOME_DIR/bench.json.gz")" | tee "$OUT/local.md"
+                "$HOME_DIR/bench.json.gz")" | tee "$OUT/$name.md"
             if [[ $PROFILE == 1 ]]; then
-                fetch_profile "$CLIENT" bench "$OUT/local-bench"
+                fetch_profile "$CLIENT" bench "$OUT/$name-bench"
             fi
             ;;
-        nvme) remote nvme /data --no-fsync 0 0 ;;
-        nvme-fsync) remote nvme-fsync /data '' 1 0 ;;
-        nvme-tls) remote nvme-tls /data "$TLS_FLAGS --no-fsync" 0 1 ;;
-        nvme-tls-fsync) remote nvme-tls-fsync /data "$TLS_FLAGS" 1 1 ;;
-        ebs-fsync) remote ebs-fsync "$HOME_DIR/ebs" '' 1 0 ;;
+        nvme) remote "$name" /data --no-fsync 0 0 ;;
+        nvme-fsync) remote "$name" /data '' 1 0 ;;
+        nvme-tls) remote "$name" /data "$TLS_FLAGS --no-fsync" 0 1 ;;
+        nvme-tls-fsync) remote "$name" /data "$TLS_FLAGS" 1 1 ;;
+        ebs-fsync) remote "$name" "$HOME_DIR/ebs" '' 1 0 ;;
         *) echo "no run $run" >&2; exit 2 ;;
     esac
+}
+
+NAMES=()
+for round in $(seq "$ROUNDS"); do
+    for pin in $PIN; do
+        for us in $BUSY_POLL; do
+            # Unless asked, the machines as they started.
+            [[ $PIN$BUSY_POLL == 00 ]] || tune "$pin" "$us"
+            for run in $RUNS; do
+                name=$run
+                [[ $pin == 1 ]] && name+=-pin
+                [[ $BUSY_POLL != 0 ]] && name+=-bp$us
+                [[ $ROUNDS -gt 1 ]] && name+=-r$round
+                one "$run" "$name"
+                NAMES+=("$name")
+            done
+        done
+    done
 done
 
 # What it ran on, for the guide.
@@ -388,17 +450,18 @@ done
     echo "turbofan $(git rev-parse --short HEAD), $TYPE in $AZ ($AWS_REGION), $BENCH_SECS s a run, on jemalloc."
     [[ -n $RUSTFLAGS ]] && echo && echo "RUSTFLAGS=${RUSTFLAGS% }"
     [[ $NIC_COALESCE_OFF == 1 ]] && echo && echo "NIC interrupt moderation off (NIC_COALESCE_OFF=1)."
+    [[ $PIN$BUSY_POLL != 00 ]] && echo && echo "PIN=$PIN, BUSY_POLL=$BUSY_POLL, ROUNDS=$ROUNDS: see tuning.txt."
     if [[ $PROFILE == 1 ]]; then
         echo
         echo "Profiled (PROFILE=1), with frame pointers: a fifth to a third slower, not figures for the guide."
     fi
     on "$CLIENT" 'echo; lscpu | grep "Model name"; uname -sr; . ~/.cargo/env && rustc --version
         lsblk -dno NAME,MODEL,SIZE | grep -v loop'
-    for run in $RUNS; do
+    for name in "${NAMES[@]}"; do
         echo
-        echo "## $run"
+        echo "## $name"
         echo
-        cat "$OUT/$run.md"
+        cat "$OUT/$name.md"
     done
 } >"$OUT/results.md"
 log "results in $OUT/results.md"
