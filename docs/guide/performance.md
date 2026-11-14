@@ -54,10 +54,10 @@ commit. The busier the cluster, the bigger the batches.
   its own that never sleep: the node on one (`turbofan-node`), its peers' connections on another
   (`turbofan-peer`), its clients' and operators' on the third (`turbofan-client`), each polling
   its sockets and its queue rather than waiting on them. On one cluster of `c9gd`, with moderation
-  off, pinned and busy polling as above (at `9efdf33`, the same three threads; two rounds each), a
-  message on its own took 66 µs to 51 µs p50, a query 65 µs to 50 µs, a synced message 124 µs to
-  106 µs, a message over TLS 69 µs to 54 µs, a fifth off each; messages and queries a second, TLS
-  and fsync too, were 1 to 4% more. The disk still writes on a thread that waits, as it must, and
+  off, pinned and busy polling as above (at `80da5bb`, two rounds each), a message on its own took
+  69 µs to 53 µs p50, a query 66 µs to 51 µs, a synced message 128 µs to 109 µs, a message over
+  TLS 71 µs to 55 µs, a fifth off each but the synced; messages and queries a second, TLS and
+  fsync too, were 2 to 4% more. The disk still writes on a thread that waits, as it must, and
   a sync's share doesn't change.
 
   The cost is three cores, busy or not: a spinning node shows 300% CPU idle. Give it them: with

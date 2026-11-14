@@ -11,8 +11,8 @@ a patch version (0.1.1) doesn't.
 - `serve --spin` (`driver::Config::spin`): the node on three threads of its own that never sleep,
   polling their sockets, the node on one, its peers' connections on another and its clients' on a
   third, for three cores held busy or not. On Linux, a fifth off a request on its own: on `c9gd`,
-  a message 66 µs → 51 µs p50, a query 65 µs → 50 µs, synced 124 µs → 106 µs, over TLS 69 µs →
-  54 µs, with as many messages and queries a second (#31; the guide's performance chapter).
+  a message 69 µs → 53 µs p50, a query 66 µs → 51 µs, synced 128 µs → 109 µs, over TLS 71 µs →
+  55 µs, with 2 to 4% more messages and queries a second (#31; the guide's performance chapter).
 
 ### Changed
 
