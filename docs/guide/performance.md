@@ -48,6 +48,28 @@ commit. The busier the cluster, the bigger the batches.
   2.79 to 2.92 million messages a second, synced 2.75 to 2.85 million; queries 4.66 million to
   4.73 million. Pinning alone gives the throughput but not the latency. `scripts/aws-bench.sh` does
   both by default (`PIN=0 BUSY_POLL=0` leaves them).
+- **Spinning, on Linux.** By default the node and its connections are tasks on tokio's threads,
+  and a message crosses from one to another four times on the leader and twice on a follower,
+  each a wake-up of a thread that was asleep. With `serve --spin` (`driver::Config::spin`) the node runs on three threads of
+  its own that never sleep: the node on one (`turbofan-node`), its peers' connections on another
+  (`turbofan-peer`), its clients' and operators' on the third (`turbofan-client`), each polling
+  its sockets and its queue rather than waiting on them. On one cluster of `c9gd`, with moderation
+  off, pinned and busy polling as above (at `9efdf33`, the same three threads; two rounds each), a
+  message on its own took 66 µs to 51 µs p50, a query 65 µs to 50 µs, a synced message 124 µs to
+  106 µs, a message over TLS 69 µs to 54 µs, a fifth off each; messages and queries a second, TLS
+  and fsync too, were 1 to 4% more. The disk still writes on a thread that waits, as it must, and
+  a sync's share doesn't change.
+
+  The cost is three cores, busy or not: a spinning node shows 300% CPU idle. Give it them: with
+  the interrupts on CPU 0 and the node on the others, as above, at least four (three spinning,
+  and the disk's thread). Each thread may be pinned to a core of its own, by its name
+  (`ps -L -o tid,comm -p <pid>`, then `taskset -p -c <cpu> <tid>`), though on a machine that
+  runs nothing else the kernel keeps them apart anyway. Don't spin on a machine shared with other
+  work, nor several nodes on one machine's cores, nor on macOS, whose `kqueue` sleeps even when
+  told not to wait: there it spins slowly, and gains nothing. Fewer threads cost throughput: the
+  node and its connections on one, a fifth of the messages a second and two fifths of the TLS
+  queries', the one thread full; the node on one and every connection on another, an eighth of
+  the TLS messages', that thread encrypting both the leader's appends and its replies.
 - **fsync.** By default every batch waits for the disk: on a local NVMe drive a little, on
   network storage a lot. With `--no-fsync`, a write is the page cache's, and the follower's copy
   is the redundancy (see [Running a cluster][running]). Choose with the benchmark on your

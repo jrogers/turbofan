@@ -41,10 +41,8 @@
 //! to peers, and refuses peers without it. They're read from the environment, not flags, to keep
 //! them out of the process list.
 //!
-//! `TURBOFAN_SPIN=1`, an experiment (#31): `serve` runs the node and its connections on one
-//! thread that never sleeps, polling its sockets, and so holds a core whether busy or not.
-//! `TURBOFAN_SPIN=2`: the node on one such thread, its connections on another; `3`, the node on
-//! one, its peers' connections on another, and its clients' and operators' on a third.
+//! `serve --spin` runs the node on three threads that never sleep, polling their sockets: a
+//! fifth off a request on its own, on Linux, for three cores held ([`driver::Config::spin`]).
 //!
 //! With the cluster lost, `promote --admin <addr>` makes the learner at that admin address the
 //! one member of a new cluster, of a new epoch, from its log as it is: fence the old cluster first.
@@ -103,8 +101,6 @@ const MEMBERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const ADMIN_TOKEN: &str = "TURBOFAN_ADMIN_TOKEN";
 /// The peer token's environment variable.
 const PEER_TOKEN: &str = "TURBOFAN_PEER_TOKEN";
-/// The spinning runtime's environment variable (#31).
-const SPIN: &str = "TURBOFAN_SPIN";
 /// The operators' commands.
 const COMMANDS: [&str; 10] = [
     "snapshot",
@@ -128,7 +124,8 @@ const USAGE: &str = "usage:
         interface its listeners bind, on those ports: 0.0.0.0, say)
         (with --no-fsync, the log isn't synced before acknowledging: a majority of the voters
         losing power together may lose committed entries)
-        [--election-timeout <ms>] [--heartbeat <ms>]
+        [--election-timeout <ms>] [--heartbeat <ms>] [--spin]
+        (with --spin, the node runs on three threads that never sleep, a core each)
         [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]
          [--tls-reload <secs>] [--tls-plain accept|dial]] (the files reread every 60 seconds,
          or --tls-reload's; --tls-plain takes plain TCP beside TLS, and with dial, dials peers
@@ -159,7 +156,7 @@ pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
 /// As [`run`], with `configure` changing a node's configuration before it serves: the settings
 /// that are the service's to choose, such as [`NodeConfig::session_timeout`] or
 /// [`NodeConfig::egress_ring_entries`]. `serve`'s own flags (`--election-timeout`, `--heartbeat`,
-/// `--keep-snapshots`, `--no-fsync`) apply after it, for what an operator chooses for a deployment.
+/// `--keep-snapshots`, `--no-fsync`, `--spin`) apply after it, for what an operator chooses for a deployment.
 ///
 /// [`NodeConfig::session_timeout`]: crate::NodeConfig::session_timeout
 /// [`NodeConfig::egress_ring_entries`]: crate::NodeConfig::egress_ring_entries
@@ -182,29 +179,9 @@ pub fn run_with<S: Service + 'static>(
                     "warning: {PEER_TOKEN} isn't set, so anyone who can reach the peer listener can act as a node"
                 );
             }
-            let spin = std::env::var(SPIN).unwrap_or_default();
-            let runtime = if spin.is_empty() || spin == "0" { runtime()? } else { spinning_runtime()? };
-            // With 2, the connections' runtime, with 3 the peers' and the clients', each spinning on a
-            // thread of its own till the process ends.
-            let io = match spin.as_str() {
-                "2" => {
-                    let io = spinning_thread("turbofan-io")?;
-                    Some((io.clone(), io))
-                }
-                "3" => Some((spinning_thread("turbofan-peers")?, spinning_thread("turbofan-clients")?)),
-                _ => None,
-            };
+            let runtime = runtime()?;
             let stop = runtime.block_on(async { terminated() }).map_err(|e| format!("signals: {e}"))?;
-            let serve = async move {
-                if !spin.is_empty() && spin != "0" {
-                    tokio::spawn(spinning());
-                }
-                match io {
-                    Some((peers, clients)) => driver::serve_on(config, service, stop, peers, clients).await,
-                    None => serve_until(config, service, stop).await,
-                }
-            };
-            runtime.block_on(serve).map_err(|e| format!("node stopped: {e}"))
+            runtime.block_on(serve_until(config, service, stop)).map_err(|e| format!("node stopped: {e}"))
         }),
         Some("restore") => restore(&args[1..], service_id),
         Some("replay") => replay(&args[1..], service),
@@ -412,32 +389,6 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())
 }
 
-/// The node and its connections on one thread, which spins (#31): a task waking another is a
-/// push onto that thread's queue, not a wake-up of another thread. Writes and snapshots still go
-/// to blocking threads.
-fn spinning_runtime() -> Result<tokio::runtime::Runtime, String> {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())
-}
-
-/// A spinning runtime on a thread of its own, `name`, till the process ends.
-fn spinning_thread(name: &str) -> Result<tokio::runtime::Handle, String> {
-    let runtime = spinning_runtime()?;
-    let handle = runtime.handle().clone();
-    std::thread::Builder::new()
-        .name(name.into())
-        .spawn(move || runtime.block_on(spinning()))
-        .map_err(|e| e.to_string())?;
-    Ok(handle)
-}
-
-/// Never done, so a current-thread runtime running it never sleeps: each time round it polls the
-/// sockets without waiting (`yield_now` defers it till after they're polled).
-async fn spinning() {
-    loop {
-        tokio::task::yield_now().await;
-    }
-}
-
 fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, String> {
     let id: NodeId = flag(args, "--id")?.parse().map_err(|_| "--id: a number from 1".to_owned())?;
     let peers = members(&flag(args, "--peers")?)?;
@@ -491,6 +442,7 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
         admin_token: None,
         peer_token: None,
         tls: node_tls(args)?,
+        spin: false,
     })
 }
 
@@ -557,6 +509,9 @@ fn tune(args: &[String], config: &mut driver::Config) -> Result<(), String> {
         (true, false) => config.log_fsync = driver::Fsync::EachBatch,
         (false, true) => config.log_fsync = driver::Fsync::Never,
         (false, false) => {}
+    }
+    if given("--spin") {
+        config.spin = true;
     }
     let (timeout, heartbeat) = (node.raft.election_timeout, node.raft.heartbeat);
     if heartbeat * 2 >= timeout || timeout >= raft::MAX_TIMEOUT {
@@ -696,11 +651,21 @@ mod tests {
         let config = tuned(&[]).unwrap();
         assert_eq!((config.node.raft.election_timeout, config.node.snapshots_kept), (Duration::from_secs(2), 1));
         assert_eq!(config.log_fsync, Fsync::EachBatch);
-        let config = tuned(&["--election-timeout", "900", "--heartbeat", "100", "--keep-snapshots", "3", "--no-fsync"]);
+        let config = tuned(&[
+            "--election-timeout",
+            "900",
+            "--heartbeat",
+            "100",
+            "--keep-snapshots",
+            "3",
+            "--no-fsync",
+            "--spin",
+        ]);
         let config = config.unwrap();
         assert_eq!(config.node.raft.election_timeout, Duration::from_millis(900));
         assert_eq!((config.node.raft.heartbeat, config.node.snapshots_kept), (Duration::from_millis(100), 3));
         assert_eq!(config.log_fsync, Fsync::Never);
+        assert!(config.spin && !tuned(&[]).unwrap().spin);
         assert_eq!(tuned(&["--fsync"]).unwrap().log_fsync, Fsync::EachBatch, "as before it was the default");
         assert!(tuned(&["--fsync", "--no-fsync"]).is_err());
         assert!(tuned(&["--heartbeat", "1000"]).is_err(), "a heartbeat not under half the timeout");

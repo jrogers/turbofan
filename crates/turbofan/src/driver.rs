@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
@@ -115,6 +115,12 @@ pub struct Config {
     /// With none, everything is plain TCP. Every node of the cluster must agree on TLS to peers
     /// and clients; the admin listener's is each node's own.
     pub tls: Option<NodeTls>,
+    /// Whether the node runs on three threads of its own that never sleep, polling their sockets
+    /// rather than waiting on them: the node on one, its peers' connections on another, and its
+    /// clients' and operators' on the third. On Linux, a fifth off a request on its own, for three
+    /// cores held whether busy or not (the guide's *Spinning* section). Off by default: the node
+    /// runs on the caller's runtime.
+    pub spin: bool,
 }
 
 impl Config {
@@ -143,6 +149,7 @@ impl Config {
             admin_token: None,
             peer_token: None,
             tls: None,
+            spin: false,
         }
     }
 }
@@ -232,6 +239,9 @@ pub async fn serve<S: Service + 'static>(config: Config, service: S) -> io::Resu
 /// timeout: the cluster is led again in a round trip, not after an election timeout of silence.
 /// A node that doesn't lead stops at once. Either way, once its write under way is done.
 ///
+/// With [`Config::spin`], the node runs on threads of its own, and this task only waits for it:
+/// dropped, it tells the node to stop, as `stop` would, and the node stops on its own.
+///
 /// # Errors
 ///
 /// If the data directory can't be opened (or another process has it), a listener can't bind,
@@ -242,14 +252,98 @@ pub async fn serve_until<S: Service + 'static>(
     service: S,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    if config.spin {
+        return serve_spinning(config, service, stop).await;
+    }
     let here = tokio::runtime::Handle::current();
     serve_on(config, service, stop, here.clone(), here).await
 }
 
+/// [`serve_until`] with [`Config::spin`]: the node on a thread of its own, its peers' connections
+/// on another and its clients' and operators' on a third, each spinning; until `stop`, or this
+/// is dropped.
+async fn serve_spinning<S: Service + 'static>(
+    config: Config,
+    service: S,
+    stop: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new().name("turbofan-node".into()).spawn(move || {
+        // Told to stop, or what would tell it gone.
+        let stop = async { drop(stop_rx.await) };
+        let _ = done_tx.send(spin(config, service, stop));
+    })?;
+    let gone = || io::Error::other("the node's thread panicked");
+    let mut done = std::pin::pin!(done_rx);
+    tokio::select! {
+        () = stop => {}
+        done = &mut done => return done.unwrap_or_else(|_| Err(gone())),
+    }
+    let _ = stop_tx.send(());
+    done.await.unwrap_or_else(|_| Err(gone()))
+}
+
+/// Runs the node on this thread, spinning, and its connections on two more: returning once they
+/// have stopped and their listeners are closed, for a node started again to bind them.
+fn spin<S: Service + 'static>(config: Config, service: S, stop: impl Future<Output = ()>) -> io::Result<()> {
+    let mut threads = Spinning { stopped: Arc::default(), threads: Vec::new() };
+    let peer_io = threads.start("turbofan-peer")?;
+    let client_io = threads.start("turbofan-client")?;
+    // Dropped first, its tasks with it, then `threads`, which stops and joins theirs.
+    let runtime = Spinning::runtime()?;
+    runtime.block_on(async {
+        tokio::spawn(Spinning::spin(Arc::default()));
+        serve_on(config, service, stop, peer_io, client_io).await
+    })
+}
+
+/// The threads a spinning node's connections run on, each a runtime that never sleeps: dropped,
+/// they stop, dropping their runtimes and with them their tasks and listeners, and are joined.
+struct Spinning {
+    stopped: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Spinning {
+    /// A runtime on a thread of its own, `name`, spinning until `self` is dropped.
+    fn start(&mut self, name: &str) -> io::Result<tokio::runtime::Handle> {
+        let runtime = Self::runtime()?;
+        let handle = runtime.handle().clone();
+        let stopped = self.stopped.clone();
+        let thread =
+            std::thread::Builder::new().name(name.into()).spawn(move || runtime.block_on(Self::spin(stopped)))?;
+        self.threads.push(thread);
+        Ok(handle)
+    }
+
+    /// One thread's runtime: what a task wakes is pushed onto its queue, not a wake-up of another
+    /// thread.
+    fn runtime() -> io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()
+    }
+
+    /// Never done until `stopped`, so the runtime running it never sleeps: each time round it
+    /// polls its sockets without waiting (`yield_now` defers it till after they're polled).
+    async fn spin(stopped: Arc<AtomicBool>) {
+        while !stopped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+impl Drop for Spinning {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// [`serve_until`], the peers' connections' tasks on `peer_io`'s runtime, the clients' and
-/// operators' on `client_io`'s, the node's on this one: threads of their own, each spinning, for
-/// #31's experiment (see [`crate::cli`]).
-pub(crate) async fn serve_on<S: Service + 'static>(
+/// operators' on `client_io`'s, the node's on this one.
+async fn serve_on<S: Service + 'static>(
     config: Config,
     service: S,
     stop: impl Future<Output = ()>,

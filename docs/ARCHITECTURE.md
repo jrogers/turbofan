@@ -109,7 +109,10 @@ flowchart TB
 
 - **One task owns the node** and does everything in order. Connection tasks only frame bytes and
   check handshakes, and pass whole frames to it over bounded channels (`MAX_QUEUED_INPUTS`), one
-  for clients and one for the rest. It takes up to `MAX_BATCH_INPUTS` at a time.
+  for clients and one for the rest. It takes up to `MAX_BATCH_INPUTS` at a time. They are tasks
+  on the caller's tokio runtime; with `Config::spin` (`serve --spin`), on three threads of the
+  driver's own, each a runtime that never sleeps: the node's task on one, the peers' connections
+  on another, and the clients' and operators' on the third, a crossing between them no wake-up.
 - **A backlogged leader holds clients back.** Once its proposals not yet committed come to
   `max_uncommitted_bytes`, the node takes nothing more from clients until they commit: their
   channel fills, their connection tasks wait, and TCP pushes back on them. Peers' acks still
