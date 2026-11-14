@@ -8,6 +8,11 @@ a patch version (0.1.1) doesn't.
 
 ### Changed
 
+- Timers due at once fire at most 1024 a commit, earliest first, where every one due was logged
+  at once and each pass of the driver's loop walked past all those not yet applied. With a million
+  due together, a leader spent 87 ms logging them, 158 ms applying them in one go, and 33 ms on
+  each pass of its loop until they had, long enough for a few million to lose it its leadership.
+
 - On macOS, nodes on one drive share its flushes: a log's sync `fsync`s its own file, then waits
   for one `F_FULLFSYNC` started after that, issued by whichever finds none running, where each
   issued its own and they ran one after another. On an Apple Mac, three nodes on one machine with

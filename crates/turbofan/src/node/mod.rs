@@ -56,6 +56,10 @@ pub const MAX_SESSIONS: usize = 10_000;
 /// The highest protocol version this code supports: see `WIRE.md`, and [`Config::protocol`].
 /// 1: an activation logs the leader's [`Config::egress_ring_entries`] for every node.
 pub const PROTOCOL: u32 = 1;
+/// The most timers the leader has logged as fired and not yet applied. A burst due at once fires
+/// this many a commit, so what's logged at once, applied at once, and walked past to find the next
+/// deadline stays bounded however many there are.
+const MAX_FIRING: usize = 1024;
 /// The longest principal [`Service::authenticate`] can give.
 pub const MAX_PRINCIPAL_BYTES: usize = 255;
 
@@ -562,9 +566,14 @@ impl<S: Service> Node<S> {
     pub fn next_deadline(&self) -> u64 {
         let mut deadline = self.raft.next_deadline();
         if self.is_ready() {
-            let timer = self.state.deadlines.iter().find(|(_, id)| !self.local.firing.contains(id));
-            if let Some(&(at, _)) = timer {
-                deadline = deadline.min(at);
+            // With as many firing as can be, the next waits for one to apply: not a deadline
+            // already past, which would wake the driver over and over to do nothing.
+            if self.local.firing.len() < MAX_FIRING {
+                // Past at most MAX_FIRING already firing.
+                let timer = self.state.deadlines.iter().find(|(_, id)| !self.local.firing.contains(id));
+                if let Some(&(at, _)) = timer {
+                    deadline = deadline.min(at);
+                }
             }
             let quiet = self.local.activity.iter().filter(|(s, _)| !self.local.closing.contains(s)).map(|(_, &at)| at);
             if let Some(at) = quiet.min() {

@@ -384,6 +384,35 @@ fn a_rescheduled_timer_fires_once_at_its_new_time_and_a_cancelled_one_never() {
 }
 
 #[test]
+fn a_burst_of_due_timers_fires_a_bounded_batch_a_commit_earliest_first() {
+    let mut node = leader();
+    let n = 2 * crate::widen(MAX_FIRING) + 10;
+    // As if the service had scheduled them, in a scrambled order (11 is coprime to n), all due.
+    let at = |id: u64| (id * 11 % n + 1) * MS;
+    for id in 0..n {
+        node.state.timers.insert(id, at(id));
+        node.state.deadlines.insert((at(id), id));
+    }
+    let now = (n + 1) * MS;
+    let mut commits = 0;
+    while !node.state.timers.is_empty() {
+        node.on_tick(now);
+        assert!(node.local.firing.len() <= MAX_FIRING);
+        if node.local.firing.len() == MAX_FIRING {
+            assert!(node.next_deadline() > now, "it waits for a commit, not on a deadline past");
+        }
+        drive(&mut node);
+        commits += 1;
+    }
+    assert_eq!(commits, 3);
+    let fired: Vec<u64> =
+        node.service.0.iter().filter_map(|e| e.strip_prefix("timer ")?.split(' ').next()?.parse().ok()).collect();
+    let mut earliest_first: Vec<u64> = (0..n).collect();
+    earliest_first.sort_by_key(|&id| (at(id), id));
+    assert_eq!(fired, earliest_first);
+}
+
+#[test]
 fn a_follower_redirects_clients_to_the_leader() {
     let config = Config {
         raft: raft::Config {

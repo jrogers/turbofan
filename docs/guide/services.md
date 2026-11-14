@@ -119,7 +119,9 @@ deadlines against its own clock, and when one passes, logs that the timer fired;
 fires it as it applies that entry, with `Ctx::now` at or after `at`. A timer cancelled or moved
 later in the meantime doesn't fire.
 
-So a timer fires a commit's latency after its deadline, and later with no leader. Use one for
+So a timer fires a commit's latency after its deadline, and later with no leader. A burst due at
+once fires 1024 a commit, earliest first, so a million due together take about a thousand commits,
+and the leader goes on serving clients meanwhile. Use one for
 an order's expiry, a session's lease or a day's end, not for anything that needs microseconds.
 
 ## Proposals

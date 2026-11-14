@@ -3,12 +3,15 @@
 use super::*;
 
 impl<S: Service> Node<S> {
+    /// Logs the timers due by `now` as fired, earliest first, up to [`MAX_FIRING`] at once.
     pub(super) fn fire_timers(&mut self, now: u64) {
-        let due: Vec<u64> = self.state.deadlines.iter().take_while(|(at, _)| *at <= now).map(|&(_, id)| id).collect();
+        let room = MAX_FIRING.saturating_sub(self.local.firing.len());
+        // Past at most MAX_FIRING already firing.
+        let due = self.state.deadlines.iter().take_while(|(at, _)| *at <= now);
+        let due: Vec<u64> = due.map(|&(_, id)| id).filter(|id| !self.local.firing.contains(id)).take(room).collect();
         for id in due {
-            if self.local.firing.insert(id) {
-                self.propose(&wire::TimerFired { timestamp: now, id });
-            }
+            self.local.firing.insert(id);
+            self.propose(&wire::TimerFired { timestamp: now, id });
         }
     }
 
