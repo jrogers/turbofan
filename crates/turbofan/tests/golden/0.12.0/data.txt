@@ -1,0 +1,16 @@
+session 3
+term 1 vote Some(1)
+1 1 NewTerm
+2 1 Epoch
+3 1 SessionOpen
+4 1 SessionMessage
+5 1 SessionMessage
+6 1 SessionMessage
+7 1 SessionMessage
+8 1 SessionMessage
+9 1 Snapshot
+10 1 Members
+11 1 Members
+12 1 SessionMessage
+13 1 SessionMessage
+14 1 TimerFired

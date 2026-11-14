@@ -79,11 +79,21 @@ A service changes its behaviour the same way, by `Service::version` and `--servi
 members. It doesn't change again: that would make every existing snapshot unreadable, so a node
 with one wouldn't start. What's in the bytes changes by this file's rules instead.
 
+## The log and meta files
+
+A node upgraded in place restarts on the data directory the old version wrote. Its log segments
+(`log/<first index>.log`) are records, each a log entry framed with its term and index
+(`codec::Record`), so their entries change by this file's rules; the record's own layout, and
+the segments' naming, don't change, as the snapshot's doesn't. Nor does the meta file's (`meta`:
+the term and vote, in two checksummed slots).
+
 ## Checking a change
 
 - Mark new fields, groups and data with `sinceVersion`, and bump `version` in `cluster.xml`.
 - `tests/golden.rs` reads what each released version wrote (`tests/golden/<version>/`): a
-  snapshot, and the client protocol's frames. They must still read, as they say.
+  snapshot, and the client protocol's frames; and from 0.12.0, a stopped node's data directory
+  (its log, meta file and snapshots) and the peer protocol's frames. They must still read, as
+  they say, and a node of this version must serve from the data directory.
 - A test that an older version's message still decodes, and a newer one's is read past
   (`codec::tests::a_newer_versions_frames_are_tolerated` is the pattern).
 - For a change of the third kind, the simulator's rolling upgrade: the nodes start on the old
