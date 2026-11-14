@@ -41,6 +41,9 @@
 //! to peers, and refuses peers without it. They're read from the environment, not flags, to keep
 //! them out of the process list.
 //!
+//! `TURBOFAN_SPIN=1`, an experiment (#31): `serve` runs the node and its connections on one
+//! thread that never sleeps, polling its sockets, and so holds a core whether busy or not.
+//!
 //! With the cluster lost, `promote --admin <addr>` makes the learner at that admin address the
 //! one member of a new cluster, of a new epoch, from its log as it is: fence the old cluster first.
 //! Its nodes can't talk to the new one, which grows with `add-member`.
@@ -98,6 +101,8 @@ const MEMBERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const ADMIN_TOKEN: &str = "TURBOFAN_ADMIN_TOKEN";
 /// The peer token's environment variable.
 const PEER_TOKEN: &str = "TURBOFAN_PEER_TOKEN";
+/// The spinning runtime's environment variable (#31).
+const SPIN: &str = "TURBOFAN_SPIN";
 /// The operators' commands.
 const COMMANDS: [&str; 10] = [
     "snapshot",
@@ -175,9 +180,22 @@ pub fn run_with<S: Service + 'static>(
                     "warning: {PEER_TOKEN} isn't set, so anyone who can reach the peer listener can act as a node"
                 );
             }
-            let runtime = runtime()?;
+            let spin = std::env::var_os(SPIN).is_some_and(|v| v == "1");
+            let runtime = if spin { spinning_runtime()? } else { runtime()? };
             let stop = runtime.block_on(async { terminated() }).map_err(|e| format!("signals: {e}"))?;
-            runtime.block_on(serve_until(config, service, stop)).map_err(|e| format!("node stopped: {e}"))
+            let serve = async move {
+                if spin {
+                    // Never empty, so the runtime never sleeps: each time round it polls the
+                    // sockets without waiting (`yield_now` defers it till after they're polled).
+                    tokio::spawn(async {
+                        loop {
+                            tokio::task::yield_now().await;
+                        }
+                    });
+                }
+                serve_until(config, service, stop).await
+            };
+            runtime.block_on(serve).map_err(|e| format!("node stopped: {e}"))
         }),
         Some("restore") => restore(&args[1..], service_id),
         Some("replay") => replay(&args[1..], service),
@@ -383,6 +401,13 @@ fn terminated() -> std::io::Result<impl Future<Output = ()>> {
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())
+}
+
+/// The node and its connections on one thread, which spins (#31): a task waking another is a
+/// push onto that thread's queue, not a wake-up of another thread. Writes and snapshots still go
+/// to blocking threads.
+fn spinning_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())
 }
 
 fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, String> {
