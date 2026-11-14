@@ -208,6 +208,11 @@ and the same with `--id 2` and `--id 3`. A client is given every node's client a
 the leader. Kill the leader while a client sends, and the client carries on with the next one,
 with nothing lost or repeated. [Running a cluster][running] has the rest of the command line.
 
+`examples/matching.rs` is a larger service: a matching engine, with limit and market orders on
+many symbols, matched by price then time, cancelled and modified, each order's events sent to the
+session that placed it, and a query for the book. Its `client` takes orders typed a line at a
+time, and prints the events as they come.
+
 ## How it's layered
 
 The core is sans-IO: it takes inputs (messages, the time, notice that a write is durable) and

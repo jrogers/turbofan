@@ -59,3 +59,7 @@ harness = false
 [[example]]
 name = "list_append"
 test = true
+
+[[example]]
+name = "matching"
+test = true
