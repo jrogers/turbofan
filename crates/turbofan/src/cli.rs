@@ -43,7 +43,8 @@
 //!
 //! `TURBOFAN_SPIN=1`, an experiment (#31): `serve` runs the node and its connections on one
 //! thread that never sleeps, polling its sockets, and so holds a core whether busy or not.
-//! `TURBOFAN_SPIN=2`: the node on one such thread, its connections on another.
+//! `TURBOFAN_SPIN=2`: the node on one such thread, its connections on another; `3`, the node on
+//! one, its peers' connections on another, and its clients' and operators' on a third.
 //!
 //! With the cluster lost, `promote --admin <addr>` makes the learner at that admin address the
 //! one member of a new cluster, of a new epoch, from its log as it is: fence the old cluster first.
@@ -183,17 +184,15 @@ pub fn run_with<S: Service + 'static>(
             }
             let spin = std::env::var(SPIN).unwrap_or_default();
             let runtime = if spin.is_empty() || spin == "0" { runtime()? } else { spinning_runtime()? };
-            // With 2, the connections' runtime, spinning on a thread of its own till the process ends.
-            let io = if spin == "2" {
-                let io = spinning_runtime()?;
-                let handle = io.handle().clone();
-                std::thread::Builder::new()
-                    .name("turbofan-io".into())
-                    .spawn(move || io.block_on(spinning()))
-                    .map_err(|e| e.to_string())?;
-                Some(handle)
-            } else {
-                None
+            // With 2, the connections' runtime, with 3 the peers' and the clients', each spinning on a
+            // thread of its own till the process ends.
+            let io = match spin.as_str() {
+                "2" => {
+                    let io = spinning_thread("turbofan-io")?;
+                    Some((io.clone(), io))
+                }
+                "3" => Some((spinning_thread("turbofan-peers")?, spinning_thread("turbofan-clients")?)),
+                _ => None,
             };
             let stop = runtime.block_on(async { terminated() }).map_err(|e| format!("signals: {e}"))?;
             let serve = async move {
@@ -201,7 +200,7 @@ pub fn run_with<S: Service + 'static>(
                     tokio::spawn(spinning());
                 }
                 match io {
-                    Some(io) => driver::serve_on(config, service, stop, io).await,
+                    Some((peers, clients)) => driver::serve_on(config, service, stop, peers, clients).await,
                     None => serve_until(config, service, stop).await,
                 }
             };
@@ -418,6 +417,17 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 /// to blocking threads.
 fn spinning_runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())
+}
+
+/// A spinning runtime on a thread of its own, `name`, till the process ends.
+fn spinning_thread(name: &str) -> Result<tokio::runtime::Handle, String> {
+    let runtime = spinning_runtime()?;
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || runtime.block_on(spinning()))
+        .map_err(|e| e.to_string())?;
+    Ok(handle)
 }
 
 /// Never done, so a current-thread runtime running it never sleeps: each time round it polls the

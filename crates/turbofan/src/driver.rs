@@ -242,16 +242,19 @@ pub async fn serve_until<S: Service + 'static>(
     service: S,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    serve_on(config, service, stop, tokio::runtime::Handle::current()).await
+    let here = tokio::runtime::Handle::current();
+    serve_on(config, service, stop, here.clone(), here).await
 }
 
-/// [`serve_until`], the connections' tasks on `io`'s runtime, the node's on this one: two
-/// threads, each spinning, for #31's experiment (see [`crate::cli`]).
+/// [`serve_until`], the peers' connections' tasks on `peer_io`'s runtime, the clients' and
+/// operators' on `client_io`'s, the node's on this one: threads of their own, each spinning, for
+/// #31's experiment (see [`crate::cli`]).
 pub(crate) async fn serve_on<S: Service + 'static>(
     config: Config,
     service: S,
     stop: impl Future<Output = ()>,
-    io: tokio::runtime::Handle,
+    peer_io: tokio::runtime::Handle,
+    client_io: tokio::runtime::Handle,
 ) -> io::Result<()> {
     check_tokens(&config)?;
     let (tls, reloading) = tls::start(config.tls.clone())?;
@@ -264,15 +267,16 @@ pub(crate) async fn serve_on<S: Service + 'static>(
     let own = config.peer_listen.or(own).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "no peer address for this node, or a host name and no peer_listen")
     })?;
-    // On `io`'s runtime, whose reactor then watches them: bound here, for an error to stop this.
-    let listen = |addr| {
+    // On the runtime that serves it, whose reactor then watches it: bound here, for an error to
+    // stop this.
+    let listen = |addr, on: &tokio::runtime::Handle| {
         let listener = std::net::TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
-        let _io = io.enter();
+        let _on = on.enter();
         TcpListener::from_std(listener)
     };
     let (peer_listener, client_listener, admin_listener) =
-        (listen(own)?, listen(config.client_listen)?, listen(config.admin_listen)?);
+        (listen(own, &peer_io)?, listen(config.client_listen, &client_io)?, listen(config.admin_listen, &client_io)?);
     let (inputs, rx) = mpsc::channel(MAX_QUEUED_INPUTS);
     // Clients' apart, so a backlogged leader can stop taking them and still take peers' acks.
     let (client_inputs, client_rx) = mpsc::channel(MAX_QUEUED_INPUTS);
@@ -281,9 +285,10 @@ pub(crate) async fn serve_on<S: Service + 'static>(
     let epoch = Arc::new(AtomicU64::new(node.epoch()));
     let hello = Hello { service_id: config.service_id, node_id: Some(id), epoch };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
-    tasks.spawn_on(reloading, &io);
-    let peers = accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls.clone(), peer_ids, inputs.clone());
-    tasks.spawn_on(peers, &io);
+    tasks.spawn_on(reloading, &client_io);
+    let accepting =
+        accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls.clone(), peer_ids, inputs.clone());
+    tasks.spawn_on(accepting, &peer_io);
     let next_conn = Arc::new(AtomicU64::new(1));
     let idle = Some(config.node.session_timeout);
     let clients = Gate {
@@ -296,8 +301,8 @@ pub(crate) async fn serve_on<S: Service + 'static>(
     };
     let token = config.admin_token.as_deref().map(Arc::from);
     let operators = Gate { role: wire::Role::Admin, token, inputs: inputs.clone(), idle: None, ..clients.clone() };
-    tasks.spawn_on(accept(client_listener, clients, next_conn.clone()), &io);
-    tasks.spawn_on(accept(admin_listener, operators, next_conn), &io);
+    tasks.spawn_on(accept(client_listener, clients, next_conn.clone()), &client_io);
+    tasks.spawn_on(accept(admin_listener, operators, next_conn), &client_io);
     let contacts = config.peer_addrs.clone();
     let mut core = Core {
         node,
@@ -318,7 +323,7 @@ pub(crate) async fn serve_on<S: Service + 'static>(
         contacts,
         peers: HashMap::new(),
         dials: JoinSet::new(),
-        io,
+        peer_io,
         conns: HashMap::new(),
     };
     let peers = core.node.raft().peers();
@@ -362,8 +367,8 @@ struct Core<S> {
     /// The peers dialled: where, the frames for them, and the task dialling.
     peers: HashMap<NodeId, (String, mpsc::Sender<Frame>, AbortHandle)>,
     dials: JoinSet<()>,
-    /// Where the connections' tasks run.
-    io: tokio::runtime::Handle,
+    /// Where the peers' connections' tasks run.
+    peer_io: tokio::runtime::Handle,
     conns: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
 }
 
@@ -569,7 +574,7 @@ impl<S: Service + 'static> Core<S> {
                     self.peer_ids.then_some(id),
                     rx,
                 );
-                let task = self.dials.spawn_on(dial, &self.io);
+                let task = self.dials.spawn_on(dial, &self.peer_io);
                 self.peers.insert(id, (addr, tx, task));
             }
         }
