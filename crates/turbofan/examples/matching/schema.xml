@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The matching engine's messages: requests from a client, the events the service sends back, and
+     the book query and its answer. codec.rs is generated from it, and checked in: the example's
+     test of it says how to write it again. Prices are in ticks. -->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="matching" id="11" version="0"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="groupSizeEncoding">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+        <!-- For a snapshot's groups, which can outgrow a uint16. -->
+        <composite name="largeGroupSizeEncoding">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint32"/>
+        </composite>
+        <type name="Symbol" primitiveType="char" length="8" characterEncoding="ASCII"/>
+        <type name="OptionalPrice" primitiveType="uint64" presence="optional"/>
+        <type name="OptionalQuantity" primitiveType="uint64" presence="optional"/>
+        <type name="OptionalSeconds" primitiveType="uint64" presence="optional"/>
+        <!-- Cluster time, in nanoseconds. -->
+        <type name="OptionalTime" primitiveType="uint64" presence="optional"/>
+        <enum name="Side" encodingType="uint8">
+            <validValue name="Buy">1</validValue>
+            <validValue name="Sell">2</validValue>
+        </enum>
+        <enum name="TimeInForce" encodingType="uint8">
+            <validValue name="Gtc">0</validValue>
+            <validValue name="Ioc">1</validValue>
+            <validValue name="Fok">2</validValue>
+            <validValue name="Post">3</validValue>
+            <validValue name="Gtd">4</validValue>
+        </enum>
+        <enum name="RejectReason" encodingType="uint8">
+            <validValue name="Malformed">0</validValue>
+            <validValue name="UnknownOrder">1</validValue>
+            <validValue name="BookFull">2</validValue>
+        </enum>
+    </types>
+
+    <!-- Requests. A market order has no price; `seconds` is a Gtd order's, and only its. -->
+    <sbe:message name="NewOrder" id="1">
+        <field name="side" id="1" type="Side"/>
+        <field name="symbol" id="2" type="Symbol"/>
+        <field name="quantity" id="3" type="uint64"/>
+        <field name="price" id="4" type="OptionalPrice"/>
+        <field name="timeInForce" id="5" type="TimeInForce"/>
+        <field name="seconds" id="6" type="OptionalSeconds"/>
+        <field name="show" id="7" type="OptionalQuantity"/>
+        <field name="stop" id="8" type="OptionalPrice"/>
+    </sbe:message>
+    <sbe:message name="CancelOrder" id="2">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="ModifyOrder" id="3">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="quantity" id="2" type="uint64"/>
+        <field name="price" id="3" type="uint64"/>
+    </sbe:message>
+    <!-- A query, never logged: answered with a Book. -->
+    <sbe:message name="BookRequest" id="4">
+        <field name="symbol" id="1" type="Symbol"/>
+    </sbe:message>
+
+    <!-- Events, each to the session whose order it concerns. -->
+    <sbe:message name="Accepted" id="10">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="side" id="2" type="Side"/>
+        <field name="symbol" id="3" type="Symbol"/>
+        <field name="quantity" id="4" type="uint64"/>
+        <field name="price" id="5" type="OptionalPrice"/>
+        <field name="stop" id="6" type="OptionalPrice"/>
+    </sbe:message>
+    <!-- To both sides, at the resting order's price. -->
+    <sbe:message name="Fill" id="11">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="quantity" id="2" type="uint64"/>
+        <field name="price" id="3" type="uint64"/>
+        <field name="left" id="4" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Modified" id="12">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="quantity" id="2" type="uint64"/>
+        <field name="price" id="3" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Cancelled" id="13">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="left" id="2" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Expired" id="14">
+        <field name="orderId" id="1" type="uint64"/>
+        <field name="left" id="2" type="uint64"/>
+    </sbe:message>
+    <!-- A stop came in. -->
+    <sbe:message name="Triggered" id="15">
+        <field name="orderId" id="1" type="uint64"/>
+    </sbe:message>
+    <sbe:message name="Rejected" id="16">
+        <field name="reason" id="1" type="RejectReason"/>
+    </sbe:message>
+    <!-- The best price levels on each side, best first. -->
+    <sbe:message name="Book" id="17">
+        <group name="bids" id="1">
+            <field name="price" id="1" type="uint64"/>
+            <field name="quantity" id="2" type="uint64"/>
+        </group>
+        <group name="asks" id="2">
+            <field name="price" id="3" type="uint64"/>
+            <field name="quantity" id="4" type="uint64"/>
+        </group>
+    </sbe:message>
+
+    <!-- The service's state, as its snapshot: never sent. A Gtd stop's expiry is its `expires`; the
+         expiry timers themselves are the cluster's, snapshotted with it. -->
+    <sbe:message name="Snapshot" id="20">
+        <field name="lastId" id="1" type="uint64"/>
+        <field name="lastSeq" id="2" type="uint64"/>
+        <group name="orders" id="3" dimensionType="largeGroupSizeEncoding">
+            <field name="orderId" id="4" type="uint64"/>
+            <field name="session" id="5" type="uint64"/>
+            <field name="side" id="6" type="Side"/>
+            <field name="symbol" id="7" type="Symbol"/>
+            <field name="price" id="8" type="uint64"/>
+            <field name="quantity" id="9" type="uint64"/>
+            <field name="hidden" id="10" type="uint64"/>
+            <field name="show" id="11" type="uint64"/>
+            <field name="seq" id="12" type="uint64"/>
+            <field name="expires" id="13" type="OptionalTime"/>
+        </group>
+        <group name="stops" id="14" dimensionType="largeGroupSizeEncoding">
+            <field name="orderId" id="15" type="uint64"/>
+            <field name="session" id="16" type="uint64"/>
+            <field name="side" id="17" type="Side"/>
+            <field name="symbol" id="18" type="Symbol"/>
+            <field name="trigger" id="19" type="uint64"/>
+            <field name="quantity" id="20" type="uint64"/>
+            <field name="price" id="21" type="OptionalPrice"/>
+            <field name="timeInForce" id="22" type="TimeInForce"/>
+            <field name="expires" id="23" type="OptionalTime"/>
+            <field name="show" id="24" type="uint64"/>
+        </group>
+        <group name="lastPrices" id="25" dimensionType="largeGroupSizeEncoding">
+            <field name="symbol" id="26" type="Symbol"/>
+            <field name="price" id="27" type="uint64"/>
+        </group>
+    </sbe:message>
+</sbe:messageSchema>

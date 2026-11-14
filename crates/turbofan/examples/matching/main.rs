@@ -1,8 +1,11 @@
 //! A matching engine (#32): limit and market orders on any number of symbols, matched by price
 //! and then time, cancelled and modified, each one's events sent to the session that placed it.
 //!
-//! Its nodes run as any service's ([`turbofan::run`]). `client` sends the lines typed into it and
-//! prints the events that come back:
+//! Its messages are SBE, from `schema.xml`: requests, the events sent back, the `book` query and
+//! its answer, and its snapshot. `codec.rs` is generated from it, and checked in (an example has no `build.rs`
+//! of its own); a test says when it's stale. Its nodes run as any service's ([`turbofan::run`]).
+//! `client` turns each line typed into it into a request, and prints the events that come back as
+//! lines:
 //!
 //! ```sh
 //! cargo run --example matching -- serve --id 1 --data /tmp/matching/1 \
@@ -12,7 +15,8 @@
 //! cargo run --example matching -- client --clients 127.0.0.1:7101,127.0.0.1:7102,127.0.0.1:7103
 //! ```
 //!
-//! A request is a line, quantities and prices whole numbers above zero (prices in ticks):
+//! A request, as a line typed into `client`, quantities and prices whole numbers above zero (prices
+//! in ticks):
 //!
 //! - `buy <symbol> <quantity> [<price>] [<time in force>]`, `sell ...`: a limit order, or a market
 //!   order without a price. The time in force says what becomes of what doesn't trade at once:
@@ -38,7 +42,7 @@
 //!   cancelled and placed again instead.
 //! - `book <symbol>`: the best price levels on each side, as a query, never logged.
 //!
-//! The events, each a line to the session whose order it concerns:
+//! The events, each to the session whose order it concerns, as `client` prints them:
 //!
 //! - `accepted <id> <side> <symbol> <quantity> <price|market> [stop <trigger>]`
 //! - `triggered <id>`: a stop came in.
@@ -57,6 +61,12 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use turbofan::{CloseReason, Ctx, Service, SessionId, SnapshotWriter};
+use turbofan_sbe::Encode;
+
+use codec::{Decoded, RejectReason};
+
+#[allow(dead_code, clippy::all, clippy::pedantic, reason = "generated, by turbofan_sbe::codegen")]
+mod codec;
 
 /// This cluster's `Hello.service_id`.
 const SERVICE_ID: u32 = 11;
@@ -86,18 +96,18 @@ impl Side {
         }
     }
 
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "buy" => Some(Self::Buy),
-            "sell" => Some(Self::Sell),
-            _ => None,
+    fn from_wire(side: codec::Side) -> Option<Self> {
+        match side {
+            codec::Side::Buy => Some(Self::Buy),
+            codec::Side::Sell => Some(Self::Sell),
+            codec::Side::Unknown(_) => None,
         }
     }
 
-    fn name(self) -> &'static str {
+    fn wire(self) -> codec::Side {
         match self {
-            Self::Buy => "buy",
-            Self::Sell => "sell",
+            Self::Buy => codec::Side::Buy,
+            Self::Sell => codec::Side::Sell,
         }
     }
 
@@ -135,13 +145,13 @@ enum TimeInForce {
 }
 
 impl TimeInForce {
-    fn name(self) -> &'static str {
+    fn wire(self) -> codec::TimeInForce {
         match self {
-            Self::Gtc => "gtc",
-            Self::Ioc => "ioc",
-            Self::Fok => "fok",
-            Self::Post => "post",
-            Self::Gtd(_) => "gtd",
+            Self::Gtc => codec::TimeInForce::Gtc,
+            Self::Ioc => codec::TimeInForce::Ioc,
+            Self::Fok => codec::TimeInForce::Fok,
+            Self::Post => codec::TimeInForce::Post,
+            Self::Gtd(_) => codec::TimeInForce::Gtd,
         }
     }
 
@@ -271,17 +281,21 @@ struct Matching {
 impl Service for Matching {
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
         match parse(payload) {
-            Err(why) => send(ctx, session, format!("rejected {why}")),
+            Err(reason) => send(ctx, session, &codec::Rejected { reason }),
             Ok(Request::Place { side, symbol, quantity, limit, tif, show, stop }) => {
                 let waits = tif.rests() || stop.is_some();
                 if waits && self.tranches + tranches(quantity, show) > MAX_ORDERS {
-                    return send(ctx, session, "rejected book-full".to_owned());
+                    return send(ctx, session, &codec::Rejected { reason: RejectReason::BookFull });
                 }
                 self.last_id += 1;
                 let id = self.last_id;
-                let price = limit.map_or_else(|| "market".to_owned(), |p| p.to_string());
-                let trigger = stop.map_or_else(String::new, |t| format!(" stop {t}"));
-                send(ctx, session, format!("accepted {id} {} {symbol} {quantity} {price}{trigger}", side.name()));
+                let wire_symbol = turbofan_sbe::pad(symbol.as_bytes());
+                let side_ = side.wire();
+                send(
+                    ctx,
+                    session,
+                    &codec::Accepted { order_id: id, side: side_, symbol: wire_symbol, quantity, price: limit, stop },
+                );
                 let tif = match tif {
                     TimeInForce::Gtd(seconds) => {
                         TimeInForce::Gtd(ctx.now().saturating_add(seconds.saturating_mul(SECOND)))
@@ -308,18 +322,18 @@ impl Service for Matching {
                     _ => self.take(ctx, session, id).map(|order| order.left()),
                 };
                 match left {
-                    Some(left) => send(ctx, session, format!("cancelled {id} {left}")),
-                    None => send(ctx, session, "rejected unknown-order".to_owned()),
+                    Some(left) => send(ctx, session, &codec::Cancelled { order_id: id, left }),
+                    None => send(ctx, session, &codec::Rejected { reason: RejectReason::UnknownOrder }),
                 }
             }
             Ok(Request::Modify { id, quantity, price }) => {
                 let Some(order) = self.orders.get_mut(&id).filter(|o| o.session == session) else {
-                    return send(ctx, session, "rejected unknown-order".to_owned());
+                    return send(ctx, session, &codec::Rejected { reason: RejectReason::UnknownOrder });
                 };
                 if self.tranches - order.tranches() + tranches(quantity, order.show) > MAX_ORDERS {
-                    return send(ctx, session, "rejected book-full".to_owned());
+                    return send(ctx, session, &codec::Rejected { reason: RejectReason::BookFull });
                 }
-                send(ctx, session, format!("modified {id} {quantity} {price}"));
+                send(ctx, session, &codec::Modified { order_id: id, quantity, price });
                 if price == order.price && quantity <= order.left() {
                     let before = order.tranches();
                     order.quantity = order.quantity.min(quantity);
@@ -347,12 +361,12 @@ impl Service for Matching {
             let order = self.remove(id);
             (order.session, order.left())
         };
-        send(ctx, session, format!("expired {id} {left}"));
+        send(ctx, session, &codec::Expired { order_id: id, left });
     }
 
     fn on_query(&self, _session: SessionId, query: &[u8]) -> Option<Vec<u8>> {
-        let symbol = std::str::from_utf8(query).ok()?.strip_prefix("book ").filter(|s| valid_symbol(s))?;
-        let Some(book) = self.books.get(symbol) else { return Some(b"bids\nasks".to_vec()) };
+        let Ok((Decoded::BookRequest(request), len)) = codec::decode(query) else { return None };
+        let symbol = std::str::from_utf8(request.symbol()).ok().filter(|s| valid_symbol(s) && len == query.len())?;
         let levels = |side: &BTreeMap<(u64, u64), u64>| {
             let mut levels: Vec<(u64, u64)> = Vec::new();
             for id in side.values() {
@@ -367,9 +381,18 @@ impl Service for Matching {
                     break;
                 }
             }
-            levels.iter().map(|(price, quantity)| format!(" {quantity}@{price}")).collect::<String>()
+            levels
         };
-        Some(format!("bids{}\nasks{}", levels(&book.bids), levels(&book.asks)).into_bytes())
+        let (mut bids, mut asks) = (Vec::new(), Vec::new());
+        if let Some(book) = self.books.get(symbol) {
+            bids =
+                levels(&book.bids).into_iter().map(|(price, quantity)| codec::BookBids { price, quantity }).collect();
+            asks =
+                levels(&book.asks).into_iter().map(|(price, quantity)| codec::BookAsks { price, quantity }).collect();
+        }
+        let mut answer = Vec::new();
+        codec::Book { bids: &bids, asks: &asks }.encode_into(&mut answer).expect("at most MAX_BOOK_LEVELS a side");
+        Some(answer)
     }
 
     fn on_session_close(&mut self, ctx: &mut Ctx, session: SessionId, _reason: CloseReason) {
@@ -388,71 +411,88 @@ impl Service for Matching {
         }
     }
 
-    /// The resting orders, waiting stops and last prices as text, a line each, after the last id
-    /// and seq given. Their expiry timers are the cluster's, snapshotted with it.
+    /// The resting orders, waiting stops and last prices, as an SBE `Snapshot`. Their expiry
+    /// timers are the cluster's, snapshotted with it.
     fn snapshot(&self) -> SnapshotWriter {
-        let mut text = format!("{} {}\n", self.last_id, self.last_seq);
-        for (id, o) in &self.orders {
-            let (session, side, symbol, expires) = (o.session.0, o.side.name(), &o.symbol, o.expires.unwrap_or(0));
-            let (price, quantity, hidden, show, seq) = (o.price, o.quantity, o.hidden, o.show, o.seq);
-            text +=
-                &format!("order {id} {session} {side} {symbol} {price} {quantity} {hidden} {show} {seq} {expires}\n");
-        }
-        for (id, Stop { trigger, order: o }) in &self.stops {
-            let (session, side, symbol, limit) = (o.session.0, o.side.name(), &o.symbol, o.limit.unwrap_or(0));
-            let (quantity, tif, expires, show) = (o.quantity, o.tif.name(), o.expires().unwrap_or(0), o.show);
-            text +=
-                &format!("stop {id} {session} {side} {symbol} {trigger} {quantity} {limit} {tif} {expires} {show}\n");
-        }
-        for (symbol, price) in &self.last {
-            text += &format!("last {symbol} {price}\n");
-        }
-        Box::new(move |out| out.write_all(text.as_bytes()))
+        let orders: Vec<_> = (self.orders.iter())
+            .map(|(&order_id, o)| codec::SnapshotOrders {
+                order_id,
+                session: o.session.0,
+                side: o.side.wire(),
+                symbol: turbofan_sbe::pad(o.symbol.as_bytes()),
+                price: o.price,
+                quantity: o.quantity,
+                hidden: o.hidden,
+                show: o.show,
+                seq: o.seq,
+                expires: o.expires,
+            })
+            .collect();
+        let stops: Vec<_> = (self.stops.iter())
+            .map(|(&order_id, Stop { trigger, order: o })| codec::SnapshotStops {
+                order_id,
+                session: o.session.0,
+                side: o.side.wire(),
+                symbol: turbofan_sbe::pad(o.symbol.as_bytes()),
+                trigger: *trigger,
+                quantity: o.quantity,
+                price: o.limit,
+                time_in_force: o.tif.wire(),
+                expires: o.expires(),
+                show: o.show,
+            })
+            .collect();
+        let last_prices: Vec<_> = (self.last.iter())
+            .map(|(symbol, &price)| codec::SnapshotLastPrices { symbol: turbofan_sbe::pad(symbol.as_bytes()), price })
+            .collect();
+        let snapshot = codec::Snapshot {
+            last_id: self.last_id,
+            last_seq: self.last_seq,
+            orders: &orders,
+            stops: &stops,
+            last_prices: &last_prices,
+        };
+        let mut bytes = Vec::new();
+        snapshot.encode_into(&mut bytes).expect("at most MAX_ORDERS orders and stops, and a u32 of symbols");
+        Box::new(move |out| out.write_all(&bytes))
     }
 
     fn restore(&mut self, from: &mut dyn Read) -> io::Result<()> {
-        let mut text = String::new();
-        from.read_to_string(&mut text)?;
+        let mut bytes = Vec::new();
+        from.read_to_end(&mut bytes)?;
         let damaged = || io::Error::new(io::ErrorKind::InvalidData, "a damaged matching snapshot");
-        let mut lines = text.lines();
-        let header = lines.next().and_then(|l| l.split_once(' '));
-        let (last_id, last_seq) =
-            header.and_then(|(i, s)| Some((i.parse().ok()?, s.parse().ok()?))).ok_or_else(damaged)?;
+        let Ok((Decoded::Snapshot(snapshot), len)) = codec::decode(&bytes) else { return Err(damaged()) };
+        let (last_id, last_seq) = (snapshot.last_id(), snapshot.last_seq());
+        if len != bytes.len() {
+            return Err(damaged());
+        }
         let mut restored = Self { last_id, last_seq, ..Self::default() };
         let mut seqs = std::collections::BTreeSet::new();
-        for line in lines {
-            let fresh = |restored: &Self, id| {
-                id <= last_id && !restored.orders.contains_key(&id) && !restored.stops.contains_key(&id)
-            };
-            match line.split_once(' ') {
-                Some(("order", line)) => {
-                    let (id, order) = parse_order(line).ok_or_else(damaged)?;
-                    if !fresh(&restored, id) || !seqs.insert(order.seq) || order.seq > last_seq {
-                        return Err(damaged());
-                    }
-                    restored.rest(id, order);
-                }
-                Some(("stop", line)) => {
-                    let stop = parse_stop(line).ok_or_else(damaged)?;
-                    if !fresh(&restored, stop.order.id) {
-                        return Err(damaged());
-                    }
-                    restored.tranches += tranches(stop.order.quantity, stop.order.show);
-                    restored.triggers.insert(stop.key());
-                    restored.stops.insert(stop.order.id, stop);
-                }
-                Some(("last", line)) => {
-                    let (symbol, price) = line.split_once(' ').ok_or_else(damaged)?;
-                    let price = price.parse().ok().filter(|p| *p > 0 && valid_symbol(symbol)).ok_or_else(damaged)?;
-                    if restored.last.insert(symbol.to_owned(), price).is_some() {
-                        return Err(damaged());
-                    }
-                }
-                _ => return Err(damaged()),
+        let fresh = |restored: &Self, id| {
+            id <= last_id && !restored.orders.contains_key(&id) && !restored.stops.contains_key(&id)
+        };
+        for entry in snapshot.orders() {
+            let (id, order) = restore_order(entry).ok_or_else(damaged)?;
+            if !fresh(&restored, id) || !seqs.insert(order.seq) || order.seq > last_seq {
+                return Err(damaged());
             }
+            restored.rest(id, order);
         }
-        if !text.ends_with('\n') {
-            return Err(damaged());
+        for entry in snapshot.stops() {
+            let stop = restore_stop(entry).ok_or_else(damaged)?;
+            if !fresh(&restored, stop.order.id) {
+                return Err(damaged());
+            }
+            restored.tranches += tranches(stop.order.quantity, stop.order.show);
+            restored.triggers.insert(stop.key());
+            restored.stops.insert(stop.order.id, stop);
+        }
+        for entry in snapshot.last_prices() {
+            let symbol = symbol(entry.symbol()).ok_or_else(damaged)?;
+            let price = Some(entry.price()).filter(|p| *p > 0).ok_or_else(damaged)?;
+            if restored.last.insert(symbol, price).is_some() {
+                return Err(damaged());
+            }
         }
         *self = restored;
         Ok(())
@@ -468,7 +508,7 @@ impl Matching {
         let crosses = |resting: &Order| limit.is_none_or(|limit| side.crosses(limit, resting.price));
         let killed = self.killed(session, side, &symbol, quantity, limit, tif);
         if killed {
-            return send(ctx, session, format!("cancelled {id} {quantity}"));
+            return send(ctx, session, &codec::Cancelled { order_id: id, left: quantity });
         }
         let mut traded = None;
         if let Some(book) = self.books.get_mut(&symbol) {
@@ -483,7 +523,7 @@ impl Matching {
                 let before = resting.tranches();
                 if resting.session == session {
                     // Self-trade prevention: the resting order goes, and the new one goes on.
-                    send(ctx, session, format!("cancelled {resting_id} {}", resting.left()));
+                    send(ctx, session, &codec::Cancelled { order_id: resting_id, left: resting.left() });
                     (resting.quantity, resting.hidden) = (0, 0);
                 } else {
                     let filled = quantity.min(resting.quantity);
@@ -491,8 +531,9 @@ impl Matching {
                     resting.quantity -= filled;
                     let (price, left) = (resting.price, resting.left());
                     traded = Some(price);
-                    send(ctx, resting.session, format!("fill {resting_id} {filled} {price} {left}"));
-                    send(ctx, session, format!("fill {id} {filled} {price} {quantity}"));
+                    let fill = codec::Fill { order_id: resting_id, quantity: filled, price, left };
+                    send(ctx, resting.session, &fill);
+                    send(ctx, session, &codec::Fill { order_id: id, quantity: filled, price, left: quantity });
                 }
                 if resting.left() == 0 {
                     if resting.expires.is_some() {
@@ -532,7 +573,7 @@ impl Matching {
                 let hidden = quantity - shown;
                 self.rest(id, Order { session, side, symbol, price, quantity: shown, hidden, show, seq, expires });
             }
-            _ => send(ctx, session, format!("cancelled {id} {quantity}")),
+            _ => send(ctx, session, &codec::Cancelled { order_id: id, left: quantity }),
         }
     }
 
@@ -578,7 +619,7 @@ impl Matching {
                 // Back again if it rests.
                 ctx.cancel_timer(id);
             }
-            send(ctx, order.session, format!("triggered {id}"));
+            send(ctx, order.session, &codec::Triggered { order_id: id });
             self.execute(ctx, order);
         }
     }
@@ -638,8 +679,10 @@ impl Matching {
     }
 }
 
-fn send(ctx: &mut Ctx, session: SessionId, event: String) {
-    ctx.send(session, event).expect("an event is a few bounded fields");
+fn send(ctx: &mut Ctx, session: SessionId, event: &impl Encode) {
+    let mut payload = Vec::new();
+    event.encode_into(&mut payload).expect("an event has no groups or data");
+    ctx.send(session, payload).expect("an event is a few fixed fields");
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -664,43 +707,44 @@ enum Request {
     },
 }
 
-/// A request, from its text. Untrusted, from any client: refused, never panicked on.
-fn parse(text: &[u8]) -> Result<Request, &'static str> {
-    let text = std::str::from_utf8(text).map_err(|_| "malformed")?;
-    let number = |word: &str| word.parse::<u64>().ok().filter(|n| *n > 0).ok_or("malformed");
-    // The words of a payload, at most MAX_PAYLOAD_BYTES of them.
-    match text.split_ascii_whitespace().collect::<Vec<_>>()[..] {
-        [side, symbol, quantity, ref rest @ ..] if Side::from_name(side).is_some() && valid_symbol(symbol) => {
-            let (rest, stop) = match *rest {
-                ["stop", trigger, ref rest @ ..] => (rest, Some(number(trigger)?)),
-                _ => (rest, None),
+/// A request, from its SBE message. Untrusted, from any client: refused, never panicked on.
+fn parse(payload: &[u8]) -> Result<Request, RejectReason> {
+    let malformed = RejectReason::Malformed;
+    let positive = |n: u64| if n > 0 { Ok(n) } else { Err(malformed) };
+    let (message, len) = codec::decode(payload).map_err(|_| malformed)?;
+    if len != payload.len() {
+        return Err(malformed);
+    }
+    match message {
+        Decoded::NewOrder(order) => {
+            let side = Side::from_wire(order.side()).ok_or(malformed)?;
+            let symbol = symbol(order.symbol()).ok_or(malformed)?;
+            let limit = order.price().map(positive).transpose()?;
+            let tif = match (order.time_in_force(), order.seconds()) {
+                (codec::TimeInForce::Gtc, None) => TimeInForce::Gtc,
+                (codec::TimeInForce::Ioc, None) => TimeInForce::Ioc,
+                (codec::TimeInForce::Fok, None) => TimeInForce::Fok,
+                (codec::TimeInForce::Post, None) => TimeInForce::Post,
+                (codec::TimeInForce::Gtd, Some(seconds)) => TimeInForce::Gtd(positive(seconds)?),
+                _ => return Err(malformed),
             };
-            let (rest, show) = match *rest {
-                [ref rest @ .., "show", show] => (rest, number(show)?),
-                _ => (rest, 0),
-            };
-            let (limit, tif) = match *rest {
-                [] | ["ioc"] => (None, TimeInForce::Ioc),
-                ["fok"] => (None, TimeInForce::Fok),
-                [price] => (Some(number(price)?), TimeInForce::Gtc),
-                [price, "ioc"] => (Some(number(price)?), TimeInForce::Ioc),
-                [price, "fok"] => (Some(number(price)?), TimeInForce::Fok),
-                [price, "post"] => (Some(number(price)?), TimeInForce::Post),
-                [price, "gtd", seconds] => (Some(number(price)?), TimeInForce::Gtd(number(seconds)?)),
-                _ => return Err("malformed"),
-            };
-            if show > 0 && !(limit.is_some() && tif.rests()) {
-                return Err("malformed");
+            let show = order.show().map_or(Ok(0), positive)?;
+            // A market order never rests; an iceberg only rests.
+            let market_rests = limit.is_none() && tif.rests();
+            if market_rests || (show > 0 && !(limit.is_some() && tif.rests())) {
+                return Err(malformed);
             }
-            let side = Side::from_name(side).expect("just checked");
-            let (symbol, quantity) = (symbol.to_owned(), number(quantity)?);
+            let (quantity, stop) = (positive(order.quantity())?, order.stop().map(positive).transpose()?);
             Ok(Request::Place { side, symbol, quantity, limit, tif, show, stop })
         }
-        ["cancel", id] => Ok(Request::Cancel { id: number(id)? }),
-        ["modify", id, quantity, price] => {
-            Ok(Request::Modify { id: number(id)?, quantity: number(quantity)?, price: number(price)? })
-        }
-        _ => Err("malformed"),
+        Decoded::CancelOrder(cancel) => Ok(Request::Cancel { id: cancel.order_id() }),
+        Decoded::ModifyOrder(modify) => Ok(Request::Modify {
+            id: modify.order_id(),
+            quantity: positive(modify.quantity())?,
+            price: positive(modify.price())?,
+        }),
+        // An event, or a query sent as a message.
+        _ => Err(malformed),
     }
 }
 
@@ -708,55 +752,49 @@ fn valid_symbol(symbol: &str) -> bool {
     (1..=MAX_SYMBOL_BYTES).contains(&symbol.len()) && symbol.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// A snapshot's resting order: `order <id> <session> <side> <symbol> <price> <quantity> <hidden>
-/// <show> <seq> <expires|0>`, after the `order`.
-fn parse_order(line: &str) -> Option<(u64, Order)> {
-    let words: Vec<&str> = line.split(' ').collect();
-    let [id, session, side, symbol, price, quantity, hidden, show, seq, expires] = words[..] else { return None };
-    let number = |w: &str| w.parse::<u64>().ok();
-    let side = Side::from_name(side)?;
-    let (price, quantity) = (number(price).filter(|p| *p > 0)?, number(quantity).filter(|q| *q > 0)?);
-    let order = Order {
-        session: SessionId(number(session)?),
-        side,
-        symbol: symbol.to_owned(),
-        price,
-        quantity,
-        hidden: number(hidden)?,
-        show: number(show)?,
-        seq: number(seq)?,
-        expires: Some(number(expires)?).filter(|at| *at > 0),
-    };
-    let iceberg_shows = order.hidden == 0 || order.show > 0;
-    (valid_symbol(symbol) && iceberg_shows).then_some((number(id)?, order))
+/// A symbol, from its char array, if it's a valid one.
+fn symbol(chars: &[u8]) -> Option<String> {
+    std::str::from_utf8(chars).ok().filter(|s| valid_symbol(s)).map(str::to_owned)
 }
 
-/// A snapshot's waiting stop: `stop <id> <session> <side> <symbol> <trigger> <quantity> <limit|0>
-/// <tif> <expires|0> <show>`, after the `stop`.
-fn parse_stop(line: &str) -> Option<Stop> {
-    let words: Vec<&str> = line.split(' ').collect();
-    let [id, session, side, symbol, trigger, quantity, limit, tif, expires, show] = words[..] else { return None };
-    let number = |w: &str| w.parse::<u64>().ok();
-    let positive = |w: &str| number(w).filter(|n| *n > 0);
-    let tif = match (tif, positive(expires)) {
-        ("gtc", None) => TimeInForce::Gtc,
-        ("ioc", None) => TimeInForce::Ioc,
-        ("fok", None) => TimeInForce::Fok,
-        ("post", None) => TimeInForce::Post,
-        ("gtd", Some(at)) => TimeInForce::Gtd(at),
+/// A snapshot's resting order, and its id.
+fn restore_order(entry: codec::SnapshotOrdersRef<'_>) -> Option<(u64, Order)> {
+    let order = Order {
+        session: SessionId(entry.session()),
+        side: Side::from_wire(entry.side())?,
+        symbol: symbol(entry.symbol())?,
+        price: Some(entry.price()).filter(|p| *p > 0)?,
+        quantity: Some(entry.quantity()).filter(|q| *q > 0)?,
+        hidden: entry.hidden(),
+        show: entry.show(),
+        seq: entry.seq(),
+        expires: entry.expires(),
+    };
+    let iceberg_shows = order.hidden == 0 || order.show > 0;
+    iceberg_shows.then_some((entry.order_id(), order))
+}
+
+/// A snapshot's waiting stop.
+fn restore_stop(entry: codec::SnapshotStopsRef<'_>) -> Option<Stop> {
+    let tif = match (entry.time_in_force(), entry.expires()) {
+        (codec::TimeInForce::Gtc, None) => TimeInForce::Gtc,
+        (codec::TimeInForce::Ioc, None) => TimeInForce::Ioc,
+        (codec::TimeInForce::Fok, None) => TimeInForce::Fok,
+        (codec::TimeInForce::Post, None) => TimeInForce::Post,
+        (codec::TimeInForce::Gtd, Some(at)) => TimeInForce::Gtd(at),
         _ => return None,
     };
     let order = Incoming {
-        id: number(id)?,
-        session: SessionId(number(session)?),
-        side: Side::from_name(side)?,
-        symbol: symbol.to_owned(),
-        quantity: positive(quantity)?,
-        limit: positive(limit),
+        id: entry.order_id(),
+        session: SessionId(entry.session()),
+        side: Side::from_wire(entry.side())?,
+        symbol: symbol(entry.symbol())?,
+        quantity: Some(entry.quantity()).filter(|q| *q > 0)?,
+        limit: entry.price().filter(|p| *p > 0),
         tif,
-        show: number(show)?,
+        show: entry.show(),
     };
-    valid_symbol(symbol).then_some(Stop { trigger: positive(trigger)?, order })
+    Some(Stop { trigger: Some(entry.trigger()).filter(|t| *t > 0)?, order })
 }
 
 fn main() -> ExitCode {
@@ -765,6 +803,103 @@ fn main() -> ExitCode {
         return client::main(&args[1..]);
     }
     turbofan::run(SERVICE_ID, Matching::default())
+}
+
+/// The requests and events as lines of text, for people: what `client` reads and prints.
+mod text {
+    use super::codec::{self, Decoded, RejectReason};
+
+    /// A line typed, as what's sent.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Line {
+        /// A request, to send as a message.
+        Message(Vec<u8>),
+        /// A `book`, to ask as a query.
+        Query(Vec<u8>),
+    }
+
+    /// The request a line asks for, or `None` if it's not one. It reads the words, no more: the
+    /// service judges what they say (a quantity of 0, say).
+    pub fn request(line: &str) -> Option<Line> {
+        // The null of an optional field, never a price.
+        let number = |word: &str| word.parse::<u64>().ok().filter(|n| *n < u64::MAX);
+        let symbol = |word: &str| (word.len() <= 8).then(|| turbofan_sbe::pad(word.as_bytes()));
+        let mut out = Vec::new();
+        let encoded = match line.split_ascii_whitespace().collect::<Vec<_>>()[..] {
+            [side @ ("buy" | "sell"), word, quantity, ref rest @ ..] => {
+                let (rest, stop) = match *rest {
+                    ["stop", trigger, ref rest @ ..] => (rest, Some(number(trigger)?)),
+                    _ => (rest, None),
+                };
+                let (rest, show) = match *rest {
+                    [ref rest @ .., "show", show] => (rest, Some(number(show)?)),
+                    _ => (rest, None),
+                };
+                use codec::TimeInForce::{Fok, Gtc, Gtd, Ioc, Post};
+                let (price, time_in_force, seconds) = match *rest {
+                    [] | ["ioc"] => (None, Ioc, None),
+                    ["fok"] => (None, Fok, None),
+                    [price] => (Some(number(price)?), Gtc, None),
+                    [price, "ioc"] => (Some(number(price)?), Ioc, None),
+                    [price, "fok"] => (Some(number(price)?), Fok, None),
+                    [price, "post"] => (Some(number(price)?), Post, None),
+                    [price, "gtd", seconds] => (Some(number(price)?), Gtd, Some(number(seconds)?)),
+                    _ => return None,
+                };
+                let side = if side == "buy" { codec::Side::Buy } else { codec::Side::Sell };
+                let (symbol, quantity) = (symbol(word)?, number(quantity)?);
+                codec::NewOrder { side, symbol, quantity, price, time_in_force, seconds, show, stop }
+                    .encode_into(&mut out)
+            }
+            ["cancel", id] => codec::CancelOrder { order_id: number(id)? }.encode_into(&mut out),
+            ["modify", id, quantity, price] => {
+                let (order_id, quantity, price) = (number(id)?, number(quantity)?, number(price)?);
+                codec::ModifyOrder { order_id, quantity, price }.encode_into(&mut out)
+            }
+            ["book", word] => {
+                codec::BookRequest { symbol: symbol(word)? }.encode_into(&mut out).ok()?;
+                return Some(Line::Query(out));
+            }
+            _ => return None,
+        };
+        encoded.ok()?;
+        Some(Line::Message(out))
+    }
+
+    /// An event, or `book`'s answer, as a line (two, for a book).
+    pub fn describe(payload: &[u8]) -> String {
+        let side = |side| match side {
+            codec::Side::Buy => "buy",
+            codec::Side::Sell => "sell",
+            codec::Side::Unknown(_) => "?",
+        };
+        let Ok((message, _)) = codec::decode(payload) else { return format!("undecodable: {payload:?}") };
+        match message {
+            Decoded::Accepted(e) => {
+                let symbol = String::from_utf8_lossy(e.symbol());
+                let price = e.price().map_or_else(|| "market".to_owned(), |p| p.to_string());
+                let stop = e.stop().map_or_else(String::new, |t| format!(" stop {t}"));
+                format!("accepted {} {} {symbol} {} {price}{stop}", e.order_id(), side(e.side()), e.quantity())
+            }
+            Decoded::Fill(e) => format!("fill {} {} {} {}", e.order_id(), e.quantity(), e.price(), e.left()),
+            Decoded::Modified(e) => format!("modified {} {} {}", e.order_id(), e.quantity(), e.price()),
+            Decoded::Cancelled(e) => format!("cancelled {} {}", e.order_id(), e.left()),
+            Decoded::Expired(e) => format!("expired {} {}", e.order_id(), e.left()),
+            Decoded::Triggered(e) => format!("triggered {}", e.order_id()),
+            Decoded::Rejected(e) => match e.reason() {
+                RejectReason::Malformed => "rejected malformed".to_owned(),
+                RejectReason::UnknownOrder => "rejected unknown-order".to_owned(),
+                RejectReason::BookFull => "rejected book-full".to_owned(),
+                RejectReason::Unknown(raw) => format!("rejected {raw}"),
+            },
+            Decoded::Book(book) => {
+                let bids: String = book.bids().map(|l| format!(" {}@{}", l.quantity(), l.price())).collect();
+                let asks: String = book.asks().map(|l| format!(" {}@{}", l.quantity(), l.price())).collect();
+                format!("bids{bids}\nasks{asks}")
+            }
+            request => format!("{request:?}"),
+        }
+    }
 }
 
 /// A session with the cluster: each line typed is a request (`book` a query), and each event is
@@ -779,6 +914,7 @@ mod client {
     use turbofan::client::Event;
 
     use super::SERVICE_ID;
+    use super::text::{self, Line};
 
     /// As the client guide's examples.
     const KEEPALIVE: Duration = Duration::from_millis(500);
@@ -810,9 +946,10 @@ mod client {
             let (mut applied, mut last_sent) = (session.applied(), 0);
             loop {
                 tokio::select! {
-                    line = typed.recv() => match line {
+                    line = typed.recv() => match line.as_deref().map(|line| (line, text::request(line))) {
                         None => break,
-                        Some(line) if line.starts_with("book ") => {
+                        Some((line, None)) => eprintln!("not a request: {line}"),
+                        Some((_, Some(Line::Query(query)))) => {
                             // A query isn't ordered with the messages: it sees what was sent
                             // before it once that's applied.
                             if applied.wait_for(|applied| *applied >= last_sent).await.is_err() {
@@ -824,12 +961,12 @@ mod client {
                                     return ExitCode::FAILURE;
                                 }
                             }
-                            match session.query(line).await {
-                                Ok(answer) => println!("{}", String::from_utf8_lossy(&answer)),
+                            match session.query(query).await {
+                                Ok(answer) => println!("{}", text::describe(&answer)),
                                 Err(e) => eprintln!("query: {e}"),
                             }
                         }
-                        Some(line) => match session.send(line).await {
+                        Some((_, Some(Line::Message(request)))) => match session.send(request).await {
                             Ok(seq) => last_sent = seq,
                             Err(e) => eprintln!("send: {e}"),
                         },
@@ -847,7 +984,7 @@ mod client {
     /// Prints an event: false once the session is over.
     fn print(event: Option<Event>) -> bool {
         match event {
-            Some(Event::Message(event)) => println!("{}", String::from_utf8_lossy(&event)),
+            Some(Event::Message(event)) => println!("{}", text::describe(&event)),
             Some(Event::Closed { .. }) | None => {
                 eprintln!("the session closed");
                 return false;
@@ -868,24 +1005,33 @@ mod tests {
     const BOB: SessionId = SessionId(2);
     const CAROL: SessionId = SessionId(3);
 
-    /// The events a request sends, each with the session it goes to.
-    fn request(service: &mut Matching, session: SessionId, text: &str) -> Vec<(u64, String)> {
+    /// The events a request, typed as a line, sends, each with the session it goes to.
+    fn request(service: &mut Matching, session: SessionId, line: &str) -> Vec<(u64, String)> {
         let mut ctx = Ctx::new(0);
-        service.on_message(&mut ctx, session, text.as_bytes());
+        service.on_message(&mut ctx, session, &message(line));
         events(ctx.take_effects())
+    }
+
+    /// The message a line is.
+    fn message(line: &str) -> Vec<u8> {
+        match text::request(line) {
+            Some(text::Line::Message(message)) => message,
+            other => panic!("{line:?}: {other:?}"),
+        }
     }
 
     /// The events among effects, each with the session it goes to: timers are left out.
     fn events(effects: Vec<Effect>) -> Vec<(u64, String)> {
         let sends = effects.into_iter().filter_map(|effect| match effect {
-            Effect::Send(to, event) => Some((to.0, String::from_utf8(event).unwrap())),
+            Effect::Send(to, event) => Some((to.0, text::describe(&event))),
             _ => None,
         });
         sends.collect()
     }
 
     fn book(service: &Matching, symbol: &str) -> String {
-        String::from_utf8(service.on_query(ALICE, format!("book {symbol}").as_bytes()).unwrap()).unwrap()
+        let Some(text::Line::Query(query)) = text::request(&format!("book {symbol}")) else { panic!("{symbol:?}") };
+        text::describe(&service.on_query(ALICE, &query).unwrap())
     }
 
     #[test]
@@ -994,12 +1140,92 @@ mod tests {
             "buy ACME 5 stop x 100",
             "buy ACME 5 100 stop 90",
             "buy ACME 5 stop 90 show 1",
+            "buy \u{ff} 1",
         ] {
-            assert_eq!(request(&mut service, ALICE, bad), [(1, "rejected malformed".to_owned())], "{bad:?}");
+            // The client refuses what isn't a request at all, and the service what says nonsense.
+            if let Some(line) = text::request(bad) {
+                let text::Line::Message(message) = line else { panic!("{bad:?}") };
+                let mut ctx = Ctx::new(0);
+                service.on_message(&mut ctx, ALICE, &message);
+                assert_eq!(events(ctx.take_effects()), [(1, "rejected malformed".to_owned())], "{bad:?}");
+            }
         }
-        assert_eq!(request(&mut service, ALICE, "buy \u{ff} 1"), [(1, "rejected malformed".to_owned())]);
         assert_eq!(service.last_id, 0);
-        assert_eq!(service.on_query(ALICE, b"book TOOLONGSYM"), None);
+        let Some(text::Line::Query(query)) = text::request("book AC.ME") else { panic!() };
+        assert_eq!(service.on_query(ALICE, &query), None);
+    }
+
+    /// What the client never sends, but another client could.
+    #[test]
+    fn a_malformed_message_is_rejected_and_changes_nothing() {
+        let mut service = Matching::default();
+        let order = codec::NewOrder {
+            side: codec::Side::Buy,
+            symbol: *b"ACME\0\0\0\0",
+            quantity: 1,
+            price: Some(100),
+            time_in_force: codec::TimeInForce::Gtc,
+            seconds: None,
+            show: None,
+            stop: None,
+        };
+        let encode = |message: &dyn Fn(&mut Vec<u8>)| {
+            let mut out = Vec::new();
+            message(&mut out);
+            out
+        };
+        let new_order = |order: codec::NewOrder| encode(&|out| order.encode_into(out).unwrap());
+        let mut trailing = new_order(order.clone());
+        trailing.push(0);
+        for bad in [
+            Vec::new(),
+            b"buy ACME 1 100".to_vec(),
+            trailing,
+            new_order(codec::NewOrder { side: codec::Side::Unknown(9), ..order.clone() }),
+            new_order(codec::NewOrder { time_in_force: codec::TimeInForce::Unknown(9), ..order.clone() }),
+            new_order(codec::NewOrder { symbol: *b"\0\0\0\0\0\0\0\0", ..order.clone() }),
+            new_order(codec::NewOrder { price: None, ..order.clone() }),
+            new_order(codec::NewOrder { seconds: Some(5), ..order.clone() }),
+            new_order(codec::NewOrder { time_in_force: codec::TimeInForce::Gtd, ..order.clone() }),
+            new_order(codec::NewOrder {
+                price: None,
+                show: Some(1),
+                time_in_force: codec::TimeInForce::Ioc,
+                ..order.clone()
+            }),
+            new_order(codec::NewOrder { stop: Some(0), ..order.clone() }),
+            encode(&|out| codec::Triggered { order_id: 1 }.encode_into(out).unwrap()),
+            encode(&|out| codec::BookRequest { symbol: order.symbol }.encode_into(out).unwrap()),
+        ] {
+            let mut ctx = Ctx::new(0);
+            service.on_message(&mut ctx, ALICE, &bad);
+            assert_eq!(events(ctx.take_effects()), [(1, "rejected malformed".to_owned())], "{bad:?}");
+        }
+        assert_eq!(service.last_id, 0);
+        assert_eq!(request(&mut service, ALICE, "buy ACME 1 100").len(), 1, "the order it was made from is fine");
+    }
+
+    /// `codec.rs` is what the generator writes from `schema.xml` now, formatted as `turbofan-sbe`'s
+    /// checked-in codecs are. `SBE_REGENERATE=1` rewrites it instead.
+    #[test]
+    fn the_codec_is_current() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/matching");
+        let code = turbofan_sbe::codegen::SbeGenerator::load(dir.join("schema.xml")).unwrap().render().unwrap();
+        let mut rustfmt = std::process::Command::new("rustfmt")
+            .args(["--edition", "2024", "--config", "max_width=120,use_small_heuristics=Max"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("rustfmt runs");
+        std::io::Write::write_all(&mut rustfmt.stdin.take().unwrap(), code.as_bytes()).unwrap();
+        let formatted = String::from_utf8(rustfmt.wait_with_output().unwrap().stdout).unwrap();
+        let path = dir.join("codec.rs");
+        if std::env::var_os("SBE_REGENERATE").is_some() {
+            std::fs::write(&path, formatted).unwrap();
+        } else {
+            let stale = "codec.rs is stale: SBE_REGENERATE=1 cargo test -p turbofan --example matching";
+            assert!(std::fs::read_to_string(&path).unwrap() == formatted, "{stale}");
+        }
     }
 
     #[test]
@@ -1058,15 +1284,15 @@ mod tests {
     fn a_good_till_date_order_expires_unless_it_goes_first() {
         let mut service = Matching::default();
         let mut ctx = Ctx::new(SECOND);
-        service.on_message(&mut ctx, ALICE, b"buy ACME 5 100 gtd 30");
-        service.on_message(&mut ctx, ALICE, b"buy ACME 5 99 gtd 60");
+        service.on_message(&mut ctx, ALICE, &message("buy ACME 5 100 gtd 30"));
+        service.on_message(&mut ctx, ALICE, &message("buy ACME 5 99 gtd 60"));
         let effects = ctx.take_effects();
         assert!(effects.contains(&Effect::Schedule { id: 1, at: 31 * SECOND }));
         assert!(effects.contains(&Effect::Schedule { id: 2, at: 61 * SECOND }));
         // A fill, a cancel and a modify take the timer with them; a modify that moves it puts
         // it back.
-        service.on_message(&mut ctx, BOB, b"sell ACME 5 100");
-        service.on_message(&mut ctx, ALICE, b"modify 2 5 98");
+        service.on_message(&mut ctx, BOB, &message("sell ACME 5 100"));
+        service.on_message(&mut ctx, ALICE, &message("modify 2 5 98"));
         let effects = ctx.take_effects();
         assert!(effects.contains(&Effect::Cancel(1)));
         assert!(effects.ends_with(&[Effect::Cancel(2), Effect::Schedule { id: 2, at: 61 * SECOND }]));
@@ -1166,7 +1392,7 @@ mod tests {
         assert_eq!(request(&mut service, ALICE, "modify 1 5 100"), [(1, "rejected unknown-order".to_owned())]);
         assert_eq!(request(&mut service, ALICE, "cancel 1"), [(1, "cancelled 1 5".to_owned())]);
         let mut ctx = Ctx::new(0);
-        service.on_message(&mut ctx, BOB, b"buy ACME 3 stop 100 100 gtd 10");
+        service.on_message(&mut ctx, BOB, &message("buy ACME 3 stop 100 100 gtd 10"));
         assert!(ctx.take_effects().contains(&Effect::Schedule { id: 3, at: 10 * SECOND }));
         service.on_timer(&mut ctx, 3);
         assert_eq!(events(ctx.take_effects()), [(2, "expired 3 3".to_owned())]);
@@ -1200,13 +1426,72 @@ mod tests {
         for cut in [0, 1, 2, bytes.len() - 1] {
             assert!(Matching::default().restore(&mut &bytes[..cut]).is_err(), "cut at {cut}");
         }
-        assert!(
-            Matching::default().restore(&mut &b"1 1\norder 5 1 buy ACME 1 1 0 0 1 0\n"[..]).is_err(),
-            "an id from the future"
-        );
-        assert!(
-            Matching::default().restore(&mut &b"1 1\norder 1 1 buy ACME 1 1 5 0 1 0\n"[..]).is_err(),
-            "an iceberg that shows none of itself"
-        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(Matching::default().restore(&mut trailing.as_slice()).is_err(), "a byte after it");
+        let mut request = Vec::new();
+        codec::CancelOrder { order_id: 1 }.encode_into(&mut request).unwrap();
+        assert!(Matching::default().restore(&mut request.as_slice()).is_err(), "another message");
+    }
+
+    /// Snapshots that decode, but whose state can't be.
+    #[test]
+    fn a_snapshot_that_says_nonsense_is_refused() {
+        let order = codec::SnapshotOrders {
+            order_id: 1,
+            session: 1,
+            side: codec::Side::Buy,
+            symbol: *b"ACME\0\0\0\0",
+            price: 100,
+            quantity: 5,
+            hidden: 0,
+            show: 0,
+            seq: 1,
+            expires: None,
+        };
+        let stop = codec::SnapshotStops {
+            order_id: 2,
+            session: 1,
+            side: codec::Side::Sell,
+            symbol: *b"ACME\0\0\0\0",
+            trigger: 90,
+            quantity: 5,
+            price: None,
+            time_in_force: codec::TimeInForce::Ioc,
+            expires: None,
+            show: 0,
+        };
+        let last = codec::SnapshotLastPrices { symbol: *b"ACME\0\0\0\0", price: 100 };
+        let restore = |orders: &[codec::SnapshotOrders],
+                       stops: &[codec::SnapshotStops],
+                       last_prices: &[codec::SnapshotLastPrices]| {
+            let snapshot = codec::Snapshot { last_id: 2, last_seq: 1, orders, stops, last_prices };
+            let mut bytes = Vec::new();
+            snapshot.encode_into(&mut bytes).unwrap();
+            Matching::default().restore(&mut bytes.as_slice())
+        };
+        restore(std::slice::from_ref(&order), std::slice::from_ref(&stop), std::slice::from_ref(&last))
+            .expect("the one these are made from is fine");
+        for (orders, why) in [
+            (vec![codec::SnapshotOrders { order_id: 3, ..order.clone() }], "an id from the future"),
+            (vec![codec::SnapshotOrders { seq: 2, ..order.clone() }], "a seq from the future"),
+            (vec![order.clone(), codec::SnapshotOrders { order_id: 2, ..order.clone() }], "a seq twice"),
+            (vec![codec::SnapshotOrders { hidden: 5, ..order.clone() }], "an iceberg that shows none of itself"),
+            (vec![codec::SnapshotOrders { quantity: 0, ..order.clone() }], "nothing left"),
+            (vec![codec::SnapshotOrders { symbol: *b"AC.ME\0\0\0", ..order.clone() }], "a bad symbol"),
+            (vec![codec::SnapshotOrders { side: codec::Side::Unknown(9), ..order.clone() }], "an unknown side"),
+        ] {
+            assert!(restore(&orders, &[], &[]).is_err(), "{why}");
+        }
+        for (stops, why) in [
+            (vec![codec::SnapshotStops { order_id: 1, ..stop.clone() }], "an order's id"),
+            (vec![codec::SnapshotStops { time_in_force: codec::TimeInForce::Gtd, ..stop.clone() }], "gtd, no expiry"),
+            (vec![codec::SnapshotStops { expires: Some(5), ..stop.clone() }], "an expiry, not gtd"),
+            (vec![codec::SnapshotStops { trigger: 0, ..stop.clone() }], "no trigger"),
+        ] {
+            assert!(restore(std::slice::from_ref(&order), &stops, &[]).is_err(), "{why}");
+        }
+        assert!(restore(&[], &[], &[last.clone(), last.clone()]).is_err(), "a symbol's last price twice");
+        assert!(restore(&[], &[], &[codec::SnapshotLastPrices { price: 0, ..last }]).is_err(), "a price of 0");
     }
 }
