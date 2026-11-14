@@ -132,9 +132,11 @@ mod apple {
         #[test]
         fn syncs_at_once_share_a_drive_flush() {
             let dir = tempfile::tempdir().unwrap();
-            let flush = DriveFlush::for_dir(dir.path()).unwrap();
-            assert!(Arc::ptr_eq(&flush.0, &DriveFlush::for_dir(dir.path()).unwrap().0), "one per drive");
-            let before = flush.0.state.lock().unwrap().started;
+            let shared = DriveFlush::for_dir(dir.path()).unwrap();
+            assert!(Arc::ptr_eq(&shared.0, &DriveFlush::for_dir(dir.path()).unwrap().0), "one per drive");
+            // A drive's flushes of its own: the registry's are shared with the other tests' logs,
+            // which may be flushing when this counts them.
+            let flush = DriveFlush(Arc::new(Drive::default()));
             let threads = 16;
             std::thread::scope(|scope| {
                 for n in 0..threads {
@@ -151,7 +153,7 @@ mod apple {
                 }
             });
             let state = flush.0.state.lock().unwrap();
-            assert!(state.started - before <= threads * 4);
+            assert!(state.started <= threads * 4);
             assert!(!state.running && state.finished == state.started);
         }
     }
