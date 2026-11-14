@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The checks a change must pass: formatting, clippy, tests, rustdoc and cargo-deny, stopping at the
-# first failure.
+# The checks a change must pass: formatting, clippy, tests, rustdoc, cargo-deny and cargo-semver-checks,
+# stopping at the first failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 echo "== fmt";    cargo fmt --all --check
@@ -12,3 +12,7 @@ echo "== test";   cargo test --workspace
 echo "== test, all features"; cargo test --workspace --all-features
 echo "== doc";    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 echo "== deny";   cargo deny check   # licences, advisories, sources (deny.toml); needs cargo-deny
+# The public API against the last published version's: a break fails until the workspace version is
+# bumped to allow it. Hidden items (`#[doc(hidden)]`) aren't checked. Needs cargo-semver-checks.
+echo "== semver"; cargo semver-checks -p turbofan --features tls,testing
+                  cargo semver-checks -p turbofan-sbe

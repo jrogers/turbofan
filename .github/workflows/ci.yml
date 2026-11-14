@@ -27,6 +27,20 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # The public API against the last published version's (cargo-semver-checks): a break fails until
+  # the workspace version is bumped to allow it.
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - run: cargo semver-checks -p turbofan --features tls,testing
+      - run: cargo semver-checks -p turbofan-sbe
+
   # The simulation's fixed seeds (crates/turbofan/tests/sim.rs), a release build: a failure
   # prints SIM_SEED=<n>, which replays it.
   simulate:

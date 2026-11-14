@@ -19,8 +19,10 @@ before writing code.
   turbofan` and its `scripts/check.sh`.
 - Planned work is in GitHub issues (`gh issue list`), each with its size (S, M or L) in the body
   and `research` or `needs-linux` where they apply; a commit that does one closes it ("Closes #12").
-- `scripts/check.sh` (fmt, clippy `-D warnings`, tests, rustdoc, `cargo deny`) before calling work
-  done.
+- `scripts/check.sh` (fmt, clippy `-D warnings`, tests, rustdoc, `cargo deny`, `cargo semver-checks`
+  against the last published version) before calling work done. A change that breaks the public API
+  bumps the workspace version as it must (0.x: the minor) in the same commit, or the semver check
+  fails.
   `cargo bench -p turbofan --bench cluster` for throughput and latency (`--features tls`
   adds runs over TLS) (CI's summary has
   each run's).
@@ -34,7 +36,7 @@ before writing code.
   and pull request, a missed mutant a warning on its line.
 - `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan/fuzz`,
   outside the workspace; nightly and cargo-fuzz). `check.sh` only checks it builds.
-- Releasing: both crates share the workspace version. Bump it (and `cargo update -w` both lock files, the
+- Releasing: both crates share the workspace version. Bump it, unless a breaking change already did (and `cargo update -w` both lock files, the
   fuzz crate's too), date its `CHANGELOG.md` section, set the docs' dependency lines to it (`git grep
   '= "0\.' -- '*.md'`), write its golden files (`GOLDEN_WRITE=1 cargo test -p turbofan --test
   golden`, checked in under `tests/golden/<version>/`),
