@@ -412,6 +412,9 @@ mod tests {
     #[tokio::test]
     async fn the_gateway_answers_lines_from_the_cluster() {
         let dir = tempfile::tempdir().unwrap();
+        // Bound before the node's ports are found and let go: after, it could be given one of them.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = listener.local_addr().unwrap();
         let addrs: Vec<SocketAddr> =
             (0..3).map(|_| StdListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()).collect();
         let member = Member::new(NodeId(1), addrs[0].to_string(), addrs[1].to_string(), addrs[2].to_string());
@@ -424,8 +427,6 @@ mod tests {
             addrs[2],
         );
         tokio::spawn(serve_until(config, ListAppend::default(), std::future::pending()));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let gateway = listener.local_addr().unwrap();
         tokio::spawn(gateway::serve(listener, vec![addrs[1].to_string()], Duration::from_secs(10)));
 
         let stream = TcpStream::connect(gateway).await.unwrap();
