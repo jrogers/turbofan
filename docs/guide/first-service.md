@@ -210,7 +210,9 @@ with nothing lost or repeated. [Running a cluster][running] has the rest of the 
 
 `examples/matching.rs` is a larger service: a matching engine, with limit and market orders on
 many symbols, matched by price then time, cancelled and modified, each order's events sent to the
-session that placed it, and a query for the book. Its `client` takes orders typed a line at a
+session that placed it, and a query for the book. Orders take a time in force (immediate or cancel,
+fill or kill, post only, or good till a time, which expires on a timer), can be icebergs that
+show only part of themselves at a time, and never trade with their own session's. Its `client` takes orders typed a line at a
 time, and prints the events as they come.
 
 ## How it's layered

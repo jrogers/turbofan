@@ -14,11 +14,22 @@
 //!
 //! A request is a line, quantities and prices whole numbers above zero (prices in ticks):
 //!
-//! - `buy <symbol> <quantity> [<price>]`, `sell ...`: a limit order, or a market order without a
-//!   price. A market order takes what the book has, and what it can't fill is cancelled.
+//! - `buy <symbol> <quantity> [<price>] [<time in force>]`, `sell ...`: a limit order, or a market
+//!   order without a price. The time in force says what becomes of what doesn't trade at once:
+//!   - none: a limit order rests until it's filled or cancelled; a market order is cancelled.
+//!   - `ioc`, immediate or cancel: it's cancelled.
+//!   - `fok`, fill or kill: the order is cancelled whole unless it can be filled whole at once.
+//!   - `post`, post only (a limit order): it's cancelled whole if it would trade at all, so it only
+//!     ever rests.
+//!   - `gtd <seconds>`, good till date (a limit order): it rests, and expires after that long.
+//!
+//!   An order that rests can end in `show <quantity>`, an iceberg: the book shows only that much of
+//!   it at a time, and when that's filled, shows that much more of what's left, at the back of the
+//!   queue at its price.
 //! - `cancel <id>`
-//! - `modify <id> <quantity> <price>`: a resting order's new size and price. Only a smaller one at
-//!   the same price keeps its place in the queue.
+//! - `modify <id> <quantity> <price>`: a resting order's new size (all that's left of it, shown
+//!   or not) and price. Only a smaller one at the same price keeps its place in the queue; any other
+//!   trades as a new limit order would, keeping its expiry and what it shows.
 //! - `book <symbol>`: the best price levels on each side, as a query, never logged.
 //!
 //! The events, each a line to the session whose order it concerns:
@@ -27,9 +38,12 @@
 //! - `fill <id> <quantity> <price> <left>`: to both sides, at the resting order's price.
 //! - `modified <id> <quantity> <price>`
 //! - `cancelled <id> <left>`
+//! - `expired <id> <left>`
 //! - `rejected <why>`
 //!
-//! A session's resting orders are cancelled when it closes: there's no one left to tell of fills.
+//! An order never trades with one of its own session's: the resting one is cancelled instead
+//! (self-trade prevention). A session's resting orders are cancelled when it closes: there's no
+//! one left to tell of fills.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -39,13 +53,16 @@ use turbofan::{CloseReason, Ctx, Service, SessionId, SnapshotWriter};
 
 /// This cluster's `Hello.service_id`.
 const SERVICE_ID: u32 = 11;
-/// The most orders resting at once, across every symbol: a market order sweeps at most this many,
-/// so it sends at most twice this many events, well within a session's egress ring.
-const MAX_ORDERS: usize = 10_000;
+/// The most orders resting at once, across every symbol, an iceberg counting once for each time it
+/// will show: a market order sweeps at most this many, so it sends at most twice this many events,
+/// well within a session's egress ring.
+const MAX_ORDERS: u64 = 10_000;
 /// The longest symbol: a ticker.
 const MAX_SYMBOL_BYTES: usize = 8;
 /// The most price levels a side of `book` shows: its answer stays well within a payload.
 const MAX_BOOK_LEVELS: usize = 10;
+/// Cluster time's unit, a nanosecond, in a second.
+const SECOND: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
@@ -54,6 +71,13 @@ enum Side {
 }
 
 impl Side {
+    fn other(self) -> Self {
+        match self {
+            Self::Buy => Self::Sell,
+            Self::Sell => Self::Buy,
+        }
+    }
+
     fn from_name(name: &str) -> Option<Self> {
         match name {
             "buy" => Some(Self::Buy),
@@ -86,6 +110,49 @@ impl Side {
     }
 }
 
+/// What becomes of the part of an order that doesn't trade at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeInForce {
+    /// Good till cancelled: it rests.
+    Gtc,
+    /// Immediate or cancel.
+    Ioc,
+    /// Fill or kill: all at once, or none.
+    Fok,
+    /// Post only: never trades on arrival, only rests.
+    Post,
+    /// Good till date: it rests for this many seconds.
+    Gtd(u64),
+}
+
+impl TimeInForce {
+    /// Whether what doesn't trade at once rests, if it has a limit.
+    fn rests(self) -> bool {
+        matches!(self, Self::Gtc | Self::Post | Self::Gtd(_))
+    }
+}
+
+/// How many times an order of `quantity` showing `show` at a time (0: all of it) shows: how many
+/// of [`MAX_ORDERS`] it takes.
+fn tranches(quantity: u64, show: u64) -> u64 {
+    if show == 0 { 1 } else { quantity.div_ceil(show) }
+}
+
+/// An order as it comes in, or back from a modify, before it trades.
+struct Incoming {
+    id: u64,
+    session: SessionId,
+    side: Side,
+    symbol: String,
+    quantity: u64,
+    limit: Option<u64>,
+    tif: TimeInForce,
+    /// As [`Order::expires`].
+    expires: Option<u64>,
+    /// As [`Order::show`].
+    show: u64,
+}
+
 /// An order resting in a book.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Order {
@@ -93,15 +160,31 @@ struct Order {
     side: Side,
     symbol: String,
     price: u64,
+    /// What the book shows of it.
     quantity: u64,
+    /// What it doesn't: an iceberg's.
+    hidden: u64,
+    /// How much an iceberg shows at a time, or 0.
+    show: u64,
     /// Its place in the queue at its price: later orders, and orders that lost their place, have
     /// higher ones.
     seq: u64,
+    /// The cluster time it expires at, a timer with its id: a `gtd` order's.
+    expires: Option<u64>,
 }
 
 impl Order {
     fn key(&self) -> (u64, u64) {
         self.side.key(self.price, self.seq)
+    }
+
+    fn left(&self) -> u64 {
+        self.quantity + self.hidden
+    }
+
+    /// How many more times it shows, this one included: its share of [`MAX_ORDERS`].
+    fn tranches(&self) -> u64 {
+        1 + if self.show == 0 { 0 } else { self.hidden.div_ceil(self.show) }
     }
 }
 
@@ -131,39 +214,58 @@ struct Matching {
     orders: BTreeMap<u64, Order>,
     /// Every symbol with an order resting: an empty book is removed.
     books: BTreeMap<String, Book>,
+    /// The resting orders' [`Order::tranches`], summed.
+    tranches: u64,
 }
 
 impl Service for Matching {
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
         match parse(payload) {
             Err(why) => send(ctx, session, format!("rejected {why}")),
-            Ok(Request::Place { side, symbol, quantity, limit }) => {
-                if limit.is_some() && self.orders.len() == MAX_ORDERS {
+            Ok(Request::Place { side, symbol, quantity, limit, tif, show }) => {
+                if tif.rests() && self.tranches + tranches(quantity, show) > MAX_ORDERS {
                     return send(ctx, session, "rejected book-full".to_owned());
                 }
                 self.last_id += 1;
                 let id = self.last_id;
                 let price = limit.map_or_else(|| "market".to_owned(), |p| p.to_string());
                 send(ctx, session, format!("accepted {id} {} {symbol} {quantity} {price}", side.name()));
-                self.execute(ctx, id, session, side, symbol, quantity, limit);
+                let expires = match tif {
+                    TimeInForce::Gtd(seconds) => Some(ctx.now().saturating_add(seconds.saturating_mul(SECOND))),
+                    _ => None,
+                };
+                self.execute(ctx, Incoming { id, session, side, symbol, quantity, limit, tif, expires, show });
             }
-            Ok(Request::Cancel { id }) => match self.take(session, id) {
-                Some(order) => send(ctx, session, format!("cancelled {id} {}", order.quantity)),
+            Ok(Request::Cancel { id }) => match self.take(ctx, session, id) {
+                Some(order) => send(ctx, session, format!("cancelled {id} {}", order.left())),
                 None => send(ctx, session, "rejected unknown-order".to_owned()),
             },
             Ok(Request::Modify { id, quantity, price }) => {
-                let Some(mut order) = self.take(session, id) else {
+                let Some(order) = self.orders.get_mut(&id).filter(|o| o.session == session) else {
                     return send(ctx, session, "rejected unknown-order".to_owned());
                 };
+                if self.tranches - order.tranches() + tranches(quantity, order.show) > MAX_ORDERS {
+                    return send(ctx, session, "rejected book-full".to_owned());
+                }
                 send(ctx, session, format!("modified {id} {quantity} {price}"));
-                if price == order.price && quantity <= order.quantity {
-                    order.quantity = quantity;
-                    self.rest(id, order);
+                if price == order.price && quantity <= order.left() {
+                    let before = order.tranches();
+                    order.quantity = order.quantity.min(quantity);
+                    order.hidden = quantity - order.quantity;
+                    self.tranches -= before - order.tranches();
                 } else {
-                    self.execute(ctx, id, session, order.side, order.symbol, quantity, Some(price));
+                    let Order { side, symbol, expires, show, .. } = self.take(ctx, session, id).expect("just found");
+                    let (limit, tif) = (Some(price), TimeInForce::Gtc);
+                    self.execute(ctx, Incoming { id, session, side, symbol, quantity, limit, tif, expires, show });
                 }
             }
         }
+    }
+
+    fn on_timer(&mut self, ctx: &mut Ctx, id: u64) {
+        // A timer is cancelled with its order, so its order still rests.
+        let order = self.remove(id);
+        send(ctx, order.session, format!("expired {id} {}", order.left()));
     }
 
     fn on_query(&self, _session: SessionId, query: &[u8]) -> Option<Vec<u8>> {
@@ -188,21 +290,23 @@ impl Service for Matching {
         Some(format!("bids{}\nasks{}", levels(&book.bids), levels(&book.asks)).into_bytes())
     }
 
-    fn on_session_close(&mut self, _ctx: &mut Ctx, session: SessionId, _reason: CloseReason) {
+    fn on_session_close(&mut self, ctx: &mut Ctx, session: SessionId, _reason: CloseReason) {
         // ponytail: a scan of every resting order, at most MAX_ORDERS; an index by session if
         // sessions come and go often.
         let ids: Vec<u64> = self.orders.iter().filter(|(_, o)| o.session == session).map(|(id, _)| *id).collect();
         for id in ids {
-            self.take(session, id).expect("the order rests, and is the session's");
+            self.take(ctx, session, id).expect("the order rests, and is the session's");
         }
     }
 
-    /// The resting orders as text, a line each, after the last id and seq given.
+    /// The resting orders as text, a line each, after the last id and seq given. Their expiry
+    /// timers are the cluster's, snapshotted with it.
     fn snapshot(&self) -> SnapshotWriter {
         let mut text = format!("{} {}\n", self.last_id, self.last_seq);
         for (id, o) in &self.orders {
-            let (session, side, symbol) = (o.session.0, o.side.name(), &o.symbol);
-            text += &format!("{id} {session} {side} {symbol} {} {} {}\n", o.price, o.quantity, o.seq);
+            let (session, side, symbol, expires) = (o.session.0, o.side.name(), &o.symbol, o.expires.unwrap_or(0));
+            let (price, quantity, hidden, show, seq) = (o.price, o.quantity, o.hidden, o.show, o.seq);
+            text += &format!("{id} {session} {side} {symbol} {price} {quantity} {hidden} {show} {seq} {expires}\n");
         }
         Box::new(move |out| out.write_all(text.as_bytes()))
     }
@@ -235,38 +339,53 @@ impl Service for Matching {
 
 impl Matching {
     /// Matches an order against the other side of its book, best price then oldest first, and
-    /// rests what's left of it at its limit, or cancels what's left of a market order.
-    #[expect(clippy::too_many_arguments, reason = "an order's fields, before it is one")]
-    fn execute(
-        &mut self,
-        ctx: &mut Ctx,
-        id: u64,
-        session: SessionId,
-        side: Side,
-        symbol: String,
-        mut quantity: u64,
-        limit: Option<u64>,
-    ) {
+    /// rests what's left of it at its limit, or cancels it, as its time in force says.
+    fn execute(&mut self, ctx: &mut Ctx, incoming: Incoming) {
+        let Incoming { id, session, side, symbol, mut quantity, limit, tif, expires, show } = incoming;
+        let crosses = |resting: &Order| limit.is_none_or(|limit| side.crosses(limit, resting.price));
+        let killed = self.killed(session, side, &symbol, quantity, limit, tif);
+        if killed {
+            return send(ctx, session, format!("cancelled {id} {quantity}"));
+        }
         if let Some(book) = self.books.get_mut(&symbol) {
-            let other = book.side(match side {
-                Side::Buy => Side::Sell,
-                Side::Sell => Side::Buy,
-            });
+            let other = book.side(side.other());
             while quantity > 0 {
                 let Some(best) = other.first_entry() else { break };
-                let resting = self.orders.get_mut(best.get()).expect("a book holds only resting orders");
-                if limit.is_some_and(|limit| !side.crosses(limit, resting.price)) {
+                let resting_id = *best.get();
+                let resting = self.orders.get_mut(&resting_id).expect("a book holds only resting orders");
+                if !crosses(resting) {
                     break;
                 }
-                let filled = quantity.min(resting.quantity);
-                quantity -= filled;
-                resting.quantity -= filled;
-                let (resting_id, price) = (*best.get(), resting.price);
-                send(ctx, resting.session, format!("fill {resting_id} {filled} {price} {}", resting.quantity));
-                send(ctx, session, format!("fill {id} {filled} {price} {quantity}"));
-                if resting.quantity == 0 {
+                let before = resting.tranches();
+                if resting.session == session {
+                    // Self-trade prevention: the resting order goes, and the new one goes on.
+                    send(ctx, session, format!("cancelled {resting_id} {}", resting.left()));
+                    (resting.quantity, resting.hidden) = (0, 0);
+                } else {
+                    let filled = quantity.min(resting.quantity);
+                    quantity -= filled;
+                    resting.quantity -= filled;
+                    let (price, left) = (resting.price, resting.left());
+                    send(ctx, resting.session, format!("fill {resting_id} {filled} {price} {left}"));
+                    send(ctx, session, format!("fill {id} {filled} {price} {quantity}"));
+                }
+                if resting.left() == 0 {
+                    if resting.expires.is_some() {
+                        ctx.cancel_timer(resting_id);
+                    }
                     best.remove();
                     self.orders.remove(&resting_id);
+                    self.tranches -= before;
+                } else if resting.quantity == 0 {
+                    // An iceberg shows more, at the back of the queue.
+                    resting.quantity = resting.show.min(resting.hidden);
+                    resting.hidden -= resting.quantity;
+                    self.last_seq += 1;
+                    resting.seq = self.last_seq;
+                    self.tranches -= before - resting.tranches();
+                    let key = resting.key();
+                    best.remove();
+                    other.insert(key, resting_id);
                 }
             }
             if book.bids.is_empty() && book.asks.is_empty() {
@@ -275,17 +394,51 @@ impl Matching {
         }
         match limit {
             _ if quantity == 0 => {}
-            Some(price) => {
+            Some(price) if tif.rests() => {
                 self.last_seq += 1;
                 let seq = self.last_seq;
-                self.rest(id, Order { session, side, symbol, price, quantity, seq });
+                if let Some(at) = expires {
+                    ctx.schedule_timer(id, at);
+                }
+                let shown = if show == 0 { quantity } else { quantity.min(show) };
+                let hidden = quantity - shown;
+                self.rest(id, Order { session, side, symbol, price, quantity: shown, hidden, show, seq, expires });
             }
-            None => send(ctx, session, format!("cancelled {id} {quantity}")),
+            _ => send(ctx, session, format!("cancelled {id} {quantity}")),
+        }
+    }
+
+    /// Whether a post only order would trade, or a fill or kill one can't be filled whole.
+    fn killed(
+        &self,
+        session: SessionId,
+        side: Side,
+        symbol: &str,
+        quantity: u64,
+        limit: Option<u64>,
+        tif: TimeInForce,
+    ) -> bool {
+        let crosses = |resting: &Order| limit.is_none_or(|limit| side.crosses(limit, resting.price));
+        // What it would trade with: the other side's orders that cross, but for its own.
+        let against = self.books.get(symbol).into_iter().flat_map(|book| match side {
+            Side::Buy => book.asks.values(),
+            Side::Sell => book.bids.values(),
+        });
+        let mut against =
+            against.map(|id| &self.orders[id]).take_while(|o| crosses(o)).filter(|o| o.session != session);
+        match tif {
+            TimeInForce::Post => against.next().is_some(),
+            // ponytail: a walk of every order it would trade with, at most MAX_ORDERS; a
+            // quantity per price level if fill or kill orders are big and common.
+            TimeInForce::Fok => against.fold(0, |n: u64, o| n.saturating_add(o.left())) < quantity,
+            _ => false,
         }
     }
 
     fn rest(&mut self, id: u64, order: Order) {
         debug_assert!(order.quantity > 0);
+        debug_assert!(order.hidden == 0 || order.show > 0, "an iceberg shows some of itself");
+        self.tranches += order.tranches();
         let book = self.books.entry(order.symbol.clone()).or_default();
         let replaced = book.side(order.side).insert(order.key(), id);
         debug_assert!(replaced.is_none(), "each order has its own seq");
@@ -293,18 +446,29 @@ impl Matching {
         debug_assert!(replaced.is_none(), "each order has its own id");
     }
 
-    /// Takes a session's resting order out of its book, if it's there and the session's.
-    fn take(&mut self, session: SessionId, id: u64) -> Option<Order> {
+    /// Takes a session's resting order out of its book, and cancels its expiry, if it's there
+    /// and the session's.
+    fn take(&mut self, ctx: &mut Ctx, session: SessionId, id: u64) -> Option<Order> {
         if self.orders.get(&id)?.session != session {
             return None;
         }
-        let order = self.orders.remove(&id).expect("just found");
+        let order = self.remove(id);
+        if order.expires.is_some() {
+            ctx.cancel_timer(id);
+        }
+        Some(order)
+    }
+
+    /// Takes a resting order out of its book.
+    fn remove(&mut self, id: u64) -> Order {
+        let order = self.orders.remove(&id).expect("the order rests");
+        self.tranches -= order.tranches();
         let book = self.books.get_mut(&order.symbol).expect("a resting order has a book");
         book.side(order.side).remove(&order.key()).expect("a resting order is in its book");
         if book.bids.is_empty() && book.asks.is_empty() {
             self.books.remove(&order.symbol);
         }
-        Some(order)
+        order
     }
 }
 
@@ -314,24 +478,51 @@ fn send(ctx: &mut Ctx, session: SessionId, event: String) {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
-    Place { side: Side, symbol: String, quantity: u64, limit: Option<u64> },
-    Cancel { id: u64 },
-    Modify { id: u64, quantity: u64, price: u64 },
+    /// `show` is 0 but for an iceberg.
+    Place {
+        side: Side,
+        symbol: String,
+        quantity: u64,
+        limit: Option<u64>,
+        tif: TimeInForce,
+        show: u64,
+    },
+    Cancel {
+        id: u64,
+    },
+    Modify {
+        id: u64,
+        quantity: u64,
+        price: u64,
+    },
 }
 
 /// A request, from its text. Untrusted, from any client: refused, never panicked on.
 fn parse(text: &[u8]) -> Result<Request, &'static str> {
     let text = std::str::from_utf8(text).map_err(|_| "malformed")?;
     let number = |word: &str| word.parse::<u64>().ok().filter(|n| *n > 0).ok_or("malformed");
-    let place = |side: &str, symbol: &str, quantity, limit| match (Side::from_name(side), valid_symbol(symbol)) {
-        (Some(side), true) => Ok(Request::Place { side, symbol: symbol.to_owned(), quantity, limit }),
-        _ => Err("malformed"),
-    };
     // The words of a payload, at most MAX_PAYLOAD_BYTES of them.
     match text.split_ascii_whitespace().collect::<Vec<_>>()[..] {
-        [side @ ("buy" | "sell"), symbol, quantity] => place(side, symbol, number(quantity)?, None),
-        [side @ ("buy" | "sell"), symbol, quantity, price] => {
-            place(side, symbol, number(quantity)?, Some(number(price)?))
+        [side, symbol, quantity, ref rest @ ..] if Side::from_name(side).is_some() && valid_symbol(symbol) => {
+            let (rest, show) = match *rest {
+                [ref rest @ .., "show", show] => (rest, number(show)?),
+                _ => (rest, 0),
+            };
+            let (limit, tif) = match *rest {
+                [] | ["ioc"] => (None, TimeInForce::Ioc),
+                ["fok"] => (None, TimeInForce::Fok),
+                [price] => (Some(number(price)?), TimeInForce::Gtc),
+                [price, "ioc"] => (Some(number(price)?), TimeInForce::Ioc),
+                [price, "fok"] => (Some(number(price)?), TimeInForce::Fok),
+                [price, "post"] => (Some(number(price)?), TimeInForce::Post),
+                [price, "gtd", seconds] => (Some(number(price)?), TimeInForce::Gtd(number(seconds)?)),
+                _ => return Err("malformed"),
+            };
+            if show > 0 && !(limit.is_some() && tif.rests()) {
+                return Err("malformed");
+            }
+            let side = Side::from_name(side).expect("just checked");
+            Ok(Request::Place { side, symbol: symbol.to_owned(), quantity: number(quantity)?, limit, tif, show })
         }
         ["cancel", id] => Ok(Request::Cancel { id: number(id)? }),
         ["modify", id, quantity, price] => {
@@ -345,10 +536,11 @@ fn valid_symbol(symbol: &str) -> bool {
     (1..=MAX_SYMBOL_BYTES).contains(&symbol.len()) && symbol.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// A snapshot's line: `<id> <session> <side> <symbol> <price> <quantity> <seq>`.
+/// A snapshot's line: `<id> <session> <side> <symbol> <price> <quantity> <hidden> <show> <seq>
+/// <expires|0>`.
 fn parse_order(line: &str) -> Option<(u64, Order)> {
     let words: Vec<&str> = line.split(' ').collect();
-    let [id, session, side, symbol, price, quantity, seq] = words[..] else { return None };
+    let [id, session, side, symbol, price, quantity, hidden, show, seq, expires] = words[..] else { return None };
     let number = |w: &str| w.parse::<u64>().ok();
     let side = Side::from_name(side)?;
     let (price, quantity) = (number(price).filter(|p| *p > 0)?, number(quantity).filter(|q| *q > 0)?);
@@ -358,9 +550,13 @@ fn parse_order(line: &str) -> Option<(u64, Order)> {
         symbol: symbol.to_owned(),
         price,
         quantity,
+        hidden: number(hidden)?,
+        show: number(show)?,
         seq: number(seq)?,
+        expires: Some(number(expires)?).filter(|at| *at > 0),
     };
-    valid_symbol(symbol).then_some((number(id)?, order))
+    let iceberg_shows = order.hidden == 0 || order.show > 0;
+    (valid_symbol(symbol) && iceberg_shows).then_some((number(id)?, order))
 }
 
 fn main() -> ExitCode {
@@ -470,18 +666,22 @@ mod tests {
 
     const ALICE: SessionId = SessionId(1);
     const BOB: SessionId = SessionId(2);
+    const CAROL: SessionId = SessionId(3);
 
     /// The events a request sends, each with the session it goes to.
     fn request(service: &mut Matching, session: SessionId, text: &str) -> Vec<(u64, String)> {
         let mut ctx = Ctx::new(0);
         service.on_message(&mut ctx, session, text.as_bytes());
-        ctx.take_effects()
-            .into_iter()
-            .map(|effect| match effect {
-                Effect::Send(to, event) => (to.0, String::from_utf8(event).unwrap()),
-                other => panic!("{other:?}"),
-            })
-            .collect()
+        events(ctx.take_effects())
+    }
+
+    /// The events among effects, each with the session it goes to: timers are left out.
+    fn events(effects: Vec<Effect>) -> Vec<(u64, String)> {
+        let sends = effects.into_iter().filter_map(|effect| match effect {
+            Effect::Send(to, event) => Some((to.0, String::from_utf8(event).unwrap())),
+            _ => None,
+        });
+        sends.collect()
     }
 
     fn book(service: &Matching, symbol: &str) -> String {
@@ -493,7 +693,7 @@ mod tests {
         let mut service = Matching::default();
         request(&mut service, ALICE, "sell ACME 10 101");
         request(&mut service, ALICE, "sell ACME 10 100");
-        request(&mut service, BOB, "sell ACME 5 100");
+        request(&mut service, CAROL, "sell ACME 5 100");
         request(&mut service, BOB, "sell OTHER 5 50");
         assert_eq!(book(&service, "ACME"), "bids\nasks 15@100 10@101");
         let events = request(&mut service, BOB, "buy ACME 30 101");
@@ -503,7 +703,7 @@ mod tests {
                 (2, "accepted 5 buy ACME 30 101".to_owned()),
                 (1, "fill 2 10 100 0".to_owned()),
                 (2, "fill 5 10 100 20".to_owned()),
-                (2, "fill 3 5 100 0".to_owned()),
+                (3, "fill 3 5 100 0".to_owned()),
                 (2, "fill 5 5 100 15".to_owned()),
                 (1, "fill 1 10 101 0".to_owned()),
                 (2, "fill 5 10 101 5".to_owned()),
@@ -533,15 +733,15 @@ mod tests {
         request(&mut service, ALICE, "buy ACME 10 100");
         request(&mut service, BOB, "buy ACME 10 100");
         assert_eq!(request(&mut service, ALICE, "modify 1 5 100"), [(1, "modified 1 5 100".to_owned())]);
-        let fills = request(&mut service, BOB, "sell ACME 1 100");
+        let fills = request(&mut service, CAROL, "sell ACME 1 100");
         assert_eq!(fills[1], (1, "fill 1 1 100 4".to_owned()), "alice is still first");
         request(&mut service, ALICE, "modify 1 6 100");
-        let fills = request(&mut service, BOB, "sell ACME 1 100");
+        let fills = request(&mut service, CAROL, "sell ACME 1 100");
         assert_eq!(fills[1], (2, "fill 2 1 100 9".to_owned()), "a bigger order goes to the back");
         // A new price that crosses trades at once.
-        request(&mut service, BOB, "sell ACME 2 101");
+        request(&mut service, CAROL, "sell ACME 2 101");
         let events = request(&mut service, ALICE, "modify 1 6 101");
-        assert_eq!(events[1], (2, "fill 5 2 101 0".to_owned()));
+        assert_eq!(events[1], (3, "fill 5 2 101 0".to_owned()));
         assert_eq!(book(&service, "ACME"), "bids 4@101 9@100\nasks");
     }
 
@@ -579,6 +779,16 @@ mod tests {
             "modify 1 2 3 4",
             "hold ACME 1",
             "buy ACME 99999999999999999999",
+            "buy ACME 1 post",
+            "buy ACME 1 gtd 5",
+            "buy ACME 1 2 gtd",
+            "buy ACME 1 2 gtd 0",
+            "buy ACME 1 2 ioc fok",
+            "buy ACME 1 2 day",
+            "buy ACME 5 show 1",
+            "buy ACME 5 2 ioc show 1",
+            "buy ACME 5 2 show 0",
+            "buy ACME 5 2 show",
         ] {
             assert_eq!(request(&mut service, ALICE, bad), [(1, "rejected malformed".to_owned())], "{bad:?}");
         }
@@ -598,12 +808,122 @@ mod tests {
     }
 
     #[test]
+    fn immediate_or_cancel_and_fill_or_kill_never_rest() {
+        let mut service = Matching::default();
+        request(&mut service, ALICE, "sell ACME 5 100");
+        request(&mut service, ALICE, "sell ACME 5 101");
+        let events = request(&mut service, BOB, "buy ACME 8 100 ioc");
+        assert_eq!(
+            events[1..],
+            [(1, "fill 1 5 100 0".to_owned()), (2, "fill 3 5 100 3".to_owned()), (2, "cancelled 3 3".to_owned()),]
+        );
+        // 5 at 101 is too little: nothing trades.
+        assert_eq!(request(&mut service, BOB, "buy ACME 6 101 fok")[1..], [(2, "cancelled 4 6".to_owned())]);
+        assert_eq!(book(&service, "ACME"), "bids\nasks 5@101");
+        assert_eq!(request(&mut service, BOB, "buy ACME 5 fok").len(), 3, "a market order, filled whole");
+        assert!(service.orders.is_empty());
+    }
+
+    #[test]
+    fn a_post_only_order_that_would_trade_is_cancelled_whole() {
+        let mut service = Matching::default();
+        request(&mut service, ALICE, "sell ACME 5 100");
+        assert_eq!(request(&mut service, BOB, "buy ACME 5 100 post")[1..], [(2, "cancelled 2 5".to_owned())]);
+        request(&mut service, BOB, "buy ACME 5 99 post");
+        assert_eq!(book(&service, "ACME"), "bids 5@99\nasks 5@100");
+    }
+
+    #[test]
+    fn an_order_cancels_its_own_sessions_resting_orders_instead_of_trading_with_them() {
+        let mut service = Matching::default();
+        request(&mut service, ALICE, "sell ACME 5 100");
+        request(&mut service, BOB, "sell ACME 5 100");
+        let events = request(&mut service, ALICE, "buy ACME 10 100");
+        assert_eq!(
+            events[1..],
+            [(1, "cancelled 1 5".to_owned()), (2, "fill 2 5 100 0".to_owned()), (1, "fill 3 5 100 5".to_owned()),]
+        );
+        assert_eq!(book(&service, "ACME"), "bids 5@100\nasks");
+        // Its own orders don't count towards filling a fill or kill order.
+        request(&mut service, BOB, "sell ACME 5 100");
+        assert_eq!(request(&mut service, BOB, "buy ACME 5 100 fok")[1..], [(2, "cancelled 5 5".to_owned())]);
+    }
+
+    #[test]
+    fn a_good_till_date_order_expires_unless_it_goes_first() {
+        let mut service = Matching::default();
+        let mut ctx = Ctx::new(SECOND);
+        service.on_message(&mut ctx, ALICE, b"buy ACME 5 100 gtd 30");
+        service.on_message(&mut ctx, ALICE, b"buy ACME 5 99 gtd 60");
+        let effects = ctx.take_effects();
+        assert!(effects.contains(&Effect::Schedule { id: 1, at: 31 * SECOND }));
+        assert!(effects.contains(&Effect::Schedule { id: 2, at: 61 * SECOND }));
+        // A fill, a cancel and a modify take the timer with them; a modify that moves it puts
+        // it back.
+        service.on_message(&mut ctx, BOB, b"sell ACME 5 100");
+        service.on_message(&mut ctx, ALICE, b"modify 2 5 98");
+        let effects = ctx.take_effects();
+        assert!(effects.contains(&Effect::Cancel(1)));
+        assert!(effects.ends_with(&[Effect::Cancel(2), Effect::Schedule { id: 2, at: 61 * SECOND }]));
+        service.on_timer(&mut ctx, 2);
+        assert_eq!(events(ctx.take_effects()), [(1, "expired 2 5".to_owned())]);
+        assert!(service.books.is_empty());
+    }
+
+    #[test]
+    fn an_iceberg_shows_a_part_at_a_time_each_at_the_back_of_the_queue() {
+        let mut service = Matching::default();
+        request(&mut service, ALICE, "sell ACME 25 100 show 10");
+        request(&mut service, BOB, "sell ACME 5 100");
+        assert_eq!(book(&service, "ACME"), "bids\nasks 15@100");
+        let events = request(&mut service, CAROL, "buy ACME 12 100");
+        assert_eq!(
+            events[1..],
+            [
+                (1, "fill 1 10 100 15".to_owned()),
+                (3, "fill 3 10 100 2".to_owned()),
+                // Alice showed 10 more, behind Bob.
+                (2, "fill 2 2 100 3".to_owned()),
+                (3, "fill 3 2 100 0".to_owned()),
+            ]
+        );
+        assert_eq!(book(&service, "ACME"), "bids\nasks 13@100");
+        // A smaller modify keeps its place, and what it shows.
+        request(&mut service, ALICE, "modify 1 12 100");
+        assert_eq!(book(&service, "ACME"), "bids\nasks 13@100");
+        assert_eq!((service.orders[&1].quantity, service.orders[&1].hidden), (10, 2));
+        assert_eq!(service.tranches, 3, "bob's, and alice's twice more");
+        let events = request(&mut service, CAROL, "buy ACME 20");
+        assert_eq!(events.last().unwrap(), &(3, "cancelled 4 5".to_owned()), "the hidden part trades too");
+        assert!(service.orders.is_empty());
+        assert_eq!(service.tranches, 0);
+    }
+
+    #[test]
+    fn an_iceberg_takes_a_place_in_the_book_for_each_time_it_shows() {
+        let mut service = Matching::default();
+        let all = format!("buy ACME {} 100 show 1", MAX_ORDERS + 1);
+        assert_eq!(request(&mut service, ALICE, &all), [(1, "rejected book-full".to_owned())]);
+        request(&mut service, ALICE, &format!("buy ACME {MAX_ORDERS} 100 show 1"));
+        assert_eq!(request(&mut service, BOB, "buy ACME 1 100"), [(2, "rejected book-full".to_owned())]);
+        assert_eq!(request(&mut service, ALICE, "modify 1 1 101"), [(1, "modified 1 1 101".to_owned())]);
+        request(&mut service, ALICE, &format!("modify 1 {MAX_ORDERS} 100"));
+        let big = format!("modify 1 {} 100", MAX_ORDERS + 1);
+        assert_eq!(request(&mut service, ALICE, &big), [(1, "rejected book-full".to_owned())]);
+        // Each time it shows trades on its own: a market order's events stay within the bound.
+        let events = request(&mut service, BOB, "sell ACME 20000");
+        assert_eq!(events.len(), 2 + 2 * usize::try_from(MAX_ORDERS).unwrap());
+    }
+
+    #[test]
     fn a_snapshot_restores_the_same_books_and_a_damaged_one_is_refused() {
         let mut service = Matching::default();
         request(&mut service, ALICE, "buy ACME 10 100");
         request(&mut service, BOB, "buy ACME 10 100");
         request(&mut service, BOB, "sell OTHER 3 7");
         request(&mut service, ALICE, "modify 1 11 100");
+        request(&mut service, ALICE, "sell OTHER 3 9 gtd 5");
+        request(&mut service, CAROL, "sell OTHER 30 10 show 4");
         let mut bytes = Vec::new();
         service.snapshot()(&mut bytes).unwrap();
         let mut restored = Matching::default();
@@ -611,9 +931,17 @@ mod tests {
         assert_eq!((restored.last_id, restored.last_seq), (service.last_id, service.last_seq));
         assert_eq!(restored.orders, service.orders);
         assert_eq!(restored.books, service.books);
+        assert_eq!(restored.tranches, service.tranches);
         for cut in [0, 1, 2, bytes.len() - 1] {
             assert!(Matching::default().restore(&mut &bytes[..cut]).is_err(), "cut at {cut}");
         }
-        assert!(Matching::default().restore(&mut &b"1 1\n5 1 buy ACME 1 1 1\n"[..]).is_err(), "an id from the future");
+        assert!(
+            Matching::default().restore(&mut &b"1 1\n5 1 buy ACME 1 1 0 0 1 0\n"[..]).is_err(),
+            "an id from the future"
+        );
+        assert!(
+            Matching::default().restore(&mut &b"1 1\n1 1 buy ACME 1 1 5 0 1 0\n"[..]).is_err(),
+            "an iceberg that shows none of itself"
+        );
     }
 }
