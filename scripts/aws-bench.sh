@@ -40,8 +40,8 @@
 #                8 µs off a request on its own and 3 to 5% more a second (the guide's chapter).
 #                PIN=0 BUSY_POLL=0 leaves the machines as they started.
 #   DRIVERS      tokio: how the nodes run, each remote run with each, space-separated: tokio (its
-#                multi-threaded runtime) or spin (TURBOFAN_SPIN=1: one thread that never sleeps,
-#                #31). A run's table is <run>-<driver>.md where DRIVERS has several; local is
+#                multi-threaded runtime), spin (TURBOFAN_SPIN=1: one thread that never sleeps,
+#                #31) or spin2 (TURBOFAN_SPIN=2: the node on one, its connections on another). A run's table is <run>-<driver>.md where DRIVERS has several; local is
 #                in-process, so it runs once, as tokio.
 #   ROUNDS       1: how many times the runs go round, every PIN and BUSY_POLL in turn each time, so
 #                that they're compared on one cluster, interleaved. A run's table is <run>.md, with
@@ -64,7 +64,7 @@ RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
 PROFILE=${PROFILE:-0}
 NIC_COALESCE_OFF=${NIC_COALESCE_OFF:-1}
 PIN=${PIN:-1} BUSY_POLL=${BUSY_POLL:-50} ROUNDS=${ROUNDS:-1} DRIVERS=${DRIVERS:-tokio}
-for driver in $DRIVERS; do [[ $driver == tokio || $driver == spin ]] || { echo "DRIVERS are tokio or spin, not $driver" >&2; exit 2; }; done
+for driver in $DRIVERS; do [[ $driver =~ ^(tokio|spin|spin2)$ ]] || { echo "DRIVERS are tokio, spin or spin2, not $driver" >&2; exit 2; }; done
 for pin in $PIN; do [[ $pin == 0 || $pin == 1 ]] || { echo "PIN is 0, 1 or both, not $pin" >&2; exit 2; }; done
 for us in $BUSY_POLL; do [[ $us =~ ^[0-9]+$ ]] || { echo "BUSY_POLL is in µs, not $us" >&2; exit 2; }; done
 [[ $ROUNDS =~ ^[1-9][0-9]*$ ]] || { echo "ROUNDS is a count, not $ROUNDS" >&2; exit 2; }
@@ -308,7 +308,7 @@ JEMALLOC='LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2'
 # With PIN=1, what starts the nodes and the benchmark on every CPU but 0 (tune's): expanded on
 # each machine. nproc --all, since plain nproc counts only the CPUs this shell may use.
 PINNED=''
-# The driver's setting for the nodes: TURBOFAN_SPIN, 0 or 1.
+# The driver's setting for the nodes: TURBOFAN_SPIN, 0, 1 or 2.
 SPIN=0
 
 # Every machine's interrupts and busy polling, for a PIN and a BUSY_POLL: interrupts on CPU 0 with
@@ -445,6 +445,7 @@ for round in $(seq "$ROUNDS"); do
                     [[ $run == local && $driver != "${DRIVERS%% *}" ]] && continue
                     SPIN=0
                     [[ $driver == spin ]] && SPIN=1
+                    [[ $driver == spin2 ]] && SPIN=2
                     name=$run
                     [[ $DRIVERS == *' '* && $run != local ]] && name+=-$driver
                     [[ $PIN == *' '* && $pin == 1 ]] && name+=-pin
@@ -465,7 +466,7 @@ done
     echo "turbofan $(git rev-parse --short HEAD), $TYPE in $AZ ($AWS_REGION), $BENCH_SECS s a run, on jemalloc."
     [[ -n $RUSTFLAGS ]] && echo && echo "RUSTFLAGS=${RUSTFLAGS% }"
     [[ $NIC_COALESCE_OFF == 1 ]] && echo && echo "NIC interrupt moderation off (NIC_COALESCE_OFF=1)."
-    [[ $DRIVERS != tokio ]] && echo && echo "DRIVERS=$DRIVERS (spin: TURBOFAN_SPIN=1, #31)."
+    [[ $DRIVERS != tokio ]] && echo && echo "DRIVERS=$DRIVERS (spin: TURBOFAN_SPIN=1, spin2: 2, #31)."
     [[ $PIN$BUSY_POLL != 00 ]] && echo && echo "PIN=$PIN, BUSY_POLL=$BUSY_POLL, ROUNDS=$ROUNDS: see tuning.txt."
     if [[ $PROFILE == 1 ]]; then
         echo

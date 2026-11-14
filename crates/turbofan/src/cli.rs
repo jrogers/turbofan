@@ -43,6 +43,7 @@
 //!
 //! `TURBOFAN_SPIN=1`, an experiment (#31): `serve` runs the node and its connections on one
 //! thread that never sleeps, polling its sockets, and so holds a core whether busy or not.
+//! `TURBOFAN_SPIN=2`: the node on one such thread, its connections on another.
 //!
 //! With the cluster lost, `promote --admin <addr>` makes the learner at that admin address the
 //! one member of a new cluster, of a new epoch, from its log as it is: fence the old cluster first.
@@ -180,20 +181,29 @@ pub fn run_with<S: Service + 'static>(
                     "warning: {PEER_TOKEN} isn't set, so anyone who can reach the peer listener can act as a node"
                 );
             }
-            let spin = std::env::var_os(SPIN).is_some_and(|v| v == "1");
-            let runtime = if spin { spinning_runtime()? } else { runtime()? };
+            let spin = std::env::var(SPIN).unwrap_or_default();
+            let runtime = if spin.is_empty() || spin == "0" { runtime()? } else { spinning_runtime()? };
+            // With 2, the connections' runtime, spinning on a thread of its own till the process ends.
+            let io = if spin == "2" {
+                let io = spinning_runtime()?;
+                let handle = io.handle().clone();
+                std::thread::Builder::new()
+                    .name("turbofan-io".into())
+                    .spawn(move || io.block_on(spinning()))
+                    .map_err(|e| e.to_string())?;
+                Some(handle)
+            } else {
+                None
+            };
             let stop = runtime.block_on(async { terminated() }).map_err(|e| format!("signals: {e}"))?;
             let serve = async move {
-                if spin {
-                    // Never empty, so the runtime never sleeps: each time round it polls the
-                    // sockets without waiting (`yield_now` defers it till after they're polled).
-                    tokio::spawn(async {
-                        loop {
-                            tokio::task::yield_now().await;
-                        }
-                    });
+                if !spin.is_empty() && spin != "0" {
+                    tokio::spawn(spinning());
                 }
-                serve_until(config, service, stop).await
+                match io {
+                    Some(io) => driver::serve_on(config, service, stop, io).await,
+                    None => serve_until(config, service, stop).await,
+                }
             };
             runtime.block_on(serve).map_err(|e| format!("node stopped: {e}"))
         }),
@@ -408,6 +418,14 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 /// to blocking threads.
 fn spinning_runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())
+}
+
+/// Never done, so a current-thread runtime running it never sleeps: each time round it polls the
+/// sockets without waiting (`yield_now` defers it till after they're polled).
+async fn spinning() {
+    loop {
+        tokio::task::yield_now().await;
+    }
 }
 
 fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, String> {

@@ -242,6 +242,17 @@ pub async fn serve_until<S: Service + 'static>(
     service: S,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    serve_on(config, service, stop, tokio::runtime::Handle::current()).await
+}
+
+/// [`serve_until`], the connections' tasks on `io`'s runtime, the node's on this one: two
+/// threads, each spinning, for #31's experiment (see [`crate::cli`]).
+pub(crate) async fn serve_on<S: Service + 'static>(
+    config: Config,
+    service: S,
+    stop: impl Future<Output = ()>,
+    io: tokio::runtime::Handle,
+) -> io::Result<()> {
     check_tokens(&config)?;
     let (tls, reloading) = tls::start(config.tls.clone())?;
     let peer_ids = tls.borrow().as_ref().is_some_and(|t| t.peer_ids);
@@ -253,11 +264,15 @@ pub async fn serve_until<S: Service + 'static>(
     let own = config.peer_listen.or(own).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "no peer address for this node, or a host name and no peer_listen")
     })?;
-    let (peer_listener, client_listener, admin_listener) = (
-        TcpListener::bind(own).await?,
-        TcpListener::bind(config.client_listen).await?,
-        TcpListener::bind(config.admin_listen).await?,
-    );
+    // On `io`'s runtime, whose reactor then watches them: bound here, for an error to stop this.
+    let listen = |addr| {
+        let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        let _io = io.enter();
+        TcpListener::from_std(listener)
+    };
+    let (peer_listener, client_listener, admin_listener) =
+        (listen(own)?, listen(config.client_listen)?, listen(config.admin_listen)?);
     let (inputs, rx) = mpsc::channel(MAX_QUEUED_INPUTS);
     // Clients' apart, so a backlogged leader can stop taking them and still take peers' acks.
     let (client_inputs, client_rx) = mpsc::channel(MAX_QUEUED_INPUTS);
@@ -266,9 +281,9 @@ pub async fn serve_until<S: Service + 'static>(
     let epoch = Arc::new(AtomicU64::new(node.epoch()));
     let hello = Hello { service_id: config.service_id, node_id: Some(id), epoch };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
-    tasks.spawn(reloading);
+    tasks.spawn_on(reloading, &io);
     let peers = accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls.clone(), peer_ids, inputs.clone());
-    tasks.spawn(peers);
+    tasks.spawn_on(peers, &io);
     let next_conn = Arc::new(AtomicU64::new(1));
     let idle = Some(config.node.session_timeout);
     let clients = Gate {
@@ -281,8 +296,8 @@ pub async fn serve_until<S: Service + 'static>(
     };
     let token = config.admin_token.as_deref().map(Arc::from);
     let operators = Gate { role: wire::Role::Admin, token, inputs: inputs.clone(), idle: None, ..clients.clone() };
-    tasks.spawn(accept(client_listener, clients, next_conn.clone()));
-    tasks.spawn(accept(admin_listener, operators, next_conn));
+    tasks.spawn_on(accept(client_listener, clients, next_conn.clone()), &io);
+    tasks.spawn_on(accept(admin_listener, operators, next_conn), &io);
     let contacts = config.peer_addrs.clone();
     let mut core = Core {
         node,
@@ -303,6 +318,7 @@ pub async fn serve_until<S: Service + 'static>(
         contacts,
         peers: HashMap::new(),
         dials: JoinSet::new(),
+        io,
         conns: HashMap::new(),
     };
     let peers = core.node.raft().peers();
@@ -346,6 +362,8 @@ struct Core<S> {
     /// The peers dialled: where, the frames for them, and the task dialling.
     peers: HashMap<NodeId, (String, mpsc::Sender<Frame>, AbortHandle)>,
     dials: JoinSet<()>,
+    /// Where the connections' tasks run.
+    io: tokio::runtime::Handle,
     conns: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
 }
 
@@ -543,14 +561,15 @@ impl<S: Service + 'static> Core<S> {
         for (id, addr) in wanted {
             if !self.peers.contains_key(&id) {
                 let (tx, rx) = mpsc::channel(MAX_QUEUED_FRAMES);
-                let task = self.dials.spawn(dial_peer(
+                let dial = dial_peer(
                     addr.clone(),
                     self.hello.clone(),
                     self.peer_token.clone(),
                     self.tls.clone(),
                     self.peer_ids.then_some(id),
                     rx,
-                ));
+                );
+                let task = self.dials.spawn_on(dial, &self.io);
                 self.peers.insert(id, (addr, tx, task));
             }
         }
