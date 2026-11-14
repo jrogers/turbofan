@@ -397,6 +397,8 @@ fn a_burst_of_due_timers_fires_in_few_entries_and_commits_earliest_first() {
     let now = (n + 1) * MS;
     let (before, mut commits) = (node.raft().last_index(), 0);
     while !node.state.timers.is_empty() {
+        // Failing, not looping on, should they stop firing.
+        assert!(commits < 10, "{} timers left", node.state.timers.len());
         node.on_tick(now);
         node.on_tick(now);
         if node.timers_in_flight() {
@@ -465,6 +467,29 @@ fn timers_fired_fires_what_is_due_as_it_is_applied() {
     drive(&mut node);
     assert!(node.state.timers.is_empty());
     assert!(!node.service.0.iter().any(|e| e.starts_with("timer 4")), "{:?}", node.service.0);
+}
+
+/// A `TimerFired`, as a node before `TimersFired` logged it, still fires its timer.
+#[test]
+fn a_timer_fired_from_an_older_log_fires() {
+    let mut node = leader();
+    node.state.timers.insert(7, MS);
+    node.state.deadlines.insert((MS, 7));
+    node.propose(&wire::TimerFired { timestamp: 500 * MS, id: 7 }).unwrap();
+    drive(&mut node);
+    assert!(node.state.timers.is_empty());
+    assert_eq!(node.service.0.last().unwrap(), "timer 7 at 500");
+}
+
+/// Once the last `TimersFired` is applied, the leader looks from the first timer again: one that
+/// entry's own firing scheduled behind its bound isn't skipped.
+#[test]
+fn with_the_last_timers_fired_applied_every_timer_is_unfired() {
+    let mut node = leader();
+    node.state.timers.insert(5, MS);
+    node.state.deadlines.insert((MS, 5));
+    node.local.fired.push_back(((100 * MS, 100), node.state.applied));
+    assert_eq!(node.unfired().next(), Some(&(MS, 5)));
 }
 
 #[test]
