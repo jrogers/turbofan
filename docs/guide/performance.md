@@ -182,7 +182,7 @@ Throughput, messages and queries a second, varies by a few per cent from one run
 message on its own doesn't: it's a round trip over the network, client to leader and leader to
 follower, and that depends on where the placement group lands. On `c9gd` its p50 was 75 to 80 µs
 in the three runs, all in one zone (at `07ea8ba`, in three placements, 83 µs, 130 µs and
-261 µs); on `c8id`, 282 µs at the median, with a long tail (p99 695 µs). The Mac's 53 µs (below)
+261 µs); on `c8id`, 282 µs at the median, with a long tail (p99 695 µs). The Mac's 52 µs (below)
 is over loopback.
 
 A sync on the instances' NVMe drives takes about a tenth of a millisecond, where the Mac's
@@ -193,15 +193,15 @@ network storage, a sync is a round trip of its own, some milliseconds: throughpu
 to a tenth, group commit still filling each sync. TLS costs next to nothing.
 
 The same benchmark in one process on the clients' machine, the three nodes and the clients sharing
-its 8 vCPUs, as on the Mac (12 cores, at `50418c5`, below):
+its 8 vCPUs, as on the Mac (12 cores, at `d2d6b95`, below):
 
 | run, one machine | `c6id` | `c8id` | `c9gd` | Mac mini, M4 Pro |
 |---|---:|---:|---:|---:|
-| throughput, in memory | 235,520 | 335,052 | 398,336 | 536,371 |
-| latency, 1 × 1 (p50) | 51 µs | 49 µs | 29 µs | 53 µs |
-| throughput, 8 × 256 | 768,357 | 1,191,734 | 1,474,389 | 1,177,211 |
-| query throughput | 2,083,319 | 2,683,653 | 3,923,032 | 3,039,131 |
-| latency, fsync (p50) | 195 µs | 209 µs | 84 µs | 8.00 ms |
+| throughput, in memory | 235,520 | 335,052 | 398,336 | 539,648 |
+| latency, 1 × 1 (p50) | 51 µs | 49 µs | 29 µs | 52 µs |
+| throughput, 8 × 256 | 768,357 | 1,191,734 | 1,474,389 | 1,169,098 |
+| query throughput | 2,083,319 | 2,683,653 | 3,923,032 | 3,124,214 |
+| latency, fsync (p50) | 195 µs | 209 µs | 84 µs | 6.96 ms |
 
 The core alone, `in memory`, on one thread, follows each CPU's speed on one core: the newest Xeon
 does five sixths of Graviton5's, Ice Lake three fifths. Over TCP Graviton5 passes the Mac,
@@ -217,26 +217,26 @@ twice the queries'.
 
 ### On a Mac
 
-On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2, Rust 1.98.1, at
-commit `50418c5` (after 0.12.0), November 2026. Each figure is the median of three runs of 10 s,
+On an Apple M4 Pro Mac mini: 12 cores, 24 GB, its internal SSD, macOS 27.2.1, Rust 1.98.1, at
+commit `d2d6b95` (after 0.12.1), November 2026. Each figure is the median of three runs of 10 s,
 `--features tls`.
 
 | run | clients × in flight | msgs/s | p50 | p99 | p99.9 |
 |---|---|---:|---:|---:|---:|
-| latency, in memory | 1 × 1 | 448,573 | 2 µs | 2 µs | 2 µs |
-| throughput, in memory | 8 × 256 | 536,371 | 3.64 ms | 9.00 ms | 9.40 ms |
-| latency | 1 × 1 | 18,238 | 53 µs | 78 µs | 135 µs |
-| throughput | 8 × 256 | 1,177,211 | 867 µs | 8.15 ms | 11.55 ms |
-| query latency | 1 × 1 | 22,537 | 44 µs | 61 µs | 109 µs |
-| query throughput | 8 × 256 | 3,039,131 | 655 µs | 1.11 ms | 1.34 ms |
-| latency, fsync | 1 × 1 | 120 | 8.00 ms | 14.09 ms | 16.78 ms |
-| throughput, fsync | 8 × 256 | 115,272 | 17.85 ms | 29.92 ms | 41.33 ms |
-| latency, TLS | 1 × 1 | 16,979 | 57 µs | 83 µs | 143 µs |
-| throughput, TLS | 8 × 256 | 1,187,430 | 864 µs | 8.40 ms | 12.36 ms |
-| query latency, TLS | 1 × 1 | 22,732 | 43 µs | 62 µs | 115 µs |
-| query throughput, TLS | 8 × 256 | 2,880,027 | 691 µs | 1.17 ms | 1.43 ms |
-| latency, TLS, fsync | 1 × 1 | 125 | 7.93 ms | 14.03 ms | 16.13 ms |
-| throughput, TLS, fsync | 8 × 256 | 113,817 | 17.93 ms | 30.00 ms | 38.04 ms |
+| latency, in memory | 1 × 1 | 479,177 | 1 µs | 2 µs | 2 µs |
+| throughput, in memory | 8 × 256 | 539,648 | 3.56 ms | 11.54 ms | 11.74 ms |
+| latency | 1 × 1 | 18,380 | 52 µs | 75 µs | 132 µs |
+| throughput | 8 × 256 | 1,169,098 | 877 µs | 8.13 ms | 12.17 ms |
+| query latency | 1 × 1 | 22,786 | 43 µs | 60 µs | 99 µs |
+| query throughput | 8 × 256 | 3,124,214 | 642 µs | 1.01 ms | 1.20 ms |
+| latency, fsync | 1 × 1 | 147 | 6.96 ms | 8.98 ms | 13.02 ms |
+| throughput, fsync | 8 × 256 | 138,873 | 14.40 ms | 27.28 ms | 37.04 ms |
+| latency, TLS | 1 × 1 | 17,046 | 57 µs | 80 µs | 138 µs |
+| throughput, TLS | 8 × 256 | 1,168,389 | 871 µs | 8.45 ms | 12.47 ms |
+| query latency, TLS | 1 × 1 | 23,131 | 43 µs | 61 µs | 114 µs |
+| query throughput, TLS | 8 × 256 | 2,970,241 | 676 µs | 1.05 ms | 1.22 ms |
+| latency, TLS, fsync | 1 × 1 | 131 | 7.96 ms | 10.02 ms | 14.96 ms |
+| throughput, TLS, fsync | 8 × 256 | 136,153 | 14.74 ms | 26.46 ms | 37.06 ms |
 
 Without fsync, a message is committed in tens of microseconds, and no one task is busy: the
 throughput run is bound by its own window, 2,048 messages in flight over a round trip of about a
@@ -251,12 +251,12 @@ second: each sync covers every message that arrived during the one before. A Lin
 drive syncs much faster (above); measure yours.
 
 A query skips the write, so one on its own takes four fifths of a message's time, and with many in
-flight they go more than twice as fast as messages: 3.0 million a second.
+flight they go more than twice as fast as messages: 3.1 million a second.
 
-The core alone, the `in memory` runs: 448,573 messages a second one at a time, a commit through
-all three nodes in 2 µs at p50, and 536,371 a second at 8 × 256, on its one thread (openraft's
+The core alone, the `in memory` runs: 479,177 messages a second one at a time, a commit through
+all three nodes in 1 µs at p50, and 539,648 a second at 8 × 256, on its one thread (openraft's
 benchmark, on a Mac: 33,000 one at a time, 3.5 million with 4,096 clients on several). So without
-fsync, nearly all of a message's 53 µs on its own over TCP is the driver's and the loopback's,
+fsync, nearly all of a message's 52 µs on its own over TCP is the driver's and the loopback's,
 not the core's.
 
 [clients]: clients.md
