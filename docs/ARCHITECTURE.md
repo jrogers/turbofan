@@ -209,7 +209,8 @@ session lasts:
 - **Only the leader talks to clients.** A follower redirects a client to the leader. A new leader
   takes clients once its `NewTerm` entry has applied, and so everything before it too.
 - **Liveness is the leader's.** Sessions not heard from within the session timeout are closed by
-  a `SessionClose` entry. Timers fire as `TimerFired` entries, and a service's own messages
+  a `SessionClose` entry. Timers fire as `TimersFired` entries, each up to the timers due through a
+  deadline, and a service's own messages
   (`Ctx::propose`) as `ServiceProposal` entries, each applied once, even when the leaders either
   side of a failover both log it.
 

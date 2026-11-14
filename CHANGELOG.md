@@ -16,10 +16,18 @@ a patch version (0.1.1) doesn't.
 
 ### Changed
 
-- Timers due at once fire at most 1024 a commit, earliest first, where every one due was logged
-  at once and each pass of the driver's loop walked past all those not yet applied. With a million
-  due together, a leader spent 87 ms logging them, 158 ms applying them in one go, and 33 ms on
-  each pass of its loop until they had, long enough for a few million to lose it its leadership.
+- Timers due fire many to a log entry, `TimersFired`, where each was an entry of its own,
+  `TimerFired`: an entry fires, earliest first, those still due through the deadline it names, up
+  to 2048 as it's logged, and the leader has at most four logged and not yet applied (#33). With
+  a million due together, a leader had spent 87 ms logging them, 158 ms applying them in one go,
+  and 33 ms on each pass of its loop until they had, long enough for a few million to lose it its
+  leadership. Now they take 123 commits, each at most 3.3 ms applying them; a pass of the loop
+  takes 0.1 ms logging the next, and 0.1 µs finding the next deadline (an Apple M4 Pro). A timer
+  scheduled already due by another timer's callback fires with the next entry, not the same one.
+  `TimerFired` entries are still applied. A node of an earlier version stops on a `TimersFired`
+  entry: upgrade every node of a cluster before its leader is one of this version.
+- Snapshots' timers load a third of the time, a million in 49 ms where they took 174 ms: built
+  whole from the sorted list, where each was inserted.
 
 - On macOS, nodes on one drive share its flushes: a log's sync `fsync`s its own file, then waits
   for one `F_FULLFSYNC` started after that, issued by whichever finds none running, where each

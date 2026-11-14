@@ -380,9 +380,19 @@
         <field name="session" id="2" type="uint64"/>
         <field name="reason" id="3" type="CloseReason"/>
     </sbe:message>
+    <!-- Timer `id` fired, if it's still due. Logged before TimersFired; still applied, from
+         logs that have it. -->
     <sbe:message name="TimerFired" id="53">
         <field name="timestamp" id="1" type="uint64"/>
         <field name="id" id="2" type="uint64"/>
+    </sbe:message>
+    <!-- Every timer due as it's applied, at or before (`throughAt`, `throughId`) in (deadline, ID)
+         order, fired, earliest first: one cancelled or moved later since it was logged doesn't
+         fire, nor one its firing schedules, which fires with the next. -->
+    <sbe:message name="TimersFired" id="66">
+        <field name="timestamp" id="1" type="uint64"/>
+        <field name="throughAt" id="2" type="uint64"/>
+        <field name="throughId" id="3" type="uint64"/>
     </sbe:message>
     <sbe:message name="NewTerm" id="54">
         <field name="timestamp" id="1" type="uint64"/>

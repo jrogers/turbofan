@@ -56,10 +56,12 @@ pub const MAX_SESSIONS: usize = 10_000;
 /// The highest protocol version this code supports: see `WIRE.md`, and [`Config::protocol`].
 /// 1: an activation logs the leader's [`Config::egress_ring_entries`] for every node.
 pub const PROTOCOL: u32 = 1;
-/// The most timers the leader has logged as fired and not yet applied. A burst due at once fires
-/// this many a commit, so what's logged at once, applied at once, and walked past to find the next
-/// deadline stays bounded however many there are.
-const MAX_FIRING: usize = 1024;
+/// The most timers a `TimersFired` entry covers as the leader logs it: what one entry fires,
+/// within a callback each, stays short, and the leader's loop goes on serving between them.
+const MAX_TIMERS_AN_ENTRY: usize = 2048;
+/// The most `TimersFired` entries logged and not yet applied: what a commit applies of a burst due
+/// at once, a callback a timer, stays a few milliseconds, as does the walk to log them.
+const MAX_TIMER_ENTRIES_IN_FLIGHT: usize = 4;
 /// The longest principal [`Service::authenticate`] can give.
 pub const MAX_PRINCIPAL_BYTES: usize = 255;
 
@@ -212,7 +214,10 @@ struct Local {
     proposed: BTreeMap<SessionId, u64>,
     /// The highest outbox ID logged this term.
     logged: u64,
-    firing: BTreeSet<u64>,
+    /// The `TimersFired` logged this term and maybe not yet applied, in order: the (deadline, ID)
+    /// each fires through, and its index. Until the last is applied, the next fires what's due
+    /// after it; then, what's due from the first.
+    fired: VecDeque<((u64, u64), u64)>,
     /// Manual snapshots asked for: request ID to the admin connection, before and after the
     /// `Snapshot` entry is applied (then with its index).
     requested: BTreeMap<u64, ConnId>,
@@ -566,14 +571,13 @@ impl<S: Service> Node<S> {
     pub fn next_deadline(&self) -> u64 {
         let mut deadline = self.raft.next_deadline();
         if self.is_ready() {
-            // With as many firing as can be, the next waits for one to apply: not a deadline
-            // already past, which would wake the driver over and over to do nothing.
-            if self.local.firing.len() < MAX_FIRING {
-                // Past at most MAX_FIRING already firing.
-                let timer = self.state.deadlines.iter().find(|(_, id)| !self.local.firing.contains(id));
-                if let Some(&(at, _)) = timer {
-                    deadline = deadline.min(at);
-                }
+            // Past those logged as fired and not yet applied, and with as many in flight as may be,
+            // none till one applies: not a deadline already past, which would wake the driver over
+            // and over to do nothing.
+            if !self.timers_in_flight()
+                && let Some(&(at, _)) = self.unfired().next()
+            {
+                deadline = deadline.min(at);
             }
             let quiet = self.local.activity.iter().filter(|(s, _)| !self.local.closing.contains(s)).map(|(_, &at)| at);
             if let Some(at) = quiet.min() {

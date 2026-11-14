@@ -3,16 +3,37 @@
 use super::*;
 
 impl<S: Service> Node<S> {
-    /// Logs the timers due by `now` as fired, earliest first, up to [`MAX_FIRING`] at once.
+    /// Logs the timers due by `now` as fired, earliest first: up to [`MAX_TIMERS_AN_ENTRY`] an
+    /// entry, and [`MAX_TIMER_ENTRIES_IN_FLIGHT`] entries not yet applied.
     pub(super) fn fire_timers(&mut self, now: u64) {
-        let room = MAX_FIRING.saturating_sub(self.local.firing.len());
-        // Past at most MAX_FIRING already firing.
-        let due = self.state.deadlines.iter().take_while(|(at, _)| *at <= now);
-        let due: Vec<u64> = due.map(|&(_, id)| id).filter(|id| !self.local.firing.contains(id)).take(room).collect();
-        for id in due {
-            self.local.firing.insert(id);
-            self.propose(&wire::TimerFired { timestamp: now, id });
+        let applied = self.state.applied;
+        self.local.fired.retain(|&(_, index)| index > applied);
+        while self.local.fired.len() < MAX_TIMER_ENTRIES_IN_FLIGHT {
+            let due = self.unfired().take_while(|(at, _)| *at <= now).take(MAX_TIMERS_AN_ENTRY);
+            let Some(&(through_at, through_id)) = due.last() else { return };
+            let Some(index) = self.propose(&wire::TimersFired { timestamp: now, through_at, through_id }) else {
+                return;
+            };
+            self.local.fired.push_back(((through_at, through_id), index));
         }
+    }
+
+    /// The timers by deadline, past those the `TimersFired` logged and not yet applied cover. Once
+    /// they're applied, from the first: one scheduled since, due before what they covered, isn't
+    /// passed over for good.
+    pub(super) fn unfired(&self) -> std::collections::btree_set::Range<'_, (u64, u64)> {
+        match self.local.fired.back() {
+            Some(&(through, index)) if index > self.state.applied => {
+                self.state.deadlines.range((std::ops::Bound::Excluded(through), std::ops::Bound::Unbounded))
+            }
+            _ => self.state.deadlines.range(..),
+        }
+    }
+
+    /// Whether as many `TimersFired` as may be are logged and not yet applied.
+    pub(super) fn timers_in_flight(&self) -> bool {
+        let applied = self.state.applied;
+        self.local.fired.iter().filter(|&&(_, index)| index > applied).count() >= MAX_TIMER_ENTRIES_IN_FLIGHT
     }
 
     /// Applies committed entries, in order, as far as their records are in memory; fetches the
@@ -119,12 +140,15 @@ impl<S: Service> Node<S> {
             }
             wire::Decoded::TimerFired(e) => {
                 self.advance_time(e.timestamp());
-                self.local.firing.remove(&e.id());
                 // A timer rescheduled later, or cancelled, since this was logged doesn't fire.
                 if self.state.timers.get(&e.id()).is_some_and(|&at| at <= self.state.time) {
                     self.remove_timer(e.id());
                     self.call(|service, ctx| service.on_timer(ctx, e.id()));
                 }
+            }
+            wire::Decoded::TimersFired(e) => {
+                self.advance_time(e.timestamp());
+                self.fire_due((e.through_at(), e.through_id()));
             }
             _ => panic!("a log entry this node knows, at {index}: see WIRE.md"),
         }
@@ -257,6 +281,23 @@ impl<S: Service> Node<S> {
         for (id, payload) in waiting {
             self.local.logged = id;
             self.propose(&wire::ServiceProposal { timestamp: self.now, id, payload: &payload });
+        }
+    }
+
+    /// Fires, earliest first, the timers due now at or before `through` (a `TimersFired`'s), chosen
+    /// before any fires: what their callbacks schedule fires with the next, so a timer due again at
+    /// once can't fire forever. At most [`MAX_TIMERS_AN_ENTRY`] as the leader logged it, and any
+    /// scheduled into its range since.
+    fn fire_due(&mut self, through: (u64, u64)) {
+        let time = self.state.time;
+        let due: Vec<(u64, u64)> =
+            self.state.deadlines.range(..=through).take_while(|&&(at, _)| at <= time).copied().collect();
+        for (at, id) in due {
+            // Not if an earlier one's callback cancelled it or moved it.
+            if self.state.timers.get(&id) == Some(&at) {
+                self.remove_timer(id);
+                self.call(|service, ctx| service.on_timer(ctx, id));
+            }
         }
     }
 

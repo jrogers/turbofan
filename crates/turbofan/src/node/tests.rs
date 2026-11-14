@@ -384,9 +384,10 @@ fn a_rescheduled_timer_fires_once_at_its_new_time_and_a_cancelled_one_never() {
 }
 
 #[test]
-fn a_burst_of_due_timers_fires_a_bounded_batch_a_commit_earliest_first() {
+fn a_burst_of_due_timers_fires_in_few_entries_and_commits_earliest_first() {
     let mut node = leader();
-    let n = 2 * crate::widen(MAX_FIRING) + 10;
+    let in_flight = crate::widen(MAX_TIMERS_AN_ENTRY * MAX_TIMER_ENTRIES_IN_FLIGHT);
+    let n = 2 * in_flight + 10;
     // As if the service had scheduled them, in a scrambled order (11 is coprime to n), all due.
     let at = |id: u64| (id * 11 % n + 1) * MS;
     for id in 0..n {
@@ -394,22 +395,76 @@ fn a_burst_of_due_timers_fires_a_bounded_batch_a_commit_earliest_first() {
         node.state.deadlines.insert((at(id), id));
     }
     let now = (n + 1) * MS;
-    let mut commits = 0;
+    let (before, mut commits) = (node.raft().last_index(), 0);
     while !node.state.timers.is_empty() {
         node.on_tick(now);
-        assert!(node.local.firing.len() <= MAX_FIRING);
-        if node.local.firing.len() == MAX_FIRING {
+        node.on_tick(now);
+        if node.timers_in_flight() {
             assert!(node.next_deadline() > now, "it waits for a commit, not on a deadline past");
         }
         drive(&mut node);
         commits += 1;
     }
-    assert_eq!(commits, 3);
+    assert_eq!(commits, 3, "the entries in flight commit together");
+    let entries = node.raft().last_index() - before;
+    assert_eq!(entries, n.div_ceil(crate::widen(MAX_TIMERS_AN_ENTRY)), "an entry for each {MAX_TIMERS_AN_ENTRY}");
     let fired: Vec<u64> =
         node.service.0.iter().filter_map(|e| e.strip_prefix("timer ")?.split(' ').next()?.parse().ok()).collect();
     let mut earliest_first: Vec<u64> = (0..n).collect();
     earliest_first.sort_by_key(|&id| (at(id), id));
     assert_eq!(fired, earliest_first);
+    assert!(node.next_deadline() > now, "nothing left to fire");
+}
+
+/// A timer scheduled due, before what a `TimersFired` logged covers but after it's applied, fires
+/// with the next: the leader looks from the first again once nothing it logged is in flight.
+#[test]
+fn a_timer_scheduled_due_behind_the_fired_ones_still_fires() {
+    let mut node = leader();
+    let session = open(&mut node, 1, 0);
+    for id in 100..110 {
+        node.state.timers.insert(id, id * MS);
+        node.state.deadlines.insert((id * MS, id));
+    }
+    // Past the cluster's time, which electing the leader moved on, and within the session's timeout.
+    let now = 500 * MS;
+    node.on_tick(now);
+    // Logged after the TimersFired, so applied after it: due at 1 ms, before all it covers.
+    client(&mut node, 1, &wire::Message { session: session.0, client_seq: 1, payload: b"at 5 1" }, now);
+    assert_eq!(node.state.timers.keys().copied().collect::<Vec<_>>(), [5], "the ten fired, 5 not yet");
+    assert!(node.next_deadline() <= now, "5 is due");
+    node.on_tick(now);
+    drive(&mut node);
+    assert!(node.state.timers.is_empty());
+    assert_eq!(node.service.0.last().unwrap(), "timer 5 at 500");
+}
+
+/// A `TimersFired` fires what's due as it's applied, not what was when it was logged: one
+/// cancelled since doesn't fire, nor one its own firing schedules due, which waits for the next.
+#[test]
+fn timers_fired_fires_what_is_due_as_it_is_applied() {
+    let mut node = leader();
+    let session = open(&mut node, 1, 0);
+    for (client_seq, text) in [(1, "at 1 10"), (2, "at 2 20"), (3, "at 3 30")] {
+        client(&mut node, 1, &wire::Message { session: session.0, client_seq, payload: text.as_bytes() }, 0);
+    }
+    let now = 500 * MS;
+    node.on_tick(now);
+    // Logged after the TimersFired through 3, applied after it: too late to stop 2.
+    client(&mut node, 1, &wire::Message { session: session.0, client_seq: 4, payload: b"cancel 2" }, now);
+    let timers: Vec<&String> = node.service.0.iter().filter(|e| e.starts_with("timer")).collect();
+    assert_eq!(timers, ["timer 1 at 500", "timer 2 at 500", "timer 3 at 500"]);
+
+    // Due, and logged as fired, behind a cancel logged before it: applied first, so 4 never fires.
+    client(&mut node, 1, &wire::Message { session: session.0, client_seq: 5, payload: b"at 4 50" }, now);
+    let mut cancel = Vec::new();
+    codec::encode_frame(&wire::Message { session: session.0, client_seq: 6, payload: b"cancel 4" }, &mut cancel)
+        .unwrap();
+    node.on_client(1, &codec::decode_frame(&cancel).unwrap().unwrap().0, now);
+    node.on_tick(now);
+    drive(&mut node);
+    assert!(node.state.timers.is_empty());
+    assert!(!node.service.0.iter().any(|e| e.starts_with("timer 4")), "{:?}", node.service.0);
 }
 
 #[test]

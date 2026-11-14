@@ -115,13 +115,15 @@ a client controls.
 `Ctx::schedule_timer(id, at)` fires `on_timer(id)` at cluster time `at`, in nanoseconds, or soon
 after; scheduling the same ID again replaces the timer, and `cancel_timer` drops it. Timers are
 part of the replicated state, so they survive a failover and a restart. The leader watches the
-deadlines against its own clock, and when one passes, logs that the timer fired; every node then
-fires it as it applies that entry, with `Ctx::now` at or after `at`. A timer cancelled or moved
-later in the meantime doesn't fire.
+deadlines against its own clock, and when they pass, logs that the timers due fired, in one entry;
+every node then fires those still due as it applies that entry, earliest first, with `Ctx::now` at
+or after their `at`. A timer cancelled or moved later in the meantime doesn't fire, and one that
+`on_timer` schedules already due fires with the next entry, not the same one.
 
 So a timer fires a commit's latency after its deadline, and later with no leader. A burst due at
-once fires 1024 a commit, earliest first, so a million due together take about a thousand commits,
-and the leader goes on serving clients meanwhile. Use one for
+once fires up to 2048 an entry and 8192 a commit, earliest first: a million due together take
+about 120 commits, each a few milliseconds of callbacks, and the leader goes on serving clients
+between them. Use one for
 an order's expiry, a session's lease or a day's end, not for anything that needs microseconds.
 
 ## Proposals
