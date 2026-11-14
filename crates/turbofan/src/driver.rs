@@ -384,17 +384,8 @@ async fn serve_on<S: Service + 'static>(
         accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls.clone(), peer_ids, inputs.clone());
     tasks.spawn_on(accepting, &peer_io);
     let next_conn = Arc::new(AtomicU64::new(1));
-    let idle = Some(config.node.session_timeout);
-    let clients = Gate {
-        role: wire::Role::Client,
-        hello: hello.clone(),
-        token: None,
-        tls: tls.clone(),
-        inputs: client_inputs,
-        idle,
-    };
     let token = config.admin_token.as_deref().map(Arc::from);
-    let operators = Gate { role: wire::Role::Admin, token, inputs: inputs.clone(), idle: None, ..clients.clone() };
+    let (clients, operators) = gates(&hello, &tls, client_inputs, inputs.clone(), config.node.session_timeout, token);
     tasks.spawn_on(accept(client_listener, clients, next_conn.clone()), &client_io);
     tasks.spawn_on(accept(admin_listener, operators, next_conn), &client_io);
     let contacts = config.peer_addrs.clone();
@@ -1168,6 +1159,30 @@ struct Gate {
     idle: Option<Duration>,
 }
 
+/// The client listener's gate and the operators'. An operator's frames go on `inputs`, with
+/// peers', not on `client_inputs`, so a backlogged leader that stops taking clients' still
+/// answers operators; and an operator's connection is never timed out, where a client's is once
+/// its session would be.
+fn gates(
+    hello: &Hello,
+    tls: &tls::Current,
+    client_inputs: mpsc::Sender<Input>,
+    inputs: mpsc::Sender<Input>,
+    session_timeout: Duration,
+    admin_token: Option<Arc<[u8]>>,
+) -> (Gate, Gate) {
+    let clients = Gate {
+        role: wire::Role::Client,
+        hello: hello.clone(),
+        token: None,
+        tls: tls.clone(),
+        inputs: client_inputs,
+        idle: Some(session_timeout),
+    };
+    let operators = Gate { role: wire::Role::Admin, token: admin_token, inputs, idle: None, ..clients.clone() };
+    (clients, operators)
+}
+
 /// Takes clients or operators, through `gate`.
 async fn accept(listener: TcpListener, gate: Gate, next_conn: Arc<AtomicU64>) {
     let max = if gate.role == wire::Role::Client { MAX_CLIENT_CONNECTIONS } else { MAX_OTHER_CONNECTIONS };
@@ -1656,6 +1671,24 @@ mod tests {
         close.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), room(&mut conns, 2)).await.expect("room once one closes");
         assert_eq!(conns.len(), 1, "the closed one reaped");
+    }
+
+    /// Operators' frames go on the node's own queue, not clients', and their connections are never
+    /// timed out; clients' are after the session timeout. Each gate has its own role and token.
+    #[test]
+    fn operators_are_on_the_nodes_queue_and_never_idle() {
+        let (tls, _reloading) = tls::start(None).unwrap();
+        let hello = Hello { service_id: 7, node_id: Some(NodeId(1)), epoch: Arc::new(AtomicU64::new(0)) };
+        let ((inputs, mut taken), (client_inputs, mut clients_taken)) = (mpsc::channel(1), mpsc::channel(1));
+        let timeout = Duration::from_secs(9);
+        let (clients, operators) = gates(&hello, &tls, client_inputs, inputs, timeout, Some(Arc::from(&b"t"[..])));
+        assert_eq!((clients.idle, operators.idle), (Some(timeout), None));
+        assert_eq!((clients.role, operators.role), (wire::Role::Client, wire::Role::Admin));
+        assert_eq!((clients.token.as_deref(), operators.token.as_deref()), (None, Some(&b"t"[..])));
+        operators.inputs.try_send(Input::Closed(1)).unwrap();
+        clients.inputs.try_send(Input::Closed(2)).unwrap();
+        assert!(matches!(taken.try_recv(), Ok(Input::Closed(1))));
+        assert!(matches!(clients_taken.try_recv(), Ok(Input::Closed(2))));
     }
 
     /// A connection that says nothing for `idle` fails to read; with no `idle`, it waits on.
