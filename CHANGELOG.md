@@ -4,9 +4,20 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
-## Unreleased
+## 0.13.0 (2026-11-15)
+
+### Breaking
+
+- A leader of this version logs fired timers as `TimersFired` entries, which a node of an earlier
+  version can't read and stops on; nothing yet holds them back until every member reads them. So
+  a node of this version mustn't lead while a member of an earlier one remains: upgrade the
+  leader last, or the whole cluster at once. The API is unchanged.
 
 ### Added
+
+- `examples/matching.rs`: a matching engine, a service larger than the counter: limit and market
+  orders on many symbols, stop orders, time in force, self-trade prevention and icebergs, with a
+  client to type orders into (#32; the guide's first-service chapter).
 
 - `serve --spin` (`driver::Config::spin`): the node on three threads of its own that never sleep,
   polling their sockets, the node on one, its peers' connections on another and its clients' on a
@@ -34,6 +45,15 @@ a patch version (0.1.1) doesn't.
   issued its own and they ran one after another. On an Apple Mac, three nodes on one machine with
   fsync: a message on its own 11.9 ms → 7.0 ms p50, and 100,000 → 136,000 to 139,000 messages a
   second. Elsewhere a sync is still `fdatasync`.
+
+### Fixed
+
+- A snapshot sent to a follower is resent from what its latest acknowledgement said, not the most
+  any acknowledgement said: one delayed past the follower's restart had stalled the transfer for
+  good, and with a broken voter of three, nothing committed (#30).
+- A restore is done once, however often outputs are taken while the write that restores is under
+  way: a stop meanwhile had queued a second restore, and the node failed "a restore is waiting"
+  (#29).
 
 ## 0.12.1 (2026-11-11)
 
