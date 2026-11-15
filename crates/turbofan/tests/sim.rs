@@ -2192,6 +2192,13 @@ impl Sim {
             self.schedule(500 * MS, Event::Replace(id));
             return;
         }
+        // Removed in the leader's log isn't removed: a leader elected without that entry still
+        // counts the node's vote, which a wiped node never gives.
+        let leader = self.nodes[&self.leader().expect("a leader")].node.as_ref().unwrap().raft();
+        if leader.config_index() > leader.commit_index() {
+            self.schedule(200 * MS, Event::Replace(id));
+            return;
+        }
         let sim_node = self.nodes.get_mut(&id).unwrap();
         sim_node.disk = Disk::new(self.segment_bytes);
         (sim_node.broken, sim_node.wiped) = (false, true);
