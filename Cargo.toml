@@ -46,6 +46,11 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 [profile.test]
 opt-level = 2
 
+# But turbofan itself at 1, which each test binary instantiates again: on 8 cores, a quarter less CPU
+# and a fifth less time to build the tests from clean, for 10% longer to run the default seeds.
+[profile.test.package.turbofan]
+opt-level = 1
+
 # The benchmark and examples/echo.rs: 10 to 18% more throughput than thin local LTO and 16 units, for
 # a slower build. A service sets its own: a dependency's profiles don't apply to it.
 [profile.release]
