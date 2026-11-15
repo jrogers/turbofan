@@ -4,6 +4,17 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Fixed
+
+- A `ClusterClient` whose caller hadn't read 4096 responses stopped carrying out its sends too:
+  its task waited for room for the next response, so a caller that sends and reads on one task,
+  as a gateway does, waited on its own send forever. It now stops reading the connection, as
+  documented, and goes on taking sends (refusing them as `Full` once its unacknowledged messages
+  reach the limit), handing responses on as they're read. Found by an OMS venue gateway handed
+  10,000 live orders at once.
+
 ## 0.13.0 (2026-11-15)
 
 ### Breaking

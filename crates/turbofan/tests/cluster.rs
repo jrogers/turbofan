@@ -211,6 +211,44 @@ async fn a_batch_is_answered_in_order() {
     exchange(&mut cluster, &mut client, 1001, 1010).await;
 }
 
+/// A client that sends while its responses wait unread, more of them than its task queues for
+/// it: its sends are still answered (taken, or refused as full), so a gateway that sends and reads
+/// on one task never waits on itself; and once it reads, every response comes, once and in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_sends_while_its_responses_wait_unread() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::new(dir.path(), |_| None);
+    let mut client =
+        ClusterClient::connect(cluster.client_addrs(), SERVICE_ID, b"ok".to_vec(), Duration::from_millis(500)).unwrap();
+    exchange(&mut cluster, &mut client, 1, 10).await;
+    // 6000 answers, past the 4096 queued for `recv`, none of them read.
+    let mut sent = 10_u64;
+    for _ in 0..3 {
+        let batch = (sent + 1..=sent + 2000).map(|k| k.to_string().into_bytes());
+        let seqs = tokio::time::timeout(Duration::from_secs(10), client.send_batch(batch)).await;
+        assert!(seqs.expect("a send answered while responses wait").is_ok(), "room for 2000");
+        sent += 2000;
+        // Answered and applied, so the next batch has room.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let more = tokio::time::timeout(Duration::from_secs(10), client.send((sent + 1).to_string().into_bytes())).await;
+    assert!(more.is_ok(), "a send answered with the responses queue full");
+    if more.unwrap().is_ok() {
+        sent += 1;
+    }
+    let (mut events, mut expected) = (Vec::new(), 11);
+    while expected <= sent {
+        let read = tokio::time::timeout(Duration::from_secs(20), client.recv_many(&mut events, 256)).await;
+        assert!(read.expect("answered in time") > 0, "session open");
+        for event in events.drain(..) {
+            let Event::Message(payload) = event else { panic!("{event:?}") };
+            assert_eq!(String::from_utf8(payload).unwrap(), expected.to_string(), "answered out of order");
+            expected += 1;
+        }
+    }
+    exchange(&mut cluster, &mut client, sent + 1, sent + 10).await;
+}
+
 /// Unsynced, a small write is made on the node's task and a big one on a thread: messages one at
 /// a time and a batch alike are answered in order, and what was answered is still there once each
 /// node in turn, the leader among them, is killed and started again from its files.

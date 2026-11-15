@@ -214,6 +214,10 @@ async fn run(
     let hello = Hello { service_id, node_id: None, epoch: Arc::default() };
     let mut redirected_at: Option<Instant> = None;
     let mut queries = Queries::new();
+    // An event the caller's queue had no room for, the first of those `client` holds: while it
+    // waits, no frames are read, but commands are still carried out, so a caller that sends and
+    // reads on one task isn't left waiting on its own sends.
+    let mut waiting: Option<Event> = None;
     loop {
         let Ok(stream) = handshake(client.target(), &hello, wire::Role::Client, &[], tls.as_ref()).await else {
             client.on_disconnected();
@@ -233,7 +237,11 @@ async fn run(
                     let Some(command) = command else { return };
                     carry_out_queued(&mut client, &mut queries, command, &mut commands);
                 }
-                frame = conn.frames.recv() => {
+                permit = events.reserve(), if waiting.is_some() => {
+                    let Ok(permit) = permit else { return };
+                    permit.send(waiting.take().expect("guarded by is_some"));
+                }
+                frame = conn.frames.recv(), if waiting.is_none() => {
                     if !take_frames(&mut client, frame, &mut conn.frames) {
                         client.on_disconnected();
                         break;
@@ -247,17 +255,13 @@ async fn run(
             }
             applied.send_if_modified(|seq| std::mem::replace(seq, client.applied()) != client.applied());
             hand_answers(&mut client, &mut queries);
-            while let Some(event) = client.poll_event() {
-                if events.send(event).await.is_err() {
-                    return;
-                }
+            if !hand_events(&mut client, &events, &mut waiting) {
+                return;
             }
             // Over: `recv` returns `None` once the events are read, and nothing reattaches. A
             // diverged session's `Close` is written first, so the cluster needn't time it out.
             if client.is_closed() {
-                conn.write(&mut client);
-                conn.finish().await;
-                return;
+                return finish(conn, &mut client, &events, waiting).await;
             }
             conn.write(&mut client);
             // Redirected: the target already points where to go.
@@ -337,6 +341,34 @@ fn take_frames(client: &mut Client, frame: Option<Vec<u8>>, frames: &mut mpsc::R
         let Ok(frame) = frames.try_recv() else { break };
         if client.on_frame(&frame).is_err() {
             return false;
+        }
+    }
+    true
+}
+
+/// The session is over: what's left is written, and the events the caller hasn't had wait for
+/// room, as there's nothing left to carry out.
+async fn finish(conn: Connection, client: &mut Client, events: &mpsc::Sender<Event>, mut waiting: Option<Event>) {
+    conn.write(client);
+    conn.finish().await;
+    while let Some(event) = waiting.take().or_else(|| client.poll_event()) {
+        if events.send(event).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Hands the caller the events `client` holds, as many as its queue has room for, keeping the
+/// first that doesn't fit in `waiting`; false once the caller has gone.
+fn hand_events(client: &mut Client, events: &mpsc::Sender<Event>, waiting: &mut Option<Event>) -> bool {
+    while let Some(event) = waiting.take().or_else(|| client.poll_event()) {
+        match events.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                *waiting = Some(event);
+                return true;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
         }
     }
     true
