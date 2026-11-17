@@ -8,7 +8,9 @@ echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings
 echo "== clippy, all features"; cargo clippy --workspace --all-targets --all-features -- -D warnings
 echo "== fuzz";   cargo fmt --manifest-path crates/turbofan/fuzz/Cargo.toml --check
                   cargo clippy --manifest-path crates/turbofan/fuzz/Cargo.toml --bins --locked -- -D warnings
-echo "== test";   cargo test --workspace
+# Without features only the unit tests: the integration tests and examples run the same with them
+# (plus TLS), clippy above builds every target without them, and CI runs them all so.
+echo "== test";   cargo test --workspace --lib
 echo "== test, all features"; cargo test --workspace --all-features
 echo "== doc";    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 echo "== deny";   cargo deny check   # licences, advisories, sources (deny.toml); needs cargo-deny
