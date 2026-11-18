@@ -2146,7 +2146,10 @@ impl Sim {
             let made = usize::try_from(self.rng.below(ops.len() as u64 + 1)).unwrap();
             let disk = &mut self.nodes.get_mut(&id).unwrap().disk;
             for op in &ops[..made] {
-                disk.apply(op).expect("a disk that isn't damaged");
+                // The disk is damaged, and nothing after reaches it: a restart finds that.
+                if disk.apply(op).is_err() {
+                    break;
+                }
             }
         }
         let sim_node = self.nodes.get_mut(&id).unwrap();
