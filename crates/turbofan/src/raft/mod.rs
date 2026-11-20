@@ -52,10 +52,12 @@
 //! restart, arriving late, says less than the node acknowledged. The driver then ends the doubt
 //! on disk ([`Persist::Trust`]).
 //! Meanwhile its votes say so, and an election needs a vote more than a majority for each voter
-//! in doubt, its own included (or every member): however many of those lost a committed entry,
-//! the voters then still include one that holds it, if any node still does, and turns down a
-//! candidate without it. After a power cut that tears every node's log, all of them doubt, and
-//! an election needs every member up.
+//! in doubt, its own included (or, from three voters, every member): however many of those lost a
+//! committed entry, the voters then still include one that holds it, if any node still does, and
+//! turns down a candidate without it. With fewer, every member isn't enough: the dropped tail may
+//! have held a change adding a voter, the other that holds what was committed since. After a power
+//! cut that tears every node's log, all of them doubt, and an election needs every member up; in a
+//! cluster of one or two voters, an operator, ending the doubt.
 //!
 //! **The driver's one rule:** perform each [`Outputs`]' `persist` operations in order, batch
 //! after batch, and make them durable; then call [`Raft::on_persisted`] with the

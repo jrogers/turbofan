@@ -4,6 +4,17 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Fixed
+
+- A voter in doubt could lose a committed entry. Two voters, one of them in doubt, elected a
+  leader with both their votes, as every member's; but the tail the doubter dropped may have held
+  a change adding a third, committed with that one's copy and the doubter's, and the third wasn't
+  asked. Now every member's votes are enough only from three voters: below, a cluster with a voter
+  in doubt waits for the voter its dropped tail added, or for an operator to end the doubt. Found
+  by a nightly simulation: a three-node cluster replacing a node passes through two voters.
+
 ## 0.13.1 (2026-11-15)
 
 ### Fixed

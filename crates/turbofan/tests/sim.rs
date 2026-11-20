@@ -2191,6 +2191,28 @@ impl Sim {
         };
         if members.contains(&id) {
             let request_id = self.rng.next() & !ROLE_REQUEST;
+            // Of three voters, one first added, as the guide has it, if there's room: removed
+            // first, two would be left.
+            let leader = self.nodes[&self.leader().unwrap()].node.as_ref().unwrap().raft();
+            let voter = |m: &Member| !m.learner;
+            let is_voter = leader.members().iter().any(|m| m.id == id && voter(m));
+            let learner = leader.members().iter().find(|m| m.learner && m.id != id).map(|m| m.id);
+            let up = |o: &NodeId| self.nodes[o].node.is_some() && !members.contains(o);
+            let spare = self.members.iter().copied().find(up);
+            if is_voter && leader.members().iter().filter(|m| voter(m)).count() <= 3 {
+                if let Some(learner) = learner {
+                    let request_id = request_id | ROLE_REQUEST;
+                    self.admin(&turbofan::wire::SetRole { request_id, id: learner.0, learner: 0 });
+                    self.schedule(500 * MS, Event::Replace(id));
+                    return;
+                } else if let Some(spare) = spare.filter(|_| members.len() < MAX_MEMBERS) {
+                    let m = member(spare);
+                    let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
+                    self.admin(&turbofan::wire::AddMember { request_id, id: m.id.0, learner: 0, peer, client, admin });
+                    self.schedule(500 * MS, Event::Replace(id));
+                    return;
+                }
+            }
             self.admin(&turbofan::wire::RemoveMember { request_id, id: id.0 });
             self.schedule(500 * MS, Event::Replace(id));
             return;

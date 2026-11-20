@@ -81,7 +81,8 @@ still include one that holds whatever was committed. The `turbofan_in_doubt` met
 node doubts.
 
 Usually that passes unnoticed. But after a power cut every node may doubt, and then an election
-needs every member; and in a three-node cluster with one disk dead and another node in doubt,
+needs every member; a cluster of one or two voters with one in doubt has no leader at all (what
+the node dropped may have added the voter that holds what was committed since); and in a three-node cluster with one disk dead and another node in doubt,
 there's no leader, so the dead one can't be removed. If you know a node in doubt only lost power,
 delete its `doubt` file, and restart it.
 

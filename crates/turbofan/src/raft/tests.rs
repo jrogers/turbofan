@@ -360,6 +360,22 @@ fn each_voter_in_doubt_takes_one_more_vote() {
     assert_eq!(raft.role(), Role::Candidate, "every member");
 }
 
+/// Two voters, one in doubt: both votes aren't enough. The tail it dropped may have held a change
+/// adding a third voter, committed by that one and this, which alone hold what came after.
+#[test]
+fn two_voters_one_in_doubt_elect_no_one() {
+    let mut doubting = entries(&[1]);
+    doubting.doubt();
+    let mut raft = Raft::new(config(1, &[1, 2]), Meta { term: 1, vote: None }, None, doubting, 0);
+    let round = raft.next_deadline();
+    raft.on_tick(round);
+    raft.take_outputs();
+    let mut frame = Vec::new();
+    codec::encode_frame(&wire::Vote { term: 2, granted: 1, pre_vote: 1, doubt: 0, round }, &mut frame).unwrap();
+    raft.on_message(NodeId(2), &decode(&frame), round);
+    assert_eq!(raft.role(), Role::PreCandidate, "every member, but two");
+}
+
 /// A member being added has the log before the entry that adds it, so it knows no members, but
 /// it votes: when the voters in doubt take every member's vote, an election needs its, and
 /// without it none is ever won (a nightly simulation's seed 420189338040480).

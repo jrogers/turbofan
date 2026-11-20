@@ -161,9 +161,15 @@ impl Raft {
         self.voters() / 2 + 1
     }
 
-    /// The votes win the election: a majority, and one more for each voter in doubt.
+    /// The votes win the election: a majority, and one more for each voter in doubt. Or from
+    /// three voters, every member's: one that holds what a doubter dropped is among them, even a
+    /// change of members it dropped (committed with two of the voters it added one to, if three).
+    /// Not below: two voters, and one doubts, the voter its dropped tail added may be the only
+    /// other to hold what was committed, and neither of them is asked (a nightly simulation's
+    /// seed 445203634240196).
     pub(super) fn won(&self) -> bool {
-        self.votes.len() >= (self.quorum() + self.doubted).min(self.voters())
+        let (need, voters) = (self.quorum() + self.doubted, self.voters());
+        self.votes.len() >= if voters >= 3 || self.doubted == 0 { need.min(voters) } else { need }
     }
 
     /// The log, as of an entry or snapshot of `term`, has everything this node could have

@@ -261,7 +261,8 @@ back from disk, or the latest snapshot, in chunks.
 **Doubt.** Bit rot looks like a torn write, so the records dropped from the damage on may have been
 acknowledged. The node then doubts its log, durably (a `doubt` file), and its votes say so. An
 election needs one vote more than a majority for each voter in doubt, so the voters still include
-one that holds any committed entry, however much this one dropped. The doubt ends once the node holds an entry or snapshot of a
+one that holds any committed entry, however much this one dropped: capped at every member from
+three voters, not below, where the dropped tail may have added the voter that holds it. The doubt ends once the node holds an entry or snapshot of a
 later term.
 
 ## Changing a running cluster
