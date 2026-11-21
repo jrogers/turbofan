@@ -2059,6 +2059,16 @@ impl Sim {
             self.schedule(sim_node.stalled_until - self.now + u64::from(behind), event);
             return None;
         }
+        // Restoring a snapshot, it takes nothing but its write till that's done, as the driver
+        // does: a pause that ends past the write's time lets both go at once, in any order.
+        if let Some(id) = target.filter(|id| {
+            let sim_node = &self.nodes[id];
+            sim_node.node.is_some() && !sim_node.pipeline.takes_inputs() && !matches!(event, Event::Written { .. })
+        }) {
+            let written_at = self.nodes[&id].written_at.expect("a restore waits on a write");
+            self.schedule(written_at.saturating_sub(self.now) + 1, event);
+            return None;
+        }
         Some(event)
     }
 
