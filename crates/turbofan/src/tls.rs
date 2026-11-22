@@ -55,6 +55,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, BufWriter, ReadB
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
+use crate::driver::{Fault, OnFault};
 use crate::raft::NodeId;
 
 #[cfg(feature = "tls")]
@@ -291,14 +292,17 @@ impl Loaded {
 pub(crate) type Current = watch::Receiver<Option<Loaded>>;
 
 /// A node's TLS, if it has any, loaded; and what rereads it, to run as long as the node does.
-pub(crate) fn start(tls: Option<NodeTls>) -> io::Result<(Current, impl Future<Output = ()> + Send + 'static)> {
+pub(crate) fn start(
+    tls: Option<NodeTls>,
+    faults: OnFault,
+) -> io::Result<(Current, impl Future<Output = ()> + Send + 'static)> {
     // Read before they're loaded: a change after is seen by the first reload, however late the
     // reloading starts.
     let files = tls.as_ref().map(read_files);
     let (current, receiver) = watch::channel(tls.as_ref().map(Loaded::load).transpose()?);
     let reloading = async move {
         if let (Some(tls), Some(files)) = (tls, files) {
-            reload(tls, files, current).await;
+            reload(tls, files, current, faults).await;
         }
     };
     Ok((receiver, reloading))
@@ -313,7 +317,12 @@ fn read_files(tls: &NodeTls) -> Vec<Option<Vec<u8>>> {
 
 /// Rereads `tls`'s files every [`NodeTls::reload_every`], and when they've changed from `loaded`
 /// and load, puts them in `current`.
-async fn reload(tls: NodeTls, mut loaded: Vec<Option<Vec<u8>>>, current: watch::Sender<Option<Loaded>>) {
+async fn reload(
+    tls: NodeTls,
+    mut loaded: Vec<Option<Vec<u8>>>,
+    current: watch::Sender<Option<Loaded>>,
+    faults: OnFault,
+) {
     loop {
         tokio::time::sleep(tls.reload_every).await;
         let files = read_files(&tls);
@@ -326,7 +335,10 @@ async fn reload(tls: NodeTls, mut loaded: Vec<Option<Vec<u8>>>, current: watch::
                 loaded = files;
                 "ok"
             }
-            Err(_) => "failed",
+            Err(error) => {
+                faults.report(Fault::TlsReload { error });
+                "failed"
+            }
         };
         metrics::counter!("turbofan_tls_reloads", "result" => result).increment(1);
     }
@@ -684,7 +696,7 @@ mod tests {
         cert("first.turbofan");
         let mut tls = NodeTls::new(file("node.pem"), file("node.key"), file("ca.pem"), file("ca.pem"));
         tls.reload_every = Duration::from_millis(20);
-        let (mut current, reloading) = super::start(Some(tls)).unwrap();
+        let (mut current, reloading) = super::start(Some(tls), crate::driver::OnFault::default()).unwrap();
         current.mark_unchanged();
         cert("second.turbofan");
         tokio::spawn(reloading);

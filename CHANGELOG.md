@@ -6,6 +6,22 @@ a patch version (0.1.1) doesn't.
 
 ## Unreleased
 
+### Breaking
+
+- `raft::Outputs`, `node::Outputs` and `pipeline::Taken` have a new field, `elections`: a driver
+  of its own builds them with it, or with `..Default::default()`.
+
+### Added
+
+- `Config::on_fault`, called with each `Fault` the node carries on through and said nothing of
+  before, of those an operator may need to fix: a failed accept, TLS files that don't load, a peer
+  it can't dial or write to, and a connection to its peer listener refused (and why), failing its
+  handshake, or malformed. Faults alike are reported once a minute at most. Clients' connections
+  aren't faults. And `Fault::Election`, each election the node begins (and why: its leader went
+  quiet, or handed over), wins, or, leading, stands down from, having lost touch with a majority:
+  `raft::Election`, in the new `elections` of the outputs. For a service to log; by default,
+  nothing is called. The guide's *Faults* section.
+
 ### Fixed
 
 - A voter in doubt could lose a committed entry. Two voters, one of them in doubt, elected a

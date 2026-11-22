@@ -15,13 +15,15 @@
 //! slow) is dropped, and Raft sends it again.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
+use std::panic::RefUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
@@ -36,7 +38,7 @@ use crate::meta::MetaFile;
 use crate::metrics;
 use crate::node::{self, ConnId, Node, Service};
 use crate::pipeline::{self, Pipeline};
-use crate::raft::{Entries, Frame, MAX_READ_BYTES, Member, NodeId, Persist, Role, SnapshotRead};
+use crate::raft::{Election, Entries, Frame, MAX_READ_BYTES, Member, NodeId, Persist, Role, SnapshotRead};
 use crate::tls::{self, NodeTls};
 use crate::{snapshot, wire};
 
@@ -121,6 +123,9 @@ pub struct Config {
     /// cores held whether busy or not (the guide's *Spinning* section). Off by default: the node
     /// runs on the caller's runtime.
     pub spin: bool,
+    /// Called with each [`Fault`]: a refused or failed connection, a peer it can't reach. By
+    /// default, nothing is.
+    pub on_fault: OnFault,
 }
 
 impl Config {
@@ -150,7 +155,150 @@ impl Config {
             peer_token: None,
             tls: None,
             spin: false,
+            on_fault: OnFault::default(),
         }
+    }
+}
+
+/// Which listener a connection came in on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listener {
+    Peer,
+    Client,
+    Admin,
+}
+
+impl fmt::Display for Listener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Peer => "peer",
+            Self::Client => "client",
+            Self::Admin => "admin",
+        })
+    }
+}
+
+/// Something wrong with the node or the cluster that the node carries on through, for
+/// [`Config::on_fault`]: what an operator may need to fix; and the elections it takes part in,
+/// which say how often, and why, the cluster loses its leader. A client's or operator's connection that
+/// fails or is refused isn't one, any more than a stranger's: a refused one is told why. What stops
+/// the node isn't one either, but [`serve`]'s error.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Fault {
+    /// Accepting on a listener failed (out of file descriptors, say): it tries again shortly.
+    Accept { listener: Listener, error: io::Error },
+    /// A connection to the peer listener failed before its hello was read: TLS failed, it closed,
+    /// or it said nothing within five seconds.
+    Handshake { from: SocketAddr, error: io::Error },
+    /// A connection to the peer listener was refused: the wrong token, another cluster, a
+    /// certificate that doesn't name the node.
+    Refused { from: SocketAddr, reason: &'static str },
+    /// A peer sent a malformed frame, or one too long, and its connection was closed.
+    Malformed { from: SocketAddr },
+    /// Dialling the peer at `addr`, or writing to it, failed: it's dialled again, less often the
+    /// longer it fails, but at least once a second.
+    Peer { addr: String, error: io::Error },
+    /// The node's TLS files changed and didn't load: it goes on with those that last did.
+    TlsReload { error: io::Error },
+    /// The node began an election, won one, or stood down: each is reported, none alike.
+    Election(Election),
+}
+
+impl Fault {
+    /// What makes a fault the same as another, to report it once a [`FAULT_QUIET`]: its kind, and
+    /// where it's from (by IP address: a peer redials from another port).
+    fn key(&self) -> (&'static str, String) {
+        match self {
+            Self::Accept { listener, .. } => ("accept", listener.to_string()),
+            Self::Handshake { from, .. } => ("handshake", from.ip().to_string()),
+            Self::Refused { from, .. } => ("refused", from.ip().to_string()),
+            Self::Malformed { from } => ("malformed", from.ip().to_string()),
+            Self::Peer { addr, .. } => ("peer", addr.clone()),
+            Self::TlsReload { .. } => ("tls", String::new()),
+            // Each of its own term, so none is like another.
+            Self::Election(election) => ("election", format!("{election:?}")),
+        }
+    }
+}
+
+impl fmt::Display for Fault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accept { listener, error } => write!(f, "{listener} listener: accept failed: {error}"),
+            Self::Handshake { from, error } => write!(f, "peer listener: {from}: handshake: {error}"),
+            Self::Refused { from, reason } => write!(f, "peer listener: {from}: refused: {reason}"),
+            Self::Malformed { from } => write!(f, "peer listener: {from}: malformed frame"),
+            Self::Peer { addr, error } => write!(f, "peer {addr}: {error}"),
+            Self::TlsReload { error } => write!(f, "TLS reload: {error}"),
+            Self::Election(election) => write!(f, "election: {election}"),
+        }
+    }
+}
+
+/// How long after a fault is reported one like it isn't ([`Fault::key`]): a peer that's down, or
+/// misconfigured, is redialled every second, which would else be a report a second.
+const FAULT_QUIET: Duration = Duration::from_secs(60);
+/// Faults remembered to keep quiet about: past this, all are forgotten, and reported again.
+const MAX_FAULTS_REMEMBERED: usize = 256;
+
+/// What [`Config::on_fault`] calls with each [`Fault`], once a minute at most for faults alike: on
+/// the task that met it, so it mustn't block (a log line or a counter, not a request).
+/// Unwind-safe, as [`Config`] is: what it captures that isn't, wrap in
+/// [`AssertUnwindSafe`](std::panic::AssertUnwindSafe).
+#[derive(Clone)]
+pub struct OnFault {
+    call: Arc<dyn Fn(&Fault) + Send + Sync + RefUnwindSafe>,
+    /// When each fault was last reported, by its key.
+    reported: Arc<Mutex<HashMap<(&'static str, String), Instant>>>,
+}
+
+impl OnFault {
+    /// Calls `f` with each fault.
+    pub fn new(f: impl Fn(&Fault) + Send + Sync + RefUnwindSafe + 'static) -> Self {
+        Self { call: Arc::new(f), reported: Arc::default() }
+    }
+
+    pub(crate) fn report(&self, fault: Fault) {
+        if self.due(fault.key(), Instant::now()) {
+            (self.call)(&fault);
+        }
+    }
+
+    /// Whether a fault of `key` is to be reported `now`: none like it within [`FAULT_QUIET`].
+    fn due(&self, key: (&'static str, String), now: Instant) -> bool {
+        let mut reported = self.reported.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reported.get(&key).is_some_and(|&at| now.duration_since(at) < FAULT_QUIET) {
+            return false;
+        }
+        if reported.len() >= MAX_FAULTS_REMEMBERED {
+            reported.retain(|_, &mut at| now.duration_since(at) < FAULT_QUIET);
+            if reported.len() >= MAX_FAULTS_REMEMBERED {
+                reported.clear();
+            }
+        }
+        reported.insert(key, now);
+        true
+    }
+
+    /// Reports `result`'s error if it's a malformed frame: else it's the connection closing.
+    fn malformed<T>(&self, result: &io::Result<T>, from: SocketAddr) {
+        if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::InvalidData) {
+            self.report(Fault::Malformed { from });
+        }
+    }
+}
+
+/// Ignores them.
+impl Default for OnFault {
+    fn default() -> Self {
+        Self::new(|_| {})
+    }
+}
+
+impl fmt::Debug for OnFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OnFault")
     }
 }
 
@@ -351,7 +499,7 @@ async fn serve_on<S: Service + 'static>(
     client_io: tokio::runtime::Handle,
 ) -> io::Result<()> {
     check_tokens(&config)?;
-    let (tls, reloading) = tls::start(config.tls.clone())?;
+    let (tls, reloading) = tls::start(config.tls.clone(), config.on_fault.clone())?;
     let peer_ids = tls.borrow().as_ref().is_some_and(|t| t.peer_ids);
     let id = config.node.raft.id;
     let (node, storage, lock, clock) = open_node(&config, service)?;
@@ -380,12 +528,20 @@ async fn serve_on<S: Service + 'static>(
     let hello = Hello { service_id: config.service_id, node_id: Some(id), epoch };
     let peer_token: Option<Arc<[u8]>> = config.peer_token.as_deref().map(Arc::from);
     tasks.spawn_on(reloading, &client_io);
-    let accepting =
-        accept_peers(peer_listener, hello.clone(), peer_token.clone(), tls.clone(), peer_ids, inputs.clone());
+    let accepting = accept_peers(
+        peer_listener,
+        hello.clone(),
+        peer_token.clone(),
+        tls.clone(),
+        peer_ids,
+        inputs.clone(),
+        config.on_fault.clone(),
+    );
     tasks.spawn_on(accepting, &peer_io);
     let next_conn = Arc::new(AtomicU64::new(1));
     let token = config.admin_token.as_deref().map(Arc::from);
-    let (clients, operators) = gates(&hello, &tls, client_inputs, inputs.clone(), config.node.session_timeout, token);
+    let (clients, operators) =
+        gates(&hello, &tls, client_inputs, inputs.clone(), config.node.session_timeout, token, &config.on_fault);
     tasks.spawn_on(accept(client_listener, clients, next_conn.clone()), &client_io);
     tasks.spawn_on(accept(admin_listener, operators, next_conn), &client_io);
     let contacts = config.peer_addrs.clone();
@@ -410,6 +566,7 @@ async fn serve_on<S: Service + 'static>(
         dials: JoinSet::new(),
         peer_io,
         conns: HashMap::new(),
+        faults: config.on_fault.clone(),
     };
     let peers = core.node.raft().peers();
     core.dial(&peers);
@@ -455,6 +612,8 @@ struct Core<S> {
     /// Where the peers' connections' tasks run.
     peer_io: tokio::runtime::Handle,
     conns: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
+    /// What [`dial_peer`]s report to.
+    faults: OnFault,
 }
 
 impl<S: Service + 'static> Core<S> {
@@ -571,6 +730,9 @@ impl<S: Service + 'static> Core<S> {
         for &(stage, ns) in &taken.latencies {
             metrics::record_latency(stage, ns);
         }
+        for &election in &taken.elections {
+            self.faults.report(Fault::Election(election));
+        }
         self.send_peers(taken.peer_appends);
         self.send_clients(taken.client_sends);
         self.send_peers(taken.peer_sends);
@@ -658,6 +820,7 @@ impl<S: Service + 'static> Core<S> {
                     self.tls.clone(),
                     self.peer_ids.then_some(id),
                     rx,
+                    self.faults.clone(),
                 );
                 let task = self.dials.spawn_on(dial, &self.peer_io);
                 self.peers.insert(id, (addr, tx, task));
@@ -1083,54 +1246,95 @@ async fn accept_peers(
     tls: tls::Current,
     peer_ids: bool,
     inputs: mpsc::Sender<Input>,
+    faults: OnFault,
 ) {
     let mut conns = JoinSet::new();
     loop {
         room(&mut conns, MAX_OTHER_CONNECTIONS).await;
-        let Ok((stream, _)) = listener.accept().await else {
-            // Out of file descriptors, say: not again at once, in a loop that holds a core.
-            tokio::time::sleep(ACCEPT_RETRY).await;
-            continue;
-        };
+        let Some((stream, addr)) = accepted(&listener, Listener::Peer, &faults).await else { continue };
         let (tls, plain_beside) =
             tls.borrow().as_ref().map_or((None, None), |t| (t.peer.clone(), t.plain.then_some("peer")));
-        let (inputs, token, hello) = (inputs.clone(), token.clone(), hello.clone());
+        let (inputs, token, hello, faults) = (inputs.clone(), token.clone(), hello.clone(), faults.clone());
         conns.spawn(async move {
             let handshake = async {
                 let (mut stream, cert) = tls::accept(stream, tls.as_ref(), plain_beside).await?;
                 let first = read_hello(&mut stream).await?;
                 io::Result::Ok((stream, cert, first))
             };
-            let Ok(Ok((stream, cert, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else {
-                return;
+            let (stream, cert, first) = match shake(handshake).await {
+                Ok(shaken) => shaken,
+                Err(error) => return faults.report(Fault::Handshake { from: addr, error }),
             };
-            let theirs = hello.check(&first, wire::Role::Peer);
-            let theirs = theirs.filter(|h| token.as_ref().is_none_or(|token| same(h.token(), token)));
-            let theirs = theirs.filter(|h| hello.same_cluster(h.epoch()));
-            let Some((from, epoch)) = theirs.and_then(|h| Some((NodeId::from_wire(h.node_id())?, h.epoch()))) else {
-                return;
+            let refused = |reason| faults.report(Fault::Refused { from: addr, reason });
+            let Some(theirs) = hello.check(&first, wire::Role::Peer) else {
+                return refused("not a peer's hello for this service");
             };
-            if Some(from) == hello.node_id || (peer_ids && !tls::names(cert.as_ref(), from)) {
-                return;
+            if token.as_ref().is_some_and(|token| !same(theirs.token(), token)) {
+                return refused("wrong peer token");
+            }
+            let epoch = theirs.epoch();
+            if !hello.same_cluster(epoch) {
+                return refused("another cluster's epoch");
+            }
+            let Some(from) = NodeId::from_wire(theirs.node_id()) else { return refused("no node id") };
+            if Some(from) == hello.node_id {
+                return refused("this node's own id");
+            }
+            if peer_ids && !tls::names(cert.as_ref(), from) {
+                return refused("its certificate doesn't name the node its hello says");
             }
             // Only read, but its writing half kept: dropping it would close the dialler's way in.
             let (mut reader, _writer) = stream.split();
-            read_peer(&mut reader, from, epoch, &hello, &inputs).await;
+            read_peer(&mut reader, (from, addr), epoch, &hello, &inputs, &faults).await;
         });
     }
 }
 
+/// The next connection on `listener`, or none if accepting failed (reported, and after a wait).
+async fn accepted(listener: &TcpListener, which: Listener, faults: &OnFault) -> Option<(TcpStream, SocketAddr)> {
+    match listener.accept().await {
+        Ok(accepted) => Some(accepted),
+        Err(error) => {
+            faults.report(Fault::Accept { listener: which, error });
+            // Out of file descriptors, say: not again at once, in a loop that holds a core.
+            tokio::time::sleep(ACCEPT_RETRY).await;
+            None
+        }
+    }
+}
+
+/// What `handshake` yields, if it does within [`HELLO_TIMEOUT`].
+async fn shake<T>(handshake: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+    let shaken = tokio::time::timeout(HELLO_TIMEOUT, handshake).await;
+    shaken.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "no hello in time")))
+}
+
 /// Hands the node what a peer sends, until it sends something malformed, the connection fails,
 /// or it's found of another cluster.
-async fn read_peer(reader: &mut tls::ReadHalf, from: NodeId, epoch: u64, hello: &Hello, inputs: &mpsc::Sender<Input>) {
-    while let Ok(frame) = read_valid_frame(reader).await {
+async fn read_peer(
+    reader: &mut tls::ReadHalf,
+    (from, addr): (NodeId, SocketAddr),
+    epoch: u64,
+    hello: &Hello,
+    inputs: &mpsc::Sender<Input>,
+    faults: &OnFault,
+) {
+    loop {
+        let frame = read_valid_frame(reader).await;
+        faults.malformed(&frame, addr);
+        let Ok(frame) = frame else { return };
         // With the rest read whole meanwhile, as a client's are: a leader's acks from a
         // follower come many at once, each else an input of its own.
         let mut frames = vec![frame];
         let rest = read_buffered(reader, &mut frames).await;
         // Checked again as this node learns its epoch, or it changes: a connection from
         // another cluster's node is dropped then.
-        if !hello.same_cluster(epoch) || inputs.send(Input::Peer(from, frames)).await.is_err() || rest.is_err() {
+        if !hello.same_cluster(epoch) {
+            let reason = "another cluster's epoch";
+            return faults.report(Fault::Refused { from: addr, reason });
+        }
+        faults.malformed(&rest, addr);
+        if inputs.send(Input::Peer(from, frames)).await.is_err() || rest.is_err() {
             return;
         }
     }
@@ -1157,6 +1361,13 @@ struct Gate {
     /// How long a connection may say nothing: for a client the session timeout, by which its
     /// session is gone.
     idle: Option<Duration>,
+    faults: OnFault,
+}
+
+impl Gate {
+    fn listener(&self) -> Listener {
+        if self.role == wire::Role::Admin { Listener::Admin } else { Listener::Client }
+    }
 }
 
 /// The client listener's gate and the operators'. An operator's frames go on `inputs`, with
@@ -1170,6 +1381,7 @@ fn gates(
     inputs: mpsc::Sender<Input>,
     session_timeout: Duration,
     admin_token: Option<Arc<[u8]>>,
+    faults: &OnFault,
 ) -> (Gate, Gate) {
     let clients = Gate {
         role: wire::Role::Client,
@@ -1178,6 +1390,7 @@ fn gates(
         tls: tls.clone(),
         inputs: client_inputs,
         idle: Some(session_timeout),
+        faults: faults.clone(),
     };
     let operators = Gate { role: wire::Role::Admin, token: admin_token, inputs, idle: None, ..clients.clone() };
     (clients, operators)
@@ -1189,11 +1402,7 @@ async fn accept(listener: TcpListener, gate: Gate, next_conn: Arc<AtomicU64>) {
     let mut conns = JoinSet::new();
     loop {
         room(&mut conns, max).await;
-        let Ok((stream, _)) = listener.accept().await else {
-            // Out of file descriptors, say: not again at once, in a loop that holds a core.
-            tokio::time::sleep(ACCEPT_RETRY).await;
-            continue;
-        };
+        let Some((stream, _)) = accepted(&listener, gate.listener(), &gate.faults).await else { continue };
         let conn = next_conn.fetch_add(1, Ordering::Relaxed);
         conns.spawn(serve_connection(stream, conn, gate.clone()));
     }
@@ -1202,7 +1411,7 @@ async fn accept(listener: TcpListener, gate: Gate, next_conn: Arc<AtomicU64>) {
 /// A client's or operator's connection: hello each way, then frames in to the node and out from
 /// it, until either side closes or nothing comes for `idle`.
 async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
-    let Gate { role, hello, token, tls, inputs, idle } = gate;
+    let Gate { role, hello, token, tls, inputs, idle, .. } = gate;
     let admin = role == wire::Role::Admin;
     // The admin listener's TLS is each node's own: never plain beside it.
     let (tls, plain_beside) = match tls.borrow().as_ref() {
@@ -1215,7 +1424,7 @@ async fn serve_connection(stream: TcpStream, conn: ConnId, gate: Gate) {
         let first = read_hello(&mut stream).await?;
         io::Result::Ok((stream, first))
     };
-    let Ok(Ok((stream, first))) = tokio::time::timeout(HELLO_TIMEOUT, handshake).await else { return };
+    let Ok((stream, first)) = shake(handshake).await else { return };
     let (mut reader, mut writer) = stream.split();
     let Some(theirs) = hello.check(&first, role) else { return };
     if token.is_some_and(|token| !same(theirs.token(), &token)) {
@@ -1328,22 +1537,30 @@ async fn dial_peer(
     tls: tls::Current,
     node: Option<NodeId>,
     mut rx: mpsc::Receiver<Frame>,
+    faults: OnFault,
 ) {
+    let failed = |error| faults.report(Fault::Peer { addr: addr.clone(), error });
     let mut batch = Vec::new();
     let mut redial = REDIAL;
     loop {
         let dial = tls.borrow().as_ref().and_then(|t| t.dial.clone());
         let connected = tokio::time::timeout(HELLO_TIMEOUT, tls::connect(&addr, dial.as_ref(), node)).await;
-        let Ok(Ok(stream)) = connected else {
-            tokio::time::sleep(redial).await;
-            redial = backoff(redial);
-            continue;
+        let connected = connected.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "dial timed out")));
+        let stream = match connected {
+            Ok(stream) => stream,
+            Err(error) => {
+                failed(error);
+                tokio::time::sleep(redial).await;
+                redial = backoff(redial);
+                continue;
+            }
         };
         // Small frames gathered into fewer writes (over TLS, fewer records); an append with its
         // records, past the buffer, goes straight through, not copied again.
         let mut stream = BufWriter::with_capacity(PEER_WRITE_BUFFER_BYTES, stream);
         let epoch = hello.epoch();
-        if write_frames(&mut stream, [&hello.frame(wire::Role::Peer, &token)[..]]).await.is_err() {
+        if let Err(error) = write_frames(&mut stream, [&hello.frame(wire::Role::Peer, &token)[..]]).await {
+            failed(error);
             tokio::time::sleep(redial).await;
             redial = backoff(redial);
             continue;
@@ -1363,7 +1580,8 @@ async fn dial_peer(
                 }
                 stream.flush().await
             };
-            if written.await.is_err() {
+            if let Err(error) = written.await {
+                failed(error);
                 break;
             }
         }
@@ -1545,8 +1763,8 @@ mod tests {
         assert_eq!(frames, [keepalive(1)], "those before it");
     }
 
-    /// A peer's frames before a malformed one reach the node, and none after: it's dropped there.
-    /// None at all from a peer found of another cluster.
+    /// A peer's frames before a malformed one reach the node, and none after: it's dropped there,
+    /// and reported. None at all from a peer found of another cluster, refused as one.
     #[tokio::test]
     async fn a_peer_is_read_up_to_a_malformed_frame() {
         let keepalive = |session| {
@@ -1560,13 +1778,54 @@ mod tests {
         let reader = || -> tls::ReadHalf { tokio::io::BufReader::new(Box::new(std::io::Cursor::new(bytes.clone()))) };
         let hello = Hello { service_id: 1, node_id: Some(NodeId(1)), epoch: Arc::new(AtomicU64::new(7)) };
         let (inputs, mut taken) = mpsc::channel(8);
-        read_peer(&mut reader(), NodeId(2), 7, &hello, &inputs).await;
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let faults = OnFault::new({
+            let reported = reported.clone();
+            move |fault| reported.lock().unwrap().push(fault.to_string())
+        });
+        let from = (NodeId(2), "10.0.0.2:7000".parse().unwrap());
+        read_peer(&mut reader(), from, 7, &hello, &inputs, &faults).await;
         let Ok(Input::Peer(NodeId(2), frames)) = taken.try_recv() else { panic!("the frame before it") };
         assert_eq!(frames, [keepalive(1)]);
         assert!(taken.try_recv().is_err(), "none after it");
+        assert_eq!(
+            reported.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            ["peer listener: 10.0.0.2:7000: malformed frame"]
+        );
 
-        read_peer(&mut reader(), NodeId(2), 8, &hello, &inputs).await;
+        read_peer(&mut reader(), from, 8, &hello, &inputs, &faults).await;
         assert!(taken.try_recv().is_err(), "another cluster's");
+        let refused = "peer listener: 10.0.0.2:7000: refused: another cluster's epoch";
+        assert_eq!(reported.lock().unwrap().drain(..).collect::<Vec<_>>(), [refused]);
+    }
+
+    /// A fault like one reported within [`FAULT_QUIET`] isn't reported: like by kind and IP
+    /// address, not port. After it, it is again; and a full memory forgets, not refuses.
+    #[test]
+    fn a_fault_is_reported_once_a_quiet_spell() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let faults = OnFault::new({
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let refused = |from: &str| Fault::Refused { from: from.parse().unwrap(), reason: "wrong peer token" };
+        faults.report(refused("10.0.0.2:5001"));
+        faults.report(refused("10.0.0.2:5002"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "the same peer, redialled");
+        faults.report(refused("10.0.0.3:5001"));
+        faults.report(Fault::Malformed { from: "10.0.0.2:5003".parse().unwrap() });
+        assert_eq!(calls.load(Ordering::Relaxed), 3, "another peer, another kind");
+
+        let now = Instant::now();
+        let key = refused("10.0.0.2:1").key();
+        assert!(!faults.due(key.clone(), now + FAULT_QUIET / 2));
+        assert!(faults.due(key.clone(), now + FAULT_QUIET), "due again after the quiet spell");
+        for ip in 0..MAX_FAULTS_REMEMBERED {
+            assert!(faults.due(("refused", format!("10.1.0.{ip}")), now + FAULT_QUIET));
+        }
+        assert!(faults.reported.lock().unwrap().len() <= MAX_FAULTS_REMEMBERED);
     }
 
     /// A connection from a newer node isn't dropped for a message this one doesn't know: it's
@@ -1677,11 +1936,12 @@ mod tests {
     /// timed out; clients' are after the session timeout. Each gate has its own role and token.
     #[test]
     fn operators_are_on_the_nodes_queue_and_never_idle() {
-        let (tls, _reloading) = tls::start(None).unwrap();
+        let (tls, _reloading) = tls::start(None, OnFault::default()).unwrap();
         let hello = Hello { service_id: 7, node_id: Some(NodeId(1)), epoch: Arc::new(AtomicU64::new(0)) };
         let ((inputs, mut taken), (client_inputs, mut clients_taken)) = (mpsc::channel(1), mpsc::channel(1));
         let timeout = Duration::from_secs(9);
-        let (clients, operators) = gates(&hello, &tls, client_inputs, inputs, timeout, Some(Arc::from(&b"t"[..])));
+        let (clients, operators) =
+            gates(&hello, &tls, client_inputs, inputs, timeout, Some(Arc::from(&b"t"[..])), &OnFault::default());
         assert_eq!((clients.idle, operators.idle), (Some(timeout), None));
         assert_eq!((clients.role, operators.role), (wire::Role::Client, wire::Role::Admin));
         assert_eq!((clients.token.as_deref(), operators.token.as_deref()), (None, Some(&b"t"[..])));
@@ -1818,12 +2078,12 @@ mod tests {
         }
         let mut node_tls = NodeTls::new(file("node-2.pem"), file("node-2.key"), file("ca.pem"), file("ca.pem"));
         node_tls.peer_ids = true;
-        let (current, _reloading) = tls::start(Some(node_tls)).unwrap();
+        let (current, _reloading) = tls::start(Some(node_tls), OnFault::default()).unwrap();
         let hello = |id| Hello { service_id: 7, node_id: Some(NodeId(id)), epoch: Arc::new(AtomicU64::new(0)) };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (inputs, mut received) = mpsc::channel(16);
-        tokio::spawn(accept_peers(listener, hello(2), None, current, true, inputs));
+        tokio::spawn(accept_peers(listener, hello(2), None, current, true, inputs, OnFault::default()));
 
         let dialler = tls::ClientTls::load(&file("ca.pem"), Some((&file("node-1.pem"), &file("node-1.key")))).unwrap();
         for (claims, taken) in [(1, true), (3, false)] {

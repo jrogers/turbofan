@@ -231,6 +231,37 @@ pub enum Role {
     Leader,
 }
 
+/// An election this node began, won or caused, for a driver to report: how often a cluster
+/// elects, and why, says what's wrong with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Election {
+    /// It heard nothing from a leader (`leader`, if it followed one) for an election timeout in
+    /// `term`, and stands. Once an election: not again for each round it takes.
+    LeaderLost { term: u64, leader: Option<NodeId> },
+    /// Leader `from` handed leadership over to it, and it stands in `term`.
+    HandedOver { term: u64, from: NodeId },
+    /// It was elected leader of `term`.
+    Won { term: u64 },
+    /// As leader of `term`, it didn't hear from a majority of the voters for an election timeout,
+    /// and stood down.
+    QuorumLost { term: u64 },
+}
+
+impl fmt::Display for Election {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LeaderLost { term, leader: Some(leader) } => {
+                write!(f, "no word from leader {leader} in term {term}: standing for election")
+            }
+            Self::LeaderLost { term, leader: None } => write!(f, "no leader in term {term}: standing for election"),
+            Self::HandedOver { term, from } => write!(f, "leader {from} handed over: standing in term {term}"),
+            Self::Won { term } => write!(f, "elected leader of term {term}"),
+            Self::QuorumLost { term } => write!(f, "leader of term {term}: lost touch with a majority, standing down"),
+        }
+    }
+}
+
 /// A cluster member: its ID, and where it's reached, which Raft carries without using.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -342,6 +373,8 @@ pub struct Outputs {
     pub confirmed_reads: Vec<ReadIndex>,
     /// Reads dropped, as this node stopped leading: ask the new leader.
     pub dropped_reads: Vec<u64>,
+    /// Elections this node began, won or caused, in order.
+    pub elections: Vec<Election>,
 }
 
 /// A stage a leader's own entry reaches, timed from when it was proposed: see
@@ -781,6 +814,7 @@ impl Raft {
                 if heard < self.quorum() {
                     // Check quorum: a leader cut off from a majority stands down, so clients
                     // find the leader the majority elects.
+                    self.out.elections.push(Election::QuorumLost { term: self.meta.term });
                     self.become_follower(self.meta.term, now);
                     return;
                 }
@@ -810,6 +844,10 @@ impl Raft {
                     self.leader = None;
                     self.reset_election(now);
                 } else {
+                    // A round of an election already begun isn't another.
+                    if self.role == Role::Follower {
+                        self.out.elections.push(Election::LeaderLost { term: self.meta.term, leader: self.leader });
+                    }
                     self.start_pre_vote(now);
                 }
             }

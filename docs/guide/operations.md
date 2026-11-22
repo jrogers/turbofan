@@ -179,6 +179,30 @@ nowhere. The main ones:
 Every node reports the same applied state, from when it started; scrape them all, and read the
 leader's for the latencies.
 
+## Faults
+
+A node carries on through what goes wrong on the network, and says nothing of it. Those an
+operator may need to fix, it hands to `Config::on_fault` (in `run_with`'s `configure`, for a
+binary built on `run`): a listener that can't accept (out of file descriptors, say), TLS files
+that don't load, a peer it can't dial, and a connection to its peer listener refused (the wrong
+token, another cluster, a certificate that doesn't name its node), failing its handshake, or
+sending something malformed: a misconfigured node, or one of a version this one can't read. And
+the elections it takes part in: it stands, having heard nothing from its leader (or been handed
+leadership), wins, or, leading, stands down, having lost touch with a majority. Elections that
+come often say the network, a disk or a pause (garbage collection, a starved VM) is holding
+heartbeats up past the election timeout.
+
+```rust
+fn configure(config: &mut turbofan::driver::Config) {
+    config.on_fault = turbofan::driver::OnFault::new(|fault| eprintln!("turbofan: {fault}"));
+}
+```
+
+Faults alike (of a kind, from one address) are reported once a minute at most, elections each: a peer that's down
+is dialled every second. It's called on the connection's task, so it mustn't block. A client's or
+operator's connection that fails or is refused isn't a fault: a refused one is told why. Nor is
+what stops the node: `serve` returns it.
+
 [clients]: clients.md
 [membership]: membership.md
 [running]: running.md

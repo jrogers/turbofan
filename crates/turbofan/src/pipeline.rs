@@ -56,6 +56,8 @@ pub struct Taken {
     pub peers: Option<Vec<Member>>,
     /// See [`crate::node::Outputs::latencies`].
     pub latencies: Vec<(crate::raft::Stage, u64)>,
+    /// See [`crate::node::Outputs::elections`].
+    pub elections: Vec<crate::raft::Election>,
     /// Write these, each batch's reads after its operations, then sync; then, with what was read,
     /// [`Pipeline::written`].
     pub write: Option<Vec<Batch>>,
@@ -102,6 +104,7 @@ impl Pipeline {
             save: out.save,
             peers: out.peers,
             latencies: out.latencies,
+            elections: out.elections,
             write,
         }
     }

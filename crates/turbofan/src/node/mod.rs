@@ -182,6 +182,8 @@ pub struct Outputs {
     /// Captures asked for: make each after `persist`, when the log on disk is the node's as of
     /// this batch, and answer it.
     pub captures: Vec<Capture>,
+    /// See [`raft::Outputs::elections`].
+    pub elections: Vec<raft::Election>,
 }
 
 /// An operator's `Capture`: copy the latest snapshot, and the log after it to `to`, this node's
@@ -540,6 +542,7 @@ impl<S: Service> Node<S> {
             out.peers = more.peers.or(out.peers);
             out.latencies.extend(more.latencies);
             out.confirmed_reads.extend(more.confirmed_reads);
+            out.elections.extend(more.elections);
         }
         // Dropped reads went with the leader state as it stepped down, their queries with them.
         self.on_confirmed_reads(&out.confirmed_reads);
@@ -563,6 +566,7 @@ impl<S: Service> Node<S> {
             peers: out.peers,
             latencies: out.latencies,
             captures: std::mem::take(&mut self.captures),
+            elections: out.elections,
         }
     }
 

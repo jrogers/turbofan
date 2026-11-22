@@ -182,6 +182,7 @@ impl Raft {
     /// The leader of this term hands over: stand for election now.
     pub(super) fn on_timeout_now(&mut self, from: NodeId, m: &wire::TimeoutNowRef<'_>, now: u64) {
         if m.term() == self.meta.term && self.leader == Some(from) && self.is_voter(self.config.id) {
+            self.out.elections.push(Election::HandedOver { term: self.meta.term + 1, from });
             self.become_candidate(now);
         }
     }

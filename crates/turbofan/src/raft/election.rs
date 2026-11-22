@@ -121,6 +121,7 @@ impl Raft {
         self.rebuild_peers();
         self.heartbeat_at = now;
         self.out.became_leader = true;
+        self.out.elections.push(Election::Won { term: self.meta.term });
     }
 
     pub(super) fn become_follower(&mut self, term: u64, now: u64) {

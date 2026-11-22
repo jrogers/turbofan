@@ -91,6 +91,7 @@ fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Frame)>,
         let mut out = raft.take_outputs();
         reads.confirmed.append(&mut out.confirmed_reads);
         reads.dropped.append(&mut out.dropped_reads);
+        reads.elections.extend(out.elections.into_iter().map(|e| (to, e)));
         raft.on_persisted(raft.log_end(), raft.now);
         out.appends.append(&mut out.sends);
         queue.extend(out.appends.into_iter().map(|(next, frame)| (to, next, frame)));
@@ -98,11 +99,12 @@ fn deliver(rafts: &mut [Raft], up: &[u8], from: u8, sends: Vec<(NodeId, Frame)>,
     reads
 }
 
-/// Reads confirmed and dropped, by [`deliver`].
+/// Reads confirmed and dropped, by [`deliver`], and the elections reported on the way.
 #[derive(Debug, Default)]
 struct Reads {
     confirmed: Vec<ReadIndex>,
     dropped: Vec<u64>,
+    elections: Vec<(NodeId, Election)>,
 }
 
 /// Times `id` out from `now` and runs its election among `up`, retrying as a real node
@@ -126,6 +128,46 @@ fn elect(rafts: &mut [Raft], up: &[u8], id: u8, now: u64) {
 fn cluster(n: u8) -> Vec<Raft> {
     let members: Vec<u8> = (1..=n).collect();
     members.iter().map(|&id| Raft::new(config(id, &members), Meta::default(), None, Entries::default(), 0)).collect()
+}
+
+/// Each election is reported once, by the node it's of: the one that stands, why, and that it
+/// won; a leader cut off standing down; and not again for each round of an election begun.
+#[test]
+fn elections_are_reported_once_by_the_nodes_they_are_of() {
+    let mut rafts = cluster(3);
+    let now = rafts[0].next_deadline();
+    rafts[0].on_tick(now);
+    let out = rafts[0].take_outputs();
+    assert_eq!(out.elections, [Election::LeaderLost { term: 0, leader: None }]);
+    let end = rafts[0].log_end();
+    rafts[0].on_persisted(end, now);
+    let reads = deliver(&mut rafts, &[1, 2, 3], 1, [out.appends, out.sends].concat(), now);
+    assert_eq!(reads.elections, [(NodeId(1), Election::Won { term: 1 })]);
+    // Its first heartbeat, by which the others know it leads.
+    rafts[0].on_tick(now);
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, now);
+
+    // Node 1 cut off: it stands down, and node 2, hearing nothing from it, stands and wins.
+    let later = now + 10 * nanos(Duration::from_millis(150));
+    rafts[0].on_tick(later);
+    assert_eq!(rafts[0].take_outputs().elections, [Election::QuorumLost { term: 1 }]);
+    rafts[1].on_tick(later);
+    let out = rafts[1].take_outputs();
+    assert_eq!(out.elections, [Election::LeaderLost { term: 1, leader: Some(NodeId(1)) }]);
+    let end = rafts[1].log_end();
+    rafts[1].on_persisted(end, later);
+    let reads = deliver(&mut rafts, &[2, 3], 2, [out.appends, out.sends].concat(), later);
+    assert_eq!(reads.elections, [(NodeId(2), Election::Won { term: 2 })]);
+
+    // Node 1, still cut off, stands: once, not for each round.
+    for round in 1..=3 {
+        let at = later + round * 10 * nanos(Duration::from_millis(150));
+        rafts[0].on_tick(at);
+        let elections = rafts[0].take_outputs().elections;
+        let expected: &[Election] = if round == 1 { &[Election::LeaderLost { term: 1, leader: None }] } else { &[] };
+        assert_eq!(elections, expected, "round {round}");
+    }
 }
 
 /// A leader's appends go out before its own records are durable, and it counts itself

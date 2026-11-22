@@ -443,6 +443,7 @@ fn serve_config(args: &[String], service_id: u32) -> Result<driver::Config, Stri
         peer_token: None,
         tls: node_tls(args)?,
         spin: false,
+        on_fault: driver::OnFault::default(),
     })
 }
 
