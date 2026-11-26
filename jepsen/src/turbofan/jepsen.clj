@@ -80,6 +80,7 @@
                   :--clients (members test client-port)
                   :--admin   (members test admin-port)]
            (not (:fsync test))     (conj :--no-fsync)
+           (:read-lease test)      (conj :--read-lease (:read-lease test))
            (cu/exists? join-marker) (conj :--join))))
 
 (defn start-gateway! [test node]
@@ -361,6 +362,7 @@
            opts
            {:name            (->> [(str/join "," (map name (sort (:nemesis opts))))
                                        (if (:fsync opts) "fsync" "no-fsync")
+                                       (when (:read-lease opts) "read-lease")
                                        (when (:lazyfs opts) "lazyfs")]
                                       (remove str/blank?)
                                       (str/join " ")
@@ -394,6 +396,9 @@
     :default "/turbofan/target/jepsen/release/examples/list_append"]
    [nil "--fsync" "Run the nodes as by default, syncing the log. Without it, --no-fsync."
     :default false]
+   [nil "--read-lease MS" "The nodes answer reads from a lease this long (serve --read-lease), under their 300 ms election timeout."
+    :parse-fn parse-long
+    :validate [#(< 0 % 300) "Under the election timeout, 300 ms"]]
    [nil "--lazyfs" "The nodes' data on LazyFS: a node killed loses what it didn't sync."
     :default false]
    [nil "--nemesis FAULTS" "Faults to inject, comma-separated: partition, kill, pause, clock, packet, member; or none."

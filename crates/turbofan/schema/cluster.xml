@@ -3,7 +3,7 @@
      Every frame is a u32 length and one of these messages. Services' own payloads are opaque
      `payload` bytes here; each service has a schema of its own. Change it only as WIRE.md says:
      old and new nodes run side by side. -->
-<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="8"
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="wire" id="100" version="9"
                    byteOrder="littleEndian">
     <types>
         <composite name="messageHeader">
@@ -74,7 +74,9 @@
 
     <!-- Peer to peer. -->
     <!-- `round`: which of the candidate's pre-votes this is, for the `Vote` to echo. Absent from an
-         older node. -->
+         older node. `handover`: 1 from a candidate the leader handed over to (`TimeoutNow`), which
+         a voter that has heard a leader lately votes for all the same; 0 or absent otherwise, and
+         such a voter refuses it, as a leader's read lease counts on. -->
     <sbe:message name="RequestVote" id="10">
         <field name="term" id="1" type="uint64"/>
         <field name="candidate" id="2" type="uint8"/>
@@ -82,6 +84,7 @@
         <field name="lastTerm" id="4" type="uint64"/>
         <field name="preVote" id="5" type="uint8"/>
         <field name="round" id="6" type="uint64" sinceVersion="5"/>
+        <field name="handover" id="7" type="uint8" sinceVersion="9"/>
     </sbe:message>
     <!-- `doubt`: the voter's log dropped a damaged tail, which may have held entries it
          acknowledged, and it hasn't caught up since: an election counting its vote needs one more.
@@ -116,7 +119,10 @@
          know the lowest among the members. `prevIndex`: the `prevIndex` of the append (or the
          `lastIndex` of the snapshot) it answers, so a leader tells a refusal of the append it's
          probing with from one of an older append. `readRound`: the append's, echoed (0 for a
-         snapshot's). Absent from an older node. -->
+         snapshot's). Absent from an older node. `leaseWindow`: how long, in nanoseconds, from when
+         the append arrived, this node refuses to vote for a candidate not handed over to (its
+         election timeout), which a leader's read lease counts on. Absent from an older node, which
+         promises nothing. -->
     <sbe:message name="AppendAck" id="13">
         <field name="term" id="1" type="uint64"/>
         <field name="success" id="2" type="uint8"/>
@@ -126,6 +132,7 @@
         <field name="serviceVersion" id="6" type="uint32"/>
         <field name="prevIndex" id="7" type="uint64" sinceVersion="7"/>
         <field name="readRound" id="8" type="uint64" sinceVersion="8"/>
+        <field name="leaseWindow" id="9" type="uint64" sinceVersion="9"/>
     </sbe:message>
     <sbe:message name="InstallSnapshot" id="14">
         <field name="term" id="1" type="uint64"/>

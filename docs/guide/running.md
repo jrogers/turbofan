@@ -134,6 +134,7 @@ For full control, call `driver::serve` with a `driver::Config` from a `main` of 
 |---|---|---|
 | `node.raft.election_timeout` | 300 ms | A follower that hears no leader for between this and twice this stands for election: the time a failover takes. `--election-timeout`. |
 | `node.raft.heartbeat` | 50 ms | How often a leader heartbeats: under half the election timeout. `--heartbeat`. |
+| `node.raft.read_lease` | none | A leader answers queries without a round trip to a quorum, this long after one acks a heartbeat: under the election timeout by a margin for the clocks (see [Services][services]). `--read-lease`. |
 | `node.raft.seed` | the node's ID | Seeds the election timeout's jitter: make it differ between nodes. `run` mixes in the time. |
 | `node.raft.log_window_bytes` | 64 MiB | Applied records kept in memory, for followers a little behind; older ones are read back from disk. |
 | `node.raft.log_tail_entries` | 100,000 | Entries kept before a snapshot, so a follower that far behind is sent the log, not the snapshot. |
@@ -272,4 +273,5 @@ the flags are refused: there's never TLS to run, nor a TLS dependency to license
 [membership]: membership.md
 [operations]: operations.md
 [performance]: performance.md
+[services]: services.md#queries
 [upgrades]: upgrades.md

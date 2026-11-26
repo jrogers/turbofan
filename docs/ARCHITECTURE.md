@@ -240,6 +240,13 @@ A query reads the state without logging anything (Raft's ReadIndex, `raft/reads.
   commit index holds every write completed before. A leader deposed without knowing it can't get
   the echoes: a majority has moved to a later term. One round in flight at a time; the reads that
   come in meanwhile share the next, and appends of records carry the round anyway.
+- **Or holds a lease** (`raft::Config::read_lease`, off by default), and answers at once. A voter
+  that has heard a leader refuses any other candidate for an election timeout (Raft's leader
+  stickiness), but one the leader handed over to, and says so on its acks. So once a quorum has
+  acked a round started at `t`, no other leader is elected before `t` plus the lease, while no
+  clock runs faster than another by more than the lease's margin under the election timeout.
+  With a lease each heartbeat carries a round, to renew it. A handover gives it up for the term,
+  and a change of members until a round after it.
 - **Only the leader answers**, once it has applied up to that index. Nothing is logged, kept in
   a session's ring, or replayed: a query the leader drops (it stepped down, or the connection
   went) is asked again by its client, and answered once.
@@ -308,11 +315,8 @@ later term.
 
 ## Left out on purpose
 
-- **Followers and leases answering queries.** Only the leader answers one, a round trip to a
-  quorum after it comes in. A follower could, asking the leader for the index to read at, if
-  followers took clients; a leader could skip the round trip by trusting a lease, at the cost of
-  trusting bounded clock drift, which the simulation's stepped clocks argue against. Add either if
-  a service needs it.
+- **Followers answering queries.** Only the leader answers one. A follower could, asking the
+  leader for the index to read at, if followers took clients. Add it if a service needs it.
 - **Several services per cluster.** Run one cluster per service.
 - **Fewer hops between a client and the leader.** Of a quiet cluster's 53 µs a message, about 25
   are tasks waking each other: a connection's reader and writer are tasks of their own, at both

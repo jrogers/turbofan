@@ -61,7 +61,9 @@
 //! how far in the log's order the leader had applied. At least as far as any node had applied as
 //! the query was sent, all of it committed by then (ReadIndex's promise, more than
 //! linearizability's: every message answered before); and a message sent after an answer is applied
-//! after it. A leader deposed without knowing it, paused or cut off, must not answer.
+//! after it. A leader deposed without knowing it, paused or cut off, must not answer: in half the
+//! seeds, not from a lease ([`turbofan::raft::Config::read_lease`]) either, with the nodes' clocks
+//! drifting apart.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
@@ -2341,6 +2343,9 @@ impl Sim {
         config.raft.log_window_bytes = self.window;
         // None, some, or more than a snapshot's interval.
         config.raft.log_tail_entries = [0, 50, 1000][usize::try_from(self.seed % 3).unwrap()];
+        // Half the seeds read from a lease, a tenth under the election timeout: the clocks' drift is
+        // far less.
+        config.raft.read_lease = (self.seed / 3).is_multiple_of(2).then(|| Duration::from_millis(135));
         config.snapshot_every_entries = 300;
         // Covers a client's messages in flight, each with its response and some a timer's.
         config.egress_ring_entries = 2 * client::MAX_UNACKED;

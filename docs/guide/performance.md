@@ -96,6 +96,12 @@ commit. The busier the cluster, the bigger the batches.
   throughput (half the queries'), against jemalloc on the same machine. Run the service on
   jemalloc or mimalloc, preloaded (`LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`, from
   Debian and Ubuntu's `libjemalloc2`) or linked (`#[global_allocator]`). macOS's own is as quick.
+- **Read leases.** A query waits for a round trip to a quorum, to confirm the leader still
+  leads. With `serve --read-lease <ms>` (`node.raft.read_lease`) it doesn't, while a quorum has
+  acked a heartbeat within the lease: it costs a margin of trust in the clocks (see
+  [Services][services]). On the Mac below (three nodes over loopback, five-second runs), a query
+  on its own took 39 µs to 15 µs p50, p99 55 µs to 30 µs; queries a second, 8 × 256, 2.65 to 2.78
+  million. Over a network it saves the round trip between nodes. Messages are unchanged.
 - **The build.** `lto = "fat"` and `codegen-units = 1` in the service's `[profile.release]` give
   10 to 18% more throughput, for a slower build; the profile is the service's own, not inherited
   from turbofan's.
@@ -284,3 +290,4 @@ not the core's.
 [clients]: clients.md
 [operations]: operations.md
 [running]: running.md
+[services]: services.md#queries

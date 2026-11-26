@@ -130,7 +130,12 @@ impl Raft {
         p.snapshot_index = p.snapshot_index.max(m.snapshot_index());
         p.versions = Some((m.protocol(), m.service_version()));
         // No further than the rounds started: a peer can't echo one it wasn't sent.
-        p.read_round = p.read_round.max(m.read_round().unwrap_or(0).min(self.reads.round));
+        let round = m.read_round().unwrap_or(0).min(self.reads.round);
+        p.read_round = p.read_round.max(round);
+        // It promised to refuse other candidates for long enough to answer from a lease.
+        if self.config.read_lease.is_some_and(|lease| m.lease_window().unwrap_or(0) >= nanos(lease)) {
+            p.lease_round = p.lease_round.max(round);
+        }
         let id = p.id;
         if self.catching_up.as_ref().is_some_and(|c| c.member.id == id) && self.held_back(peer) {
             // Too old to run what the cluster does: it isn't added, nor sent the log.
@@ -355,6 +360,7 @@ impl Raft {
             service_version: self.advertised.1,
             prev_index,
             read_round,
+            lease_window: nanos(self.config.election_timeout),
         };
         self.send(to, &ack);
     }

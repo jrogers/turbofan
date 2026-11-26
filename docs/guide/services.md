@@ -175,6 +175,16 @@ knowing it yet can't answer from what it has. Not a message the client sent firs
 still on its way: a client that needs to see its own waits for it to be applied first (see
 [Clients][clients]).
 
+With a read lease (`node.raft.read_lease`, `serve --read-lease <ms>`), the leader skips the round
+trip: it answers at once, from what it has applied, while a quorum has acked a heartbeat within
+the lease. Every voter, having heard a leader, refuses any other candidate for an election timeout,
+so no other leader is elected before the lease runs out. That rests on the clocks: the lease must
+be under the election timeout by more than any node's clock may run fast against another's over
+it. A tenth under covers far more than clocks drift. What it doesn't cover is a clock that
+jumps: a voter's monotonic clock jumping forward, or a leader's not counting a pause (a VM stopped,
+its clock not caught up when it resumes). The answer's promise is the same. On every
+node, after 0.14.0: a voter before it promises nothing, and the leader goes on with a round trip.
+
 ```rust
 # use std::collections::BTreeMap;
 # use std::io::{self, Read};

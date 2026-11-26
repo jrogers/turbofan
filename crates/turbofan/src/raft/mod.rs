@@ -38,7 +38,9 @@
 //!
 //! **Reads** ([`Raft::read_index`]): a leader confirms a read without logging it, by a quorum's
 //! acks to a round of appends started after it came in, and hands it back with the commit index
-//! its answer must reflect (ReadIndex, `reads.rs`).
+//! its answer must reflect (ReadIndex, `reads.rs`). With [`Config::read_lease`], it answers at
+//! once while it holds a lease: every voter refuses a candidate for an election timeout after
+//! hearing a leader, but one the leader handed over to.
 //!
 //! **Stopping** ([`Raft::stop`]): a leader shutting the cluster down sends its peers `Stop` with
 //! its heartbeats for a couple of them, then stops; a follower stops on `Stop` once it has the
@@ -196,6 +198,13 @@ pub struct Config {
     /// A leader with this many bytes of its proposals not yet committed is backlogged
     /// ([`Raft::backlogged`]): its driver takes no more from clients until they commit.
     pub max_uncommitted_bytes: usize,
+    /// As leader, answer reads ([`Raft::read_index`]) without a round trip, for this long after a
+    /// quorum acks a round of heartbeats (`reads.rs`): `None`, the default, for a round trip each.
+    /// Under the election timeout, by a margin for the clocks: a voter that acked refuses other
+    /// candidates for its own election timeout, timed on its clock, so the lease is safe while no
+    /// clock runs faster than another by more than the margin, over a lease. A tenth (135 ms of
+    /// 150) is far beyond any clock's drift, and covers the driver's slewing.
+    pub read_lease: Option<Duration>,
 }
 
 /// Where the log ended when a batch of outputs was taken ([`Raft::log_end`]), for
@@ -435,6 +444,8 @@ struct Peer {
     probe_read: bool,
     /// The latest read round it echoed, in this term ([`Raft::read_index`]).
     read_round: u64,
+    /// The latest it echoed promising to refuse other candidates for a lease's length.
+    lease_round: u64,
 }
 
 /// A run of whole records read back from disk, kept as read: one buffer, not one for each.
@@ -543,8 +554,9 @@ pub struct Raft {
     doubt: Option<u64>,
     election_at: u64,
     heartbeat_at: u64,
-    /// When a leader was last heard from, for refusing pre-votes and promotion while it's alive.
-    /// Starting counts: one may be alive that hasn't been heard yet.
+    /// When a leader was last heard from, for refusing votes and promotion while it's alive.
+    /// Starting counts: one may be alive that hasn't been heard yet, and this node may have
+    /// promised it, before restarting, to refuse other candidates (a read lease).
     leader_seen_at: Option<u64>,
     rng: u64,
     out: Outputs,
@@ -584,6 +596,7 @@ impl Raft {
         assert!(config.members.iter().all(Member::fits), "addresses fit the wire");
         assert!(config.heartbeat * 2 < config.election_timeout);
         assert!(config.election_timeout < MAX_TIMEOUT, "times in nanoseconds can't overflow");
+        assert!(config.read_lease.is_none_or(|lease| lease < config.election_timeout), "a lease ends before votes do");
         let (base_index, mut base_term) = snapshot.as_ref().map_or((0, 0), |s| (s.index, s.term));
         let base_members = snapshot.as_ref().map_or_else(|| config.members.clone(), |s| s.members.clone());
         let doubt = log.doubt.then_some(meta.term);
@@ -818,6 +831,7 @@ impl Raft {
                     self.become_follower(self.meta.term, now);
                     return;
                 }
+                self.heartbeat_read_round();
                 for i in 0..self.peers.len() {
                     self.send_append(i, true);
                 }
@@ -968,6 +982,7 @@ impl Peer {
             probe: None,
             probe_read: false,
             read_round: 0,
+            lease_round: 0,
         }
     }
 }

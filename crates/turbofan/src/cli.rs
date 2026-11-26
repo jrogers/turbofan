@@ -50,7 +50,8 @@
 //!
 //! A binary built on [`run`] uses [`NodeConfig::new`](crate::NodeConfig::new)'s defaults, and one on
 //! [`run_with`] its own; then `serve --election-timeout <ms> --heartbeat <ms>` sets the timing,
-//! which depends on the network between the voters.
+//! which depends on the network between the voters. `serve --read-lease <ms>` has a leader answer
+//! queries without a round trip to a quorum ([`crate::raft::Config::read_lease`]).
 //!
 //! A snapshot is a backup: `snapshot --admin <addr>` takes one, which the node writes to
 //! `<data>/snapshots/`, whole and checked, and the newest there is a file to copy off the node.
@@ -124,7 +125,9 @@ const USAGE: &str = "usage:
         interface its listeners bind, on those ports: 0.0.0.0, say)
         (with --no-fsync, the log isn't synced before acknowledging: a majority of the voters
         losing power together may lose committed entries)
-        [--election-timeout <ms>] [--heartbeat <ms>] [--spin]
+        [--election-timeout <ms>] [--heartbeat <ms>] [--read-lease <ms>] [--spin]
+        (with --read-lease, the leader answers queries without a round trip to a quorum: under
+        the election timeout, with a margin for the clocks, a tenth, say, on every node)
         (with --spin, the node runs on three threads that never sleep, a core each)
         [--tls-cert <pem> --tls-key <pem> [--tls-admin-ca <pem>] [--tls-peer-ca <pem> [--tls-peer-ids]]
          [--tls-reload <secs>] [--tls-plain accept|dial]] (the files reread every 60 seconds,
@@ -156,7 +159,8 @@ pub fn run<S: Service + 'static>(service_id: u32, service: S) -> ExitCode {
 /// As [`run`], with `configure` changing a node's configuration before it serves: the settings
 /// that are the service's to choose, such as [`NodeConfig::session_timeout`] or
 /// [`NodeConfig::egress_ring_entries`]. `serve`'s own flags (`--election-timeout`, `--heartbeat`,
-/// `--keep-snapshots`, `--no-fsync`, `--spin`) apply after it, for what an operator chooses for a deployment.
+/// `--read-lease`, `--keep-snapshots`, `--no-fsync`, `--spin`) apply after it, for what an operator
+/// chooses for a deployment.
 ///
 /// [`NodeConfig::session_timeout`]: crate::NodeConfig::session_timeout
 /// [`NodeConfig::egress_ring_entries`]: crate::NodeConfig::egress_ring_entries
@@ -501,6 +505,9 @@ fn tune(args: &[String], config: &mut driver::Config) -> Result<(), String> {
     if given("--heartbeat") {
         node.raft.heartbeat = Duration::from_millis(number("--heartbeat")?);
     }
+    if given("--read-lease") {
+        node.raft.read_lease = Some(Duration::from_millis(number("--read-lease")?));
+    }
     if given("--keep-snapshots") {
         node.snapshots_kept = usize::try_from(number("--keep-snapshots")?).map_err(|_| "--keep-snapshots: too many")?;
     }
@@ -519,6 +526,11 @@ fn tune(args: &[String], config: &mut driver::Config) -> Result<(), String> {
         return Err(format!(
             "an election timeout of {timeout:?} and heartbeat of {heartbeat:?}: the heartbeat must be under half the \
              timeout, and the timeout under a year"
+        ));
+    }
+    if let Some(lease) = node.raft.read_lease.filter(|&lease| lease >= timeout) {
+        return Err(format!(
+            "a read lease of {lease:?}: under the election timeout, {timeout:?}, by a margin for the clocks"
         ));
     }
     Ok(())
@@ -672,6 +684,9 @@ mod tests {
         assert!(tuned(&["--heartbeat", "1000"]).is_err(), "a heartbeat not under half the timeout");
         assert!(tuned(&["--election-timeout", "0"]).is_err());
         assert!(tuned(&["--keep-snapshots", "x"]).is_err());
+        assert_eq!(tuned(&[]).unwrap().node.raft.read_lease, None);
+        assert_eq!(tuned(&["--read-lease", "1800"]).unwrap().node.raft.read_lease, Some(Duration::from_millis(1800)));
+        assert!(tuned(&["--read-lease", "2000"]).is_err(), "a lease not under the election timeout");
     }
 
     /// Addresses may be host names, dialled as given; with one for this node, `--listen` says

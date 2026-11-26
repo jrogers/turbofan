@@ -32,6 +32,9 @@
 //! durable, to committed, and to applied (and so answered), from the node's metrics, beside the
 //! client's round trip.
 //!
+//! `BENCH_READ_LEASE=<ms>` has the leader answer queries from a lease
+//! ([`turbofan::raft::Config::read_lease`]), without a round trip to a quorum.
+//!
 //! `BENCH_CLUSTER=<addr,...>` drives a cluster running elsewhere instead, the clients alone in
 //! this process: the client addresses of nodes of `examples/echo.rs`, on machines of their own, so
 //! the clients don't take the nodes' CPUs. The nodes' runs alone, as they're configured:
@@ -249,6 +252,12 @@ fn remote() -> Option<(Vec<String>, Option<ClientTls>, driver::Fsync)> {
     Some((addrs, tls, fsync))
 }
 
+/// The read lease the nodes take, from `BENCH_READ_LEASE`, in milliseconds.
+fn read_lease() -> Option<Duration> {
+    let ms = std::env::var("BENCH_READ_LEASE").ok()?;
+    Some(Duration::from_millis(ms.parse().expect("BENCH_READ_LEASE is a number of milliseconds")))
+}
+
 /// The throughput run's clients and messages in flight each, from `BENCH_THROUGHPUT`.
 fn throughput_shape() -> (usize, usize) {
     let shape = std::env::var("BENCH_THROUGHPUT").unwrap_or_else(|_| "8x256".into());
@@ -405,6 +414,7 @@ fn start(dir: &Path, tls: bool, fsync: driver::Fsync) -> (Vec<String>, Option<Cl
         let mut node = node::Config::new(id, members.clone());
         // Every response a client can have in flight, kept for it.
         node.egress_ring_entries = MAX_UNACKED;
+        node.raft.read_lease = read_lease();
         let peers = ids.iter().map(|&m| (m, addr(0, m))).collect();
         let mut config =
             driver::Config::new(node, SERVICE_ID, dir.join(id.to_string()), peers, addr(3, id), addr(6, id));

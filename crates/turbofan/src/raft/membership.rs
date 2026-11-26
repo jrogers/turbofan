@@ -61,6 +61,8 @@ impl Raft {
         };
         let (by, upto) = (self.now + nanos(self.config.election_timeout), self.last_index());
         self.transfer = Some(Transfer { to: target, by, upto, sent: false });
+        // The target is voted for by voters that refuse others for this leader's lease.
+        self.reads.forfeit_lease();
         self.try_transfer();
         Some(target)
     }
@@ -183,7 +185,7 @@ impl Raft {
     pub(super) fn on_timeout_now(&mut self, from: NodeId, m: &wire::TimeoutNowRef<'_>, now: u64) {
         if m.term() == self.meta.term && self.leader == Some(from) && self.is_voter(self.config.id) {
             self.out.elections.push(Election::HandedOver { term: self.meta.term + 1, from });
-            self.become_candidate(now);
+            self.become_candidate(now, true);
         }
     }
 
@@ -294,6 +296,8 @@ impl Raft {
     /// The members, or the member being added, changed: peers follow, and the caller is told.
     pub(super) fn peers_changed(&mut self) {
         self.rebuild_peers();
+        // A quorum of the voters as they were may not be one of them as they are.
+        self.reads.restart_lease();
         self.out.peers = Some(self.peers());
     }
 

@@ -139,7 +139,10 @@ fn peer_frames() -> Vec<u8> {
     let mut out = Vec::new();
     let role = wire::Role::Peer;
     put(&mut out, &wire::Hello { magic: codec::MAGIC, service_id: SERVICE_ID, role, node_id: 2, epoch: 3, token: b"" });
-    put(&mut out, &wire::RequestVote { term: 4, candidate: 2, last_index: 9, last_term: 3, pre_vote: 1, round: 5 });
+    put(
+        &mut out,
+        &wire::RequestVote { term: 4, candidate: 2, last_index: 9, last_term: 3, pre_vote: 1, round: 5, handover: 1 },
+    );
     put(&mut out, &wire::Vote { term: 4, granted: 1, pre_vote: 1, doubt: 1, round: 5 });
     let (prev_index, prev_term, commit, last_index, read_round) = (8, 3, 7, 9, 6);
     let entries = b"entries";
@@ -168,6 +171,7 @@ fn peer_frames() -> Vec<u8> {
             service_version: 2,
             prev_index,
             read_round,
+            lease_window: 8,
         },
     );
     let member = [wire::InstallSnapshotMember { id: 1, learner: 1, peer: b"p", client: b"c", admin: b"a" }];
@@ -191,22 +195,28 @@ fn peer_frames() -> Vec<u8> {
     out
 }
 
-/// What [`peer_frames`] wrote, as this version reads it: the same since 0.12.0.
-const PEER_FRAMES: [&str; 9] = [
-    "Hello(HelloRef { magic: 1414745155, service_id: 7, role: Peer, node_id: 2, epoch: 3, token: *** })",
-    "RequestVote(RequestVoteRef { term: 4, candidate: 2, last_index: 9, last_term: 3, pre_vote: 1, round: Some(5) })",
-    "Vote(VoteRef { term: 4, granted: 1, pre_vote: 1, doubt: Some(1), round: Some(5) })",
-    "AppendEntries(AppendEntriesRef { term: 4, leader: 1, prev_index: 8, prev_term: 3, commit: 7, count: 1, \
+/// What [`peer_frames`] wrote, as this version reads it: after 0.14.0, a vote's `handover` and an
+/// ack's `leaseWindow` too.
+fn peer_expected(version: &str) -> Vec<String> {
+    let release: Vec<u32> = version.split('.').map(|n| n.parse().unwrap()).collect();
+    let (handover, lease_window) = if release <= vec![0, 14, 0] { ("None", "None") } else { ("Some(1)", "Some(8)") };
+    let frames = [
+        "Hello(HelloRef { magic: 1414745155, service_id: 7, role: Peer, node_id: 2, epoch: 3, token: *** })",
+        "RequestVote(RequestVoteRef { term: 4, candidate: 2, last_index: 9, last_term: 3, pre_vote: 1, round: Some(5), handover: HANDOVER })",
+        "Vote(VoteRef { term: 4, granted: 1, pre_vote: 1, doubt: Some(1), round: Some(5) })",
+        "AppendEntries(AppendEntriesRef { term: 4, leader: 1, prev_index: 8, prev_term: 3, commit: 7, count: 1, \
      last_index: Some(9), read_round: Some(6), entries: [101, 110, 116, 114, 105, 101, 115] })",
-    "AppendAck(AppendAckRef { term: 4, success: 1, index: 9, snapshot_index: 5, protocol: 1, service_version: 2, \
-     prev_index: Some(8), read_round: Some(6) })",
-    "InstallSnapshot(InstallSnapshotRef { term: 4, leader: 1, last_index: 9, last_term: 3, offset: 10, done: 1, \
+        "AppendAck(AppendAckRef { term: 4, success: 1, index: 9, snapshot_index: 5, protocol: 1, service_version: 2, \
+     prev_index: Some(8), read_round: Some(6), lease_window: LEASE_WINDOW })",
+        "InstallSnapshot(InstallSnapshotRef { term: 4, leader: 1, last_index: 9, last_term: 3, offset: 10, done: 1, \
      checksum: 11, member: [InstallSnapshotMemberRef { id: 1, learner: 1, peer: [112], client: [99], admin: [97] }], \
      chunk: [99, 104, 117, 110, 107] })",
-    "SnapshotAck(SnapshotAckRef { term: 4, offset: 10, index: 9 })",
-    "TimeoutNow(TimeoutNowRef { term: 4 })",
-    "Stop(StopRef { term: 4, index: 9 })",
-];
+        "SnapshotAck(SnapshotAckRef { term: 4, offset: 10, index: 9 })",
+        "TimeoutNow(TimeoutNowRef { term: 4 })",
+        "Stop(StopRef { term: 4, index: 9 })",
+    ];
+    frames.iter().map(|f| f.replace("HANDOVER", handover).replace("LEASE_WINDOW", lease_window)).collect()
+}
 
 /// Every version's golden files: its version and directory.
 fn versions() -> Vec<(String, PathBuf)> {
@@ -298,7 +308,7 @@ fn every_versions_peer_frames_decode() {
             decoded.push(format!("{message:?}"));
             at += used;
         }
-        assert_eq!(decoded, PEER_FRAMES, "{version}");
+        assert_eq!(decoded, peer_expected(&version), "{version}");
     }
 }
 

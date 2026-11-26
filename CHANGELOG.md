@@ -4,6 +4,26 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Added
+
+- Read leases, opt in: `raft::Config::read_lease` (`serve --read-lease <ms>`). A leader answers a
+  query at once, without a round trip to a quorum, while a quorum has acked one of its heartbeats
+  within the lease, which each heartbeat now renews. It must be under the election timeout by a
+  margin for the clocks: a tenth is plenty. Off by default, as before. The guide's *Queries*.
+- A voter that has heard a leader within its election timeout refuses to vote for any other
+  candidate (leader stickiness, the Raft thesis's §4.2.3), and doesn't take its term, as it already
+  refused pre-votes; but one the leader handed over to, whose `RequestVote` now says so. A lease
+  rests on this, and each ack says how long it holds (`AppendAck.leaseWindow`). With or without a
+  lease, a node just started refuses votes for an election timeout, as it did pre-votes.
+
+Nodes of 0.14 and this run side by side: a leader of this version grants itself no lease until a
+quorum of the voters is of it too. A handover from a node of this version to one of 0.14 isn't
+voted for by this version's followers, which hear the leader: unless the leader's own vote and the
+0.14 voters' are a majority, it gives up, and the cluster elects once the leader stops. Upgrade the
+leader last, or expect an election timeout's pause.
+
 ## 0.14.0 (2026-11-25)
 
 ### Breaking

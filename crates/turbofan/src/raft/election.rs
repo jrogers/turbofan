@@ -13,10 +13,16 @@ impl Raft {
         let knows = !self.members().is_empty() || self.last_index() > 0;
         let up_to_date = (m.last_term(), m.last_index()) >= (self.last_term(), self.last_index()) && knows;
         let pre_vote = m.pre_vote() == 1;
+        let leader_seen = self.leader_seen_at.is_some_and(|at| at + nanos(self.config.election_timeout) > now);
         let granted = if pre_vote {
-            let leader_alive = self.role == Role::Leader
-                || self.leader_seen_at.is_some_and(|at| at + nanos(self.config.election_timeout) > now);
+            let leader_alive = self.role == Role::Leader || leader_seen;
             m.term() > self.meta.term && up_to_date && !leader_alive
+        } else if leader_seen && self.role != Role::Leader && m.handover() != Some(1) {
+            // Leader stickiness (the Raft thesis, §4.2.3): within an election timeout of hearing a
+            // leader, a candidate it didn't hand over to is refused, its term not taken. Every
+            // ack promised this ([`wire::AppendAck::lease_window`]): a read lease counts on it.
+            // A leader votes as it always has: standing down, it gives up its lease.
+            false
         } else {
             if m.term() > self.meta.term {
                 self.become_follower(m.term(), now);
@@ -56,7 +62,7 @@ impl Raft {
         self.doubted += usize::from(m.doubt() == Some(1));
         if self.won() {
             if self.role == Role::PreCandidate {
-                self.become_candidate(now);
+                self.become_candidate(now, false);
             } else {
                 self.become_leader(now);
             }
@@ -79,16 +85,19 @@ impl Raft {
             last_term: self.last_term(),
             pre_vote: 1,
             round: now,
+            handover: 0,
         };
         for i in 0..self.peers.len() {
             self.send(self.peers[i].id, &request);
         }
         if self.won() {
-            self.become_candidate(now);
+            self.become_candidate(now, false);
         }
     }
 
-    pub(super) fn become_candidate(&mut self, now: u64) {
+    /// Stands for election; with `handover`, handed the leadership by its leader (`TimeoutNow`),
+    /// which voters that hear a leader vote for all the same.
+    pub(super) fn become_candidate(&mut self, now: u64, handover: bool) {
         self.role = Role::Candidate;
         self.forget_stop();
         self.meta = Meta { term: self.meta.term + 1, vote: Some(self.config.id) };
@@ -104,6 +113,7 @@ impl Raft {
             last_term: self.last_term(),
             pre_vote: 0,
             round: 0,
+            handover: u8::from(handover),
         };
         for i in 0..self.peers.len() {
             self.send(self.peers[i].id, &request);

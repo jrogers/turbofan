@@ -121,7 +121,8 @@ impl Config {
     /// or of none to join a running one: a 300 ms election timeout, a 50 ms heartbeat, 64 MiB of
     /// applied records kept in memory, clients held back past 64 MiB of proposals uncommitted, a
     /// 10 s session timeout, a snapshot every 100,000 entries with 100,000 kept before it, one
-    /// snapshot kept on disk, and 8192 responses kept per session. Change any field after.
+    /// snapshot kept on disk, 8192 responses kept per session, and no read lease. Change any field
+    /// after.
     #[must_use]
     pub fn new(id: NodeId, members: Vec<Member>) -> Self {
         Self {
@@ -134,6 +135,7 @@ impl Config {
                 log_window_bytes: 64 << 20,
                 log_tail_entries: 100_000,
                 max_uncommitted_bytes: 64 << 20,
+                read_lease: None,
             },
             session_timeout: Duration::from_secs(10),
             snapshot_every_entries: 100_000,

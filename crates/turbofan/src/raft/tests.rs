@@ -16,6 +16,7 @@ fn config(id: u8, members: &[u8]) -> Config {
         log_window_bytes: usize::MAX,
         log_tail_entries: 0,
         max_uncommitted_bytes: usize::MAX,
+        read_lease: None,
     }
 }
 
@@ -288,19 +289,21 @@ fn an_earlier_terms_entry_does_not_commit_by_counting_replicas() {
 fn a_vote_is_persisted_in_the_batch_that_grants_it() {
     let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 4, vote: None }, None, entries(&[1]), 0);
     let mut frame = Vec::new();
-    let request = wire::RequestVote { term: 5, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0, round: 0 };
+    let request =
+        wire::RequestVote { term: 5, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0, round: 0, handover: 0 };
     codec::encode_frame(&request, &mut frame).unwrap();
-    raft.on_message(NodeId(2), &decode(&frame), 0);
+    raft.on_message(NodeId(2), &decode(&frame), 200 * MS);
     let out = raft.take_outputs();
     assert_eq!(out.persist.last(), Some(&Persist::Meta(Meta { term: 5, vote: Some(NodeId(2)) })));
     let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
     assert_eq!((vote.term(), vote.granted()), (5, 1));
 
     // And not again to someone else in the term.
-    let request = wire::RequestVote { term: 5, candidate: 3, last_index: 1, last_term: 1, pre_vote: 0, round: 0 };
+    let request =
+        wire::RequestVote { term: 5, candidate: 3, last_index: 1, last_term: 1, pre_vote: 0, round: 0, handover: 0 };
     frame.clear();
     codec::encode_frame(&request, &mut frame).unwrap();
-    raft.on_message(NodeId(3), &decode(&frame), 0);
+    raft.on_message(NodeId(3), &decode(&frame), 200 * MS);
     let out = raft.take_outputs();
     let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
     assert_eq!(vote.granted(), 0);
@@ -314,7 +317,8 @@ fn a_node_that_knows_no_members_doesnt_vote() {
     let mut raft = Raft::new(config(3, &[]), Meta::default(), None, Entries::default(), 0);
     for pre_vote in [1, 0] {
         let mut frame = Vec::new();
-        let request = wire::RequestVote { term: 5, candidate: 1, last_index: 9, last_term: 4, pre_vote, round: 0 };
+        let request =
+            wire::RequestVote { term: 5, candidate: 1, last_index: 9, last_term: 4, pre_vote, round: 0, handover: 0 };
         codec::encode_frame(&request, &mut frame).unwrap();
         raft.on_message(NodeId(1), &decode(&frame), 0);
         let out = raft.take_outputs();
@@ -485,9 +489,10 @@ fn a_vote_from_a_node_in_doubt_says_so() {
     log.doubt();
     let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 1, vote: None }, None, log, 0);
     let mut frame = Vec::new();
-    let request = wire::RequestVote { term: 2, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0, round: 0 };
+    let request =
+        wire::RequestVote { term: 2, candidate: 2, last_index: 1, last_term: 1, pre_vote: 0, round: 0, handover: 0 };
     codec::encode_frame(&request, &mut frame).unwrap();
-    raft.on_message(NodeId(2), &decode(&frame), 0);
+    raft.on_message(NodeId(2), &decode(&frame), 200 * MS);
     let out = raft.take_outputs();
     let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
     assert_eq!((vote.granted(), vote.doubt()), (1, Some(1)));
@@ -509,7 +514,8 @@ fn a_vote_is_refused_to_a_candidate_with_an_older_log() {
     let mut raft = Raft::new(config(1, &[1, 2, 3]), Meta { term: 2, vote: None }, None, entries(&[1, 2]), 0);
     for (last_index, last_term) in [(1, 2), (5, 1)] {
         let mut frame = Vec::new();
-        let request = wire::RequestVote { term: 3, candidate: 2, last_index, last_term, pre_vote: 0, round: 0 };
+        let request =
+            wire::RequestVote { term: 3, candidate: 2, last_index, last_term, pre_vote: 0, round: 0, handover: 0 };
         codec::encode_frame(&request, &mut frame).unwrap();
         raft.on_message(NodeId(2), &decode(&frame), 0);
         let out = raft.take_outputs();
@@ -1600,6 +1606,7 @@ fn an_echo_of_a_round_not_started_confirms_no_later_read() {
         service_version: 0,
         prev_index: 1,
         read_round: 5,
+        lease_window: 0,
     };
     let mut frame = Vec::new();
     codec::encode_frame(&ack, &mut frame).unwrap();
@@ -1618,6 +1625,189 @@ fn reads_are_a_leaders_and_bounded() {
         assert!(rafts[0].read_index(id));
     }
     assert!(!rafts[0].read_index(0), "past MAX_WAITING_READS");
+}
+
+/// The lease the tests give, a tenth under their election timeout.
+const LEASE: u64 = 135 * MS;
+
+/// Three nodes reading from a lease: node 1 leads, with an entry of its term committed, and a
+/// heartbeat's round acked by all at `now`, which grants it a lease till `now + LEASE`.
+fn leased(now: u64) -> Vec<Raft> {
+    let members = [1, 2, 3];
+    let mut rafts: Vec<Raft> = members
+        .iter()
+        .map(|&id| {
+            let mut config = config(id, &members);
+            config.read_lease = Some(Duration::from_nanos(LEASE));
+            Raft::new(config, Meta::default(), None, Entries::default(), 0)
+        })
+        .collect();
+    elect(&mut rafts, &members, 1, now);
+    rafts[0].propose(b"new term");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &members, 1, sends, now);
+    assert_eq!(rafts[0].commit_index(), 1);
+    heartbeat_at(&mut rafts, &members, 1, now);
+    rafts
+}
+
+/// Node `id` heartbeats at `now`, and what it sends is delivered among `up`.
+fn heartbeat_at(rafts: &mut [Raft], up: &[u8], id: u8, now: u64) -> Reads {
+    let raft = &mut rafts[usize::from(id) - 1];
+    raft.heartbeat_at = now;
+    raft.on_tick(now);
+    let sends = flush(raft);
+    deliver(rafts, up, id, sends, now)
+}
+
+/// Asks the leader, node 1, for read `id` at `now`: its batch's outputs, the read confirmed in
+/// them or not.
+fn read_at(rafts: &mut [Raft], id: u64, now: u64) -> Outputs {
+    rafts[0].set_time(now);
+    assert!(rafts[0].read_index(id));
+    rafts[0].take_outputs()
+}
+
+/// With a lease, a heartbeat's round acked by a quorum lets the leader answer reads at once, with
+/// no round of their own, till the lease runs out from when the round began; then a read waits
+/// for a round, whose acks renew it.
+#[test]
+fn a_leased_leader_answers_reads_at_once_till_the_lease_runs_out() {
+    let now = 1000 * MS;
+    let mut rafts = leased(now);
+    let within = read_at(&mut rafts, 1, now + LEASE - 1);
+    assert_eq!(within.confirmed_reads, [ReadIndex { id: 1, index: 1 }], "within the lease");
+    assert_eq!(read_rounds(&within.appends), [], "no round");
+    let out = read_at(&mut rafts, 2, now + LEASE);
+    assert_eq!(out.confirmed_reads, [], "the lease ran out");
+    assert_eq!(read_rounds(&out.appends), [(NodeId(2), 2), (NodeId(3), 2)], "a round of its own");
+    let reads = deliver(&mut rafts, &[1, 2], 1, out.appends, now + LEASE);
+    assert_eq!(reads.confirmed, [ReadIndex { id: 2, index: 1 }]);
+    let renewed = read_at(&mut rafts, 3, now + 2 * LEASE - 1).confirmed_reads;
+    assert_eq!(renewed, [ReadIndex { id: 3, index: 1 }], "its round renewed it");
+}
+
+/// A heartbeat carries a round, to renew the lease, only once the last is acked.
+#[test]
+fn a_leased_leaders_heartbeats_carry_rounds() {
+    let now = 1000 * MS;
+    let mut rafts = leased(now);
+    let raft = &mut rafts[0];
+    raft.heartbeat_at = now + MS;
+    raft.on_tick(now + MS);
+    let sends = flush(raft);
+    assert_eq!(read_rounds(&sends), [(NodeId(2), 2), (NodeId(3), 2)]);
+    raft.heartbeat_at = now + 2 * MS;
+    raft.on_tick(now + 2 * MS);
+    assert_eq!(read_rounds(&flush(raft)), [(NodeId(2), 2), (NodeId(3), 2)], "round 2 still in flight");
+}
+
+/// A quorum's acks grant a lease only if they promise to refuse other candidates for a lease's
+/// length: an older follower's promise nothing.
+#[test]
+fn acks_promising_less_than_a_lease_grant_none() {
+    let now = 1000 * MS;
+    let mut rafts = leased(now);
+    rafts[0].heartbeat_at = now + MS;
+    rafts[0].on_tick(now + MS);
+    flush(&mut rafts[0]);
+    rafts[0].reads.lease_until = 0;
+    for (window, granted) in [(0, false), (LEASE - 1, false), (LEASE, true)] {
+        let ack = wire::AppendAck {
+            term: rafts[0].term(),
+            success: 1,
+            index: 1,
+            snapshot_index: 0,
+            protocol: 0,
+            service_version: 0,
+            prev_index: 1,
+            read_round: rafts[0].reads.round,
+            lease_window: window,
+        };
+        let mut frame = Vec::new();
+        codec::encode_frame(&ack, &mut frame).unwrap();
+        rafts[0].on_message(NodeId(2), &decode(&frame), now + MS);
+        rafts[0].take_outputs();
+        assert_eq!(rafts[0].reads.lease_until > now + MS, granted, "a window of {window}");
+    }
+}
+
+/// A voter that has heard a leader within an election timeout refuses another candidate, without
+/// taking its term, but votes for one the leader handed over to; and once the timeout has passed,
+/// for any. As it does from starting: it may have promised a leader before.
+#[test]
+fn a_voter_hearing_a_leader_votes_only_for_one_handed_over_to() {
+    let now = 1000 * MS;
+    let mut rafts = leased(now);
+    let vote = |raft: &mut Raft, candidate, handover, now| {
+        let term = raft.term() + 1;
+        let request =
+            wire::RequestVote { term, candidate, last_index: 9, last_term: 9, pre_vote: 0, round: 0, handover };
+        let mut frame = Vec::new();
+        codec::encode_frame(&request, &mut frame).unwrap();
+        raft.on_message(NodeId(candidate), &decode(&frame), now);
+        let out = raft.take_outputs();
+        let wire::Decoded::Vote(vote) = decode(&out.sends[0].1) else { panic!("not a vote") };
+        vote.granted() == 1
+    };
+    let term = rafts[1].term();
+    assert!(!vote(&mut rafts[1], 3, 0, now + 149 * MS), "within its election timeout");
+    assert_eq!(rafts[1].term(), term, "its term not taken");
+    assert!(vote(&mut rafts[1], 3, 1, now + 149 * MS), "handed over to");
+    assert!(vote(&mut rafts[2], 1, 0, now + 150 * MS), "its timeout passed");
+
+    let mut fresh = Raft::new(config(1, &[1, 2, 3]), Meta::default(), None, entries(&[1]), now);
+    assert!(!vote(&mut fresh, 2, 0, now + 149 * MS), "within its timeout of starting");
+}
+
+/// Once a handover begins, the lease is given up for the term: the target's candidacy, which
+/// voters holding the lease for this leader vote for, may go ahead however the transfer ends.
+#[test]
+fn a_handover_gives_the_lease_up_for_the_term() {
+    let now = 1000 * MS;
+    let mut rafts = leased(now);
+    assert!(rafts[0].transfer_leadership(Some(NodeId(2))).is_some());
+    // Its `TimeoutNow` is lost: the target's cut off.
+    assert_eq!(read_at(&mut rafts, 1, now + MS).confirmed_reads, [], "the lease given up");
+    heartbeat_at(&mut rafts, &[1, 3], 1, now + 100 * MS);
+    // The transfer gives up, and this node leads on, by a round a read.
+    heartbeat_at(&mut rafts, &[1, 3], 1, now + 200 * MS);
+    assert!(!rafts[0].transferring());
+    assert_eq!(rafts[0].role(), Role::Leader);
+    assert_eq!(read_at(&mut rafts, 2, now + 200 * MS).confirmed_reads, [], "no lease again in the term");
+}
+
+/// A change of members ends the lease: a quorum of the voters as they were isn't always one of
+/// them as they are. A round started after the change grants another.
+#[test]
+fn a_change_of_members_ends_the_lease_till_a_later_round() {
+    let now = 1000 * MS;
+    let mut rafts = leased(now);
+    assert!(rafts[0].remove_member(NodeId(3)));
+    assert_eq!(read_at(&mut rafts, 1, now + MS).confirmed_reads, [], "the lease ended");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2, 3], 1, sends, now + MS);
+    heartbeat_at(&mut rafts, &[1, 2], 1, now + 2 * MS);
+    assert_eq!(read_at(&mut rafts, 2, now + 3 * MS).confirmed_reads.len(), 1, "a later round's lease");
+}
+
+/// The lease is safe only while the clocks keep within its margin: here the followers' run a
+/// fifth fast, so their election timeout passes while, by the leader's clock, its lease hasn't.
+/// They elect another, which commits a write, and the old leader answers a read from its lease
+/// without it: stale. What the margin under the election timeout ([`Config::read_lease`]) is for.
+#[test]
+fn clocks_drifting_past_the_lease_margin_read_stale() {
+    let now = 1000 * MS;
+    let mut rafts = leased(now);
+    // 160 ms on the followers' clocks, 128 ms on the leader's: within its lease of 135.
+    let (theirs, mine) = (now + 160 * MS, now + 128 * MS);
+    elect(&mut rafts, &[2, 3], 2, theirs);
+    rafts[1].propose(b"written");
+    let sends = flush(&mut rafts[1]);
+    deliver(&mut rafts, &[2, 3], 2, sends, theirs);
+    assert!(rafts[1].commit_index() > 1, "the new leader committed a write");
+    assert_eq!(rafts[0].role(), Role::Leader, "the old one hasn't heard");
+    assert_eq!(read_at(&mut rafts, 1, mine).confirmed_reads, [ReadIndex { id: 1, index: 1 }], "stale");
 }
 
 /// The value a quorum reaches is the quorum's-th highest, in any order; with too few values, or
