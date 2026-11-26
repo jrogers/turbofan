@@ -43,6 +43,9 @@
 #                multi-threaded runtime) or spin (serve --spin: three threads that never sleep). A
 #                run's table is <run>-<driver>.md where DRIVERS has both; local is in-process, so it
 #                runs once, as tokio.
+#   LEASES       0: the nodes' read lease in ms (serve --read-lease), 0 for none: each remote run with
+#                each, space-separated, its table <run>-lease<ms>.md where LEASES has several or
+#                isn't 0. Under the nodes' election timeout (300 ms): 270, say.
 #   ROUNDS       1: how many times the runs go round, every PIN and BUSY_POLL in turn each time, so
 #                that they're compared on one cluster, interleaved. A run's table is <run>.md, with
 #                -pin, -bp<µs> and -r<round> where PIN, BUSY_POLL or ROUNDS has several.
@@ -64,6 +67,8 @@ RUNS=${RUNS:-local nvme nvme-fsync nvme-tls nvme-tls-fsync ebs-fsync}
 PROFILE=${PROFILE:-0}
 NIC_COALESCE_OFF=${NIC_COALESCE_OFF:-1}
 PIN=${PIN:-1} BUSY_POLL=${BUSY_POLL:-50} ROUNDS=${ROUNDS:-1} DRIVERS=${DRIVERS:-tokio}
+LEASES=${LEASES:-0}
+for ms in $LEASES; do [[ $ms =~ ^[0-9]+$ ]] || { echo "LEASES are in ms, not $ms" >&2; exit 2; }; done
 for driver in $DRIVERS; do [[ $driver == tokio || $driver == spin ]] || { echo "DRIVERS are tokio or spin, not $driver" >&2; exit 2; }; done
 for pin in $PIN; do [[ $pin == 0 || $pin == 1 ]] || { echo "PIN is 0, 1 or both, not $pin" >&2; exit 2; }; done
 for us in $BUSY_POLL; do [[ $us =~ ^[0-9]+$ ]] || { echo "BUSY_POLL is in µs, not $us" >&2; exit 2; }; done
@@ -310,6 +315,8 @@ JEMALLOC='LD_PRELOAD=/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2'
 PINNED=''
 # The driver's flag for the nodes: --spin, or none.
 SPIN=''
+# The read lease's flag for the nodes: --read-lease <ms>, or none.
+LEASE=''
 
 # Every machine's interrupts and busy polling, for a PIN and a BUSY_POLL: interrupts on CPU 0 with
 # irqbalance stopped, or back on every CPU and irqbalance running, as the machine started. An
@@ -365,7 +372,7 @@ remote() {
     local name=$1 data=$2 extra=$3 fsync=$4 tls=$5 i status_tls='' bench_tls=''
     for i in 1 2 3; do
         on "${PUBLIC[i-1]}" "TURBOFAN_ADMIN_TOKEN=$ADMIN_TOKEN TURBOFAN_PEER_TOKEN=$PEER_TOKEN $JEMALLOC \
-            $PINNED nohup ./echo serve --id $i --data $data/n$i $FLAGS $extra $SPIN >node.log 2>&1 </dev/null &"
+            $PINNED nohup ./echo serve --id $i --data $data/n$i $FLAGS $extra $SPIN $LEASE >node.log 2>&1 </dev/null &"
     done
     if [[ $tls == 1 ]]; then
         status_tls='--tls-ca certs/ca.pem'
@@ -442,16 +449,21 @@ for round in $(seq "$ROUNDS"); do
             [[ $PIN$BUSY_POLL == 00 ]] || tune "$pin" "$us"
             for run in $RUNS; do
                 for driver in $DRIVERS; do
-                    [[ $run == local && $driver != "${DRIVERS%% *}" ]] && continue
-                    SPIN=''
-                    [[ $driver == spin ]] && SPIN=--spin
-                    name=$run
-                    [[ $DRIVERS == *' '* && $run != local ]] && name+=-$driver
-                    [[ $PIN == *' '* && $pin == 1 ]] && name+=-pin
-                    [[ $BUSY_POLL == *' '* ]] && name+=-bp$us
-                    [[ $ROUNDS -gt 1 ]] && name+=-r$round
-                    one "$run" "$name"
-                    NAMES+=("$name")
+                    for ms in $LEASES; do
+                        [[ $run == local && ($driver != "${DRIVERS%% *}" || $ms != "${LEASES%% *}") ]] && continue
+                        SPIN=''
+                        [[ $driver == spin ]] && SPIN=--spin
+                        LEASE=''
+                        [[ $ms != 0 ]] && LEASE="--read-lease $ms"
+                        name=$run
+                        [[ $DRIVERS == *' '* && $run != local ]] && name+=-$driver
+                        [[ ($LEASES == *' '* || $LEASES != 0) && $run != local ]] && name+=-lease$ms
+                        [[ $PIN == *' '* && $pin == 1 ]] && name+=-pin
+                        [[ $BUSY_POLL == *' '* ]] && name+=-bp$us
+                        [[ $ROUNDS -gt 1 ]] && name+=-r$round
+                        one "$run" "$name"
+                        NAMES+=("$name")
+                    done
                 done
             done
         done
@@ -466,6 +478,7 @@ done
     [[ -n $RUSTFLAGS ]] && echo && echo "RUSTFLAGS=${RUSTFLAGS% }"
     [[ $NIC_COALESCE_OFF == 1 ]] && echo && echo "NIC interrupt moderation off (NIC_COALESCE_OFF=1)."
     [[ $DRIVERS != tokio ]] && echo && echo "DRIVERS=$DRIVERS (spin: serve --spin)."
+    [[ $LEASES != 0 ]] && echo && echo "LEASES=$LEASES (ms: serve --read-lease; 0 none)."
     [[ $PIN$BUSY_POLL != 00 ]] && echo && echo "PIN=$PIN, BUSY_POLL=$BUSY_POLL, ROUNDS=$ROUNDS: see tuning.txt."
     if [[ $PROFILE == 1 ]]; then
         echo
