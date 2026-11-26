@@ -198,6 +198,10 @@ pub struct Client {
     /// Keepalives due since the cluster last sent anything.
     silent: u32,
     reconnect: Option<Reconnect>,
+    /// It's leaving this connection, told to go elsewhere or given up on: what else comes on it
+    /// is from a node it's done with (a leader that redirected it and was elected again may say
+    /// the session's not there), and is ignored until the next.
+    leaving: bool,
     frames: Vec<Vec<u8>>,
     events: VecDeque<Event>,
     next_query: u64,
@@ -248,6 +252,7 @@ impl Client {
             keepalive_at: 0,
             silent: 0,
             reconnect: None,
+            leaving: false,
             frames: Vec::new(),
             events: VecDeque::new(),
             next_query: 1,
@@ -284,6 +289,7 @@ impl Client {
     pub fn on_connected(&mut self, now: u64) {
         self.open = false;
         self.reconnect = None;
+        self.leaving = false;
         self.keepalive_at = now + self.keepalive_ns;
         self.silent = 0;
         match self.session {
@@ -329,6 +335,9 @@ impl Client {
 
     /// A message from the cluster.
     pub(crate) fn on_message(&mut self, message: &wire::Decoded<'_>) {
+        if self.leaving {
+            return;
+        }
         self.silent = 0;
         match message {
             wire::Decoded::Redirect(m) => {
@@ -339,6 +348,7 @@ impl Client {
                     Some(i) => (i, Some(Reconnect::ToLeader)),
                     None => ((self.target + 1) % self.addrs.len(), Some(Reconnect::Later)),
                 };
+                self.leaving = true;
             }
             // Has less of the session than it saw, and of the epoch the session was opened in: a
             // leader of this cluster deposed without knowing it yet, answering from what it has (a
@@ -348,6 +358,7 @@ impl Client {
                 self.frames.clear();
                 self.target = (self.target + 1) % self.addrs.len();
                 self.reconnect = Some(Reconnect::Later);
+                self.leaving = true;
             }
             wire::Decoded::Opened(m) if self.behind(m) => self.diverged(m),
             wire::Decoded::Opened(m) => {
@@ -569,6 +580,7 @@ impl Client {
                 self.frames.clear();
                 self.target = (self.target + 1) % self.addrs.len();
                 self.reconnect = Some(Reconnect::Later);
+                self.leaving = true;
                 return;
             }
             if let (true, Some(session)) = (self.open, self.session) {
@@ -663,6 +675,25 @@ mod tests {
 
     fn decoded(frames: &[Vec<u8>]) -> Vec<String> {
         frames.iter().map(|f| format!("{:?}", codec::decode_frame(f).unwrap().unwrap().0)).collect()
+    }
+
+    /// A leader that redirected its clients and was elected again doesn't know their connections,
+    /// and says the session isn't there to a keepalive sent before the redirect was read: behind
+    /// the redirect, that's ignored, and the session carries on at the next connection.
+    #[test]
+    fn what_follows_a_redirect_on_its_connection_is_ignored() {
+        let mut client = open();
+        client.send(b"order".to_vec()).unwrap();
+        deliver(&mut client, &frame(&wire::Redirect { leader: 0, addr: b"" }));
+        deliver(&mut client, &frame(&wire::Closed { session: 9, reason: CloseReason::NoSession }));
+        assert!(!client.is_closed());
+        assert_eq!(client.poll_event(), None);
+        assert_eq!(client.take_reconnect(), Some(Reconnect::Later));
+        client.on_connected(1);
+        assert_eq!(decoded(&client.take_frames()).len(), 1, "it reattaches");
+        deliver(&mut client, &frame(&wire::Opened { session: 9, applied_seq: 1, last_egress_seq: 0, epoch: 0 }));
+        assert_eq!(client.poll_event(), Some(Event::Opened(SessionId(9))));
+        assert_eq!(client.unacked(), 0);
     }
 
     /// A keepalive's ack says what's applied, as a response does: a service that doesn't answer

@@ -4,6 +4,18 @@ Notable changes to the published crates, `turbofan` and `turbofan-sbe`, which ar
 together at the same version. Before 1.0 a minor version (0.2.0) may break the API, and says how;
 a patch version (0.1.1) doesn't.
 
+## Unreleased
+
+### Fixed
+
+- A client's open session could be closed as `NoSession` by a leader that had redirected it and
+  been elected again: it no longer knew the client's connection, which the client hadn't dropped
+  yet, and answered a keepalive sent on it before the redirect was read. The client took that
+  behind the redirect, ending the session and reporting its messages unapplied, though some could
+  still commit: a caller resubmitting them had them applied twice. Now a `Client` takes nothing
+  more on a connection it's leaving, redirected or given up on. Found reviewing what the
+  simulation never reaches (`scripts/coverage.sh`).
+
 ## 0.14.1 (2026-11-26)
 
 ### Added
