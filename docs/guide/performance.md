@@ -99,9 +99,10 @@ commit. The busier the cluster, the bigger the batches.
 - **Read leases.** A query waits for a round trip to a quorum, to confirm the leader still
   leads. With `serve --read-lease <ms>` (`node.raft.read_lease`) it doesn't, while a quorum has
   acked a heartbeat within the lease: it costs a margin of trust in the clocks (see
-  [Services][services]). On the Mac below (three nodes over loopback, five-second runs), a query
-  on its own took 39 µs to 15 µs p50, p99 55 µs to 30 µs; queries a second, 8 × 256, 2.65 to 2.78
-  million. Over a network it saves the round trip between nodes. Messages are unchanged.
+  [Services][services]). On one cluster of `c9gd`, tuned as above but not spinning (at
+  `0b05c67`, two rounds each, a lease of 270 ms), a query on its own took 67 µs to 28 µs p50, p99
+  about 100 µs to 50 µs; queries a second, 8 × 256, 4.7 million to 5.0 million. Messages were
+  unchanged. On the Mac below, over loopback, a query on its own took 39 µs to 15 µs.
 - **The build.** `lto = "fat"` and `codegen-units = 1` in the service's `[profile.release]` give
   10 to 18% more throughput, for a slower build; the profile is the service's own, not inherited
   from turbofan's.
