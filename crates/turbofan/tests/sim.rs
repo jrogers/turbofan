@@ -24,6 +24,10 @@
 //! does, and the node doubts it; if that leaves no leader to replace a broken member with, the
 //! operator ends the doubt of nodes that only lost power.
 //!
+//! A quarter of the seeds have every kind of fault on; the rest, each kind half the time
+//! ([`swarm`]), for what one fault needs to go on uninterrupted to be reached. A failure names
+//! the seed's faults.
+//!
 //! Each node's log, meta and snapshots are real files, as the driver writes them, the log in small
 //! segments so they roll and compact. Nodes snapshot every few hundred entries and when an operator
 //! asks, compacting their logs, so restarts recover from snapshots and lagging followers are sent
@@ -128,7 +132,7 @@ fn simulate() {
         match result {
             Ok(coverage) => covered.add(&coverage),
             Err(panic) => {
-                eprintln!("simulation failed: SIM_SEED={seed}");
+                eprintln!("simulation failed: SIM_SEED={seed} (faults: {})", describe_swarm(swarm(seed)));
                 std::panic::resume_unwind(panic);
             }
         }
@@ -360,6 +364,61 @@ impl Echo {
         *self.responses.entry(session).or_default() += 1;
         ctx.send(session, text.into_bytes()).unwrap();
     }
+}
+
+/// A kind of fault, on or off for a seed: swarm testing (Groce et al., ISSTA 2012). With every
+/// kind on at once, what one needs to go on uninterrupted rarely does: a partition no crash cuts
+/// short, a slow disk with nothing else going wrong.
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    Drop,
+    Duplicate,
+    Late,
+    Partition,
+    Crash,
+    CrashLeader,
+    Power,
+    SlowDisk,
+    Reset,
+    Pause,
+    Depose,
+    Clock,
+    Rot,
+}
+
+const FAULTS: [Fault; 13] = [
+    Fault::Drop,
+    Fault::Duplicate,
+    Fault::Late,
+    Fault::Partition,
+    Fault::Crash,
+    Fault::CrashLeader,
+    Fault::Power,
+    Fault::SlowDisk,
+    Fault::Reset,
+    Fault::Pause,
+    Fault::Depose,
+    Fault::Clock,
+    Fault::Rot,
+];
+
+/// The faults a seed has on, as bits by [`Fault`]: every one in a quarter of the seeds, else each
+/// one half the time. Drawn apart from the run's own randomness, so a seed with every fault on
+/// runs as it would with no choice.
+fn swarm(seed: u64) -> u16 {
+    let mut rng = Rng(seed ^ 0x5357_4152_4d00);
+    if rng.one_in(4) {
+        return u16::MAX;
+    }
+    FAULTS.iter().filter(|_| rng.one_in(2)).fold(0, |bits, &f| bits | 1 << f as u16)
+}
+
+fn describe_swarm(bits: u16) -> String {
+    if bits == u16::MAX {
+        return "all".into();
+    }
+    let on: Vec<String> = FAULTS.iter().filter(|&&f| bits & 1 << f as u16 != 0).map(|f| format!("{f:?}")).collect();
+    if on.is_empty() { "none".into() } else { on.join(", ") }
 }
 
 /// SplitMix64.
@@ -872,6 +931,8 @@ struct Conn {
 struct Sim {
     seed: u64,
     rng: Rng,
+    /// The faults this seed has on: [`swarm`].
+    swarm: u16,
     now: u64,
     queue: BinaryHeap<(Reverse<u64>, Reverse<u64>)>,
     events: BTreeMap<u64, Event>,
@@ -991,6 +1052,7 @@ impl Sim {
         let mut sim = Self {
             seed,
             rng,
+            swarm: swarm(seed),
             now: 0,
             queue: BinaryHeap::new(),
             events: BTreeMap::new(),
@@ -1049,6 +1111,16 @@ impl Sim {
         }
         sim.schedule_operator();
         sim
+    }
+
+    /// Whether `fault` is on for this seed.
+    fn has(&self, fault: Fault) -> bool {
+        self.swarm & 1 << fault as u16 != 0
+    }
+
+    /// Whether `fault` happens now: on for this seed, and the faults not over.
+    fn fault(&self, fault: Fault) -> bool {
+        self.faults && self.has(fault)
     }
 
     /// The faults and the operator's work, each of which goes on to schedule more.
@@ -1187,7 +1259,7 @@ impl Sim {
     /// A node crashes, now and then, by the clock: any member, or the leader, with its appends in
     /// flight, some followers getting them and some not.
     fn crash_some(&mut self, leader: bool) {
-        if !self.faults {
+        if !self.fault(if leader { Fault::CrashLeader } else { Fault::Crash }) {
             return;
         }
         let id = if leader { self.leader() } else { Some(self.rng.pick(&self.members)) };
@@ -1302,7 +1374,7 @@ impl Sim {
     }
 
     fn partition(&mut self) {
-        if !self.faults {
+        if !self.fault(Fault::Partition) {
             return;
         }
         // Cut some nodes off from the rest, sometimes one way only.
@@ -1358,7 +1430,7 @@ impl Sim {
         }
         if let Some(batches) = taken.write {
             // Mostly quick; now and then the disk is slow.
-            let after = if self.faults && self.rng.one_in(40) {
+            let after = if self.fault(Fault::SlowDisk) && self.rng.one_in(40) {
                 self.stalls += 1;
                 5 * MS + self.rng.below(300 * MS)
             } else {
@@ -1390,7 +1462,10 @@ impl Sim {
             // most harm.
             let resets =
                 batches[i].persist.iter().any(|op| matches!(op, Persist::InstallSnapshot { replace_log: true, .. }));
-            if self.faults && !batches[i].persist.is_empty() && self.rng.one_in(if resets { 3 } else { 500 }) {
+            if self.fault(Fault::Power)
+                && !batches[i].persist.is_empty()
+                && self.rng.one_in(if resets { 3 } else { 500 })
+            {
                 // Power lost: what it hadn't written yet, it's writing as it crashes.
                 self.nodes.get_mut(&id).unwrap().writing = batches.split_off(i);
                 self.crash(id, true);
@@ -1509,17 +1584,20 @@ impl Sim {
     }
 
     fn send_peer(&mut self, from: NodeId, to: NodeId, frame: turbofan::raft::Frame) {
-        if self.cut[usize::from(from)][usize::from(to)] || (self.faults && self.rng.one_in(50)) {
+        if self.cut[usize::from(from)][usize::from(to)] || (self.fault(Fault::Drop) && self.rng.one_in(50)) {
             return;
         }
         let stall = self.stall(from);
-        if self.faults && self.rng.one_in(100) {
+        if self.fault(Fault::Duplicate) && self.rng.one_in(100) {
             let after = stall + MS + self.rng.below(5 * MS);
             self.schedule(after, Event::Deliver { from, to, frame: frame.clone() });
         }
         // Mostly prompt, now and then later than an election timeout: stale votes and appends.
-        let after =
-            if self.faults && self.rng.one_in(10) { self.rng.below(400 * MS) } else { MS / 2 + self.rng.below(5 * MS) };
+        let after = if self.fault(Fault::Late) && self.rng.one_in(10) {
+            self.rng.below(400 * MS)
+        } else {
+            MS / 2 + self.rng.below(5 * MS)
+        };
         self.schedule(stall + after, Event::Deliver { from, to, frame });
     }
 
@@ -1533,7 +1611,7 @@ impl Sim {
         if !self.conns[&conn].up {
             return;
         }
-        if self.faults && self.rng.one_in(300) {
+        if self.fault(Fault::Reset) && self.rng.one_in(300) {
             self.reset(conn);
             return;
         }
@@ -1929,7 +2007,7 @@ impl Sim {
     /// A node's wall clock steps, either way, to an error of its own: as NTP steps a clock it
     /// finds far out, or a VM resuming does.
     fn step_clock(&mut self) {
-        if !self.faults {
+        if !self.fault(Fault::Clock) {
             return;
         }
         let id = self.rng.pick(&self.members.clone());
@@ -1961,7 +2039,7 @@ impl Sim {
 
     /// Pauses a node, the leader half the time: mostly for longer than an election timeout.
     fn pause(&mut self) {
-        if !self.faults {
+        if !self.fault(Fault::Pause) {
             return;
         }
         let up: Vec<NodeId> = self.members.iter().copied().filter(|id| self.nodes[id].node.is_some()).collect();
@@ -1997,7 +2075,7 @@ impl Sim {
     /// outruns it. Not so long that they give up on it first. Into the quiet too, where a leader is
     /// elected and serves soon enough for that, till [`DEPOSE_UNTIL`]: resumed before the shutdown.
     fn depose(&mut self) {
-        if self.now > DEPOSE_UNTIL {
+        if self.now > DEPOSE_UNTIL || !self.has(Fault::Depose) {
             return;
         }
         let leader = self.leader();
@@ -2139,7 +2217,7 @@ impl Sim {
     fn crash_unless_paused(&mut self, id: NodeId) {
         // Mostly the process alone; now and then the machine's power.
         if self.nodes[&id].paused_until <= self.now {
-            let power = self.rng.one_in(4);
+            let power = self.has(Fault::Power) && self.rng.one_in(4);
             self.crash(id, power);
         }
     }
@@ -2260,7 +2338,7 @@ impl Sim {
 
     /// Bit rot in a node's latest snapshot, which it finds when it next needs it.
     fn rot(&mut self) {
-        if !self.faults {
+        if !self.fault(Fault::Rot) {
             return;
         }
         let after = 500 * MS + self.rng.below(1000 * MS);
