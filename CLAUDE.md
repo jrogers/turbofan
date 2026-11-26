@@ -34,6 +34,9 @@ before writing code.
 - `scripts/mutants.sh [base]` (cargo-mutants) mutation-tests the Rust changed since `base` (the commit
   before `HEAD` by default): a mutant the tests miss is code they don't check. CI runs it on each push
   and pull request, a missed mutant a warning on its line.
+- `scripts/coverage.sh` (cargo-llvm-cov, nightly) reports which lines and branches of the core the
+  simulation (`SIM_SEEDS`, 2000 by default) and `cluster.rs` never reach, into `target/coverage`:
+  a fault the sim doesn't make, or dead code. Not run in CI.
 - `scripts/fuzz.sh` fuzzes what the cluster reads from the network (`crates/turbofan/fuzz`,
   outside the workspace; nightly and cargo-fuzz). `check.sh` only checks it builds.
 - Releasing: both crates share the workspace version. Bump it, unless a breaking change already did (and `cargo update -w` both lock files, the
