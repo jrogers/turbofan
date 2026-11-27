@@ -920,6 +920,133 @@ fn a_shutdown_snapshots_then_stops() {
     assert!(node.stopped());
 }
 
+/// Nodes 1 to `n`, a cluster of them, run until one leads and is ready: heartbeats often, for
+/// what follows an entry to reach the followers well within an election timeout.
+fn nodes(n: u8) -> Vec<Node<Recorder>> {
+    let config = |id: u8| Config {
+        raft: raft::Config {
+            id: NodeId(id),
+            members: (1..=n).map(member).collect(),
+            election_timeout: Duration::from_millis(150),
+            heartbeat: Duration::from_millis(10),
+            seed: u64::from(id),
+            log_window_bytes: usize::MAX,
+            log_tail_entries: 0,
+            max_uncommitted_bytes: usize::MAX,
+            read_lease: None,
+        },
+        session_timeout: Duration::from_nanos(TIMEOUT),
+        snapshot_every_entries: 1000,
+        snapshots_kept: 1,
+        egress_ring_entries: 1024,
+        protocol: PROTOCOL,
+    };
+    let node = |id| Node::new(config(id), Recorder::default(), Meta::default(), None, Entries::default(), 0);
+    let mut nodes: Vec<Node<Recorder>> = (1..=n).map(node).collect();
+    while !nodes.iter().any(Node::is_ready) {
+        tick(&mut nodes, &|_| false);
+    }
+    nodes
+}
+
+/// Ticks the node due first, at its deadline, and carries out what the nodes do, returning it.
+fn tick(nodes: &mut [Node<Recorder>], drop: &dyn Fn(&wire::Decoded<'_>) -> bool) -> (u64, Vec<String>) {
+    let (i, now) = nodes.iter().map(Node::next_deadline).enumerate().min_by_key(|&(_, at)| at).unwrap();
+    nodes[i].on_tick(now);
+    (now, exchange(nodes, now, drop))
+}
+
+/// Carries out the nodes' outputs as drivers would, a snapshot saved at once, and their frames
+/// to each other, but those `drop` says are lost, until they're quiet. Returns what they sent
+/// clients and operators, as "<node> <conn>: <message>".
+fn exchange(nodes: &mut [Node<Recorder>], now: u64, drop: &dyn Fn(&wire::Decoded<'_>) -> bool) -> Vec<String> {
+    let mut sent = Vec::new();
+    loop {
+        let (mut frames, mut wrote) = (Vec::new(), false);
+        for (i, node) in nodes.iter_mut().enumerate() {
+            let mut out = node.take_outputs();
+            wrote |= out.save.is_some() || !out.persist.is_empty();
+            if let Some(save) = out.save.take() {
+                let (index, term, members) = (save.index, save.term, save.members.clone());
+                let len = crate::widen(written(save).len());
+                node.on_snapshot_saved(Snapshot { index, term, len, checksum: 0, members });
+            }
+            if !out.persist.is_empty() {
+                node.on_persisted(node.raft().log_end(), now);
+            }
+            for (conn, f) in out.client_sends {
+                sent.push(format!("{} {conn}: {:?}", i + 1, codec::decode_frame(&f).unwrap().unwrap().0));
+            }
+            let from = NodeId(u8::try_from(i + 1).unwrap());
+            frames.extend(out.peer_appends.into_iter().chain(out.peer_sends).map(|(to, f)| (from, to, f)));
+        }
+        if frames.is_empty() && !wrote {
+            return sent;
+        }
+        for (from, to, frame) in frames {
+            let message = codec::decode_frame(&frame).unwrap().unwrap().0;
+            if !drop(&message) {
+                nodes[usize::from(to.0) - 1].on_peer(from, &message, now);
+            }
+        }
+    }
+}
+
+fn admin(node: &mut Node<Recorder>, conn: ConnId, request: &impl turbofan_sbe::Encode, now: u64) {
+    let mut frame = Vec::new();
+    codec::encode_frame(request, &mut frame).unwrap();
+    node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, now);
+}
+
+/// A shutdown asked while the leadership is being handed over waits on the handover: its snapshot
+/// is logged past where the leader replicates to meanwhile (no voter's log newer than the
+/// target's), so it isn't taken, answered or stopped at. Given up on, the leader shuts down; made,
+/// the operator is redirected to the new leader, which does. Of three voters: of two, the old
+/// leader's vote is needed, and its log, with the shutdown's entry, is newer than the target's.
+#[test]
+fn a_shutdown_waits_on_a_handover() {
+    for made in [false, true] {
+        // Unless it's made, the handover's TimeoutNow is lost.
+        let handover = |m: &wire::Decoded<'_>| !made && matches!(m, wire::Decoded::TimeoutNow(_));
+        let mut nodes = nodes(3);
+        let l = nodes.iter().position(Node::is_ready).unwrap();
+        let other = u8::try_from((l + 1) % 3 + 1).unwrap();
+        let now = nodes[l].now;
+        admin(&mut nodes[l], 98, &wire::TransferLeadership { request_id: 1, to: other }, now);
+        admin(&mut nodes[l], 99, &wire::Shutdown { request_id: 2 }, now);
+        // The shutdown waits on the handover.
+        let given_up = now + raft::nanos(Duration::from_millis(150));
+        let mut sent = exchange(&mut nodes, now, &handover);
+        let mut now = now;
+        while now <= given_up {
+            assert!(nodes.iter().all(|n| n.raft().snapshot_index() == 0), "no snapshot while handing over");
+            assert!(!sent.iter().any(|s| s.contains("ShutDown")), "not while handing over: {sent:?}");
+            assert!(!nodes.iter().any(Node::stopped));
+            let tick = tick(&mut nodes, &handover);
+            now = tick.0;
+            sent.extend(tick.1);
+            if made && nodes[usize::from(other) - 1].is_ready() {
+                break;
+            }
+        }
+        if made {
+            // The old leader redirects the operator, as it stands down, to no leader yet: the
+            // operator tries the others, and asked, the new one shuts down.
+            let n = usize::from(other) - 1;
+            assert!(nodes[n].is_ready() && !nodes[l].is_ready());
+            let redirect = format!("{} 99: Redirect(", l + 1);
+            assert!(sent.iter().any(|s| s.starts_with(&redirect)), "{sent:?}");
+            admin(&mut nodes[n], 99, &wire::Shutdown { request_id: 2 }, now);
+            sent = exchange(&mut nodes, now, &|_| false);
+        }
+        for _ in 0..10 {
+            sent.extend(tick(&mut nodes, &|_| false).1);
+        }
+        assert_eq!(sent.iter().filter(|s| s.contains("ShutDown")).count(), 1, "answered once: {sent:?}");
+        assert!(nodes.iter().all(Node::stopped), "both stopped (handover made: {made})");
+    }
+}
+
 #[test]
 fn an_operator_snapshot_is_answered_once_durable() {
     let mut node = leader();
