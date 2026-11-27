@@ -52,6 +52,8 @@ impl Raft {
             self.ack(from, false, self.last_index() + 1, m.prev_index(), 0);
             return;
         }
+        // Election safety: one leader a term, so none hears another of its own.
+        debug_assert!(m.term() > self.meta.term || self.role != Role::Leader, "two leaders of term {}", m.term());
         if m.term() > self.meta.term || self.role != Role::Follower {
             self.become_follower(m.term(), now);
         }
