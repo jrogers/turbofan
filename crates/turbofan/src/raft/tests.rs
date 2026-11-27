@@ -1066,6 +1066,52 @@ fn a_member_is_added_once_it_has_caught_up() {
     assert!(rafts[0].can_change(), "committed");
 }
 
+/// A member being added that never catches up (down, or cut off) is given up on after
+/// `CATCH_UP_TIMEOUTS` election timeouts, not before: the change fails, the members are as they
+/// were, and another change can start; added again once it's up, it joins.
+#[test]
+fn a_member_that_never_catches_up_is_given_up_on() {
+    let mut rafts = cluster(3);
+    rafts.push(Raft::new(config(4, &[]), Meta::default(), None, Entries::default(), 0));
+    let (three, all) = ([1, 2, 3], [1, 2, 3, 4]);
+    elect(&mut rafts, &three, 1, 1000 * MS);
+    rafts[0].propose(b"x");
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &three, 1, sends, 1000 * MS);
+    let started = rafts[0].now;
+    assert!(rafts[0].add_member(member(4)));
+
+    // Node 4 is down: the leader's heartbeats go on, the change with them, until it gives up.
+    let give_up = started + CATCH_UP_TIMEOUTS * nanos(Duration::from_millis(150));
+    let failed_at = loop {
+        let now = rafts[0].next_deadline();
+        rafts[0].on_tick(now);
+        let mut out = rafts[0].take_outputs();
+        let end = rafts[0].log_end();
+        rafts[0].on_persisted(end, now);
+        out.appends.append(&mut out.sends);
+        deliver(&mut rafts, &three, 1, out.appends, now);
+        if out.change_failed {
+            break now;
+        }
+        assert!(rafts[0].changing_members(), "under way at {} ms", (now - started) / MS);
+        assert!(now <= give_up + 100 * MS, "not given up on");
+    };
+    assert!(failed_at > give_up, "given up on at {} ms, before the timeouts", (failed_at - started) / MS);
+    assert_eq!(rafts[0].role(), Role::Leader);
+    assert_eq!(ids(rafts[0].members()), [1, 2, 3]);
+    assert!(!rafts[0].changing_members() && rafts[0].can_change(), "another change can start");
+
+    // Up now, added again, it joins.
+    assert!(rafts[0].add_member(member(4)));
+    for _ in 0..3 {
+        heartbeat(&mut rafts, &all, 1);
+    }
+    for raft in &rafts {
+        assert_eq!(ids(raft.members()), [1, 2, 3, 4], "node {}", raft.id());
+    }
+}
+
 /// A learner is proposed as soon as it answers, new enough, before it has any of the log: the
 /// quorum doesn't wait on it. It catches up as a member.
 #[test]
