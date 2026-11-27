@@ -882,6 +882,86 @@ fn snapshot_chunks_are_pipelined_and_a_lost_one_is_sent_again() {
     assert_eq!(rafts[1].snapshot_index(), 10, "installed");
 }
 
+/// A snapshot larger than the in-flight window: the leader sends as far as the window past what
+/// the follower has, no further, and on as acks come; a chunk lost past the first window is sent
+/// again from there, the window from it, and the follower installs the whole.
+#[test]
+fn a_snapshot_past_the_window_is_sent_as_acks_open_it() {
+    const CHUNK: u64 = crate::widen(MAX_READ_BYTES);
+    let window = MAX_SNAPSHOT_IN_FLIGHT / CHUNK;
+    let len = (window * 2 + 4) * CHUNK + 10;
+    let bytes: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    let members = vec![member(1), member(2)];
+    let checksum = crate::snapshot::checksum(10, 1, &members, &bytes);
+    let snapshot = Snapshot { index: 10, term: 1, len, checksum, members };
+    let mut rafts = vec![
+        Raft::new(config(1, &[1, 2]), Meta { term: 1, vote: None }, Some(snapshot), Entries::default(), 0),
+        Raft::new(config(2, &[1, 2]), Meta::default(), None, Entries::default(), 0),
+    ];
+    let now = 1000 * MS;
+    elect(&mut rafts, &[1, 2], 1, now);
+    rafts[0].on_tick(now);
+    let sends = flush(&mut rafts[0]);
+    deliver(&mut rafts, &[1, 2], 1, sends, now);
+    // What the leader asks to read and sends to node 2, by offset in chunks.
+    let send_chunks = |raft: &mut Raft| {
+        let out = raft.take_outputs();
+        for &SnapshotRead { index, offset } in &out.snapshot_reads {
+            let start = usize::try_from(offset).unwrap();
+            raft.on_snapshot_read(index, offset, &bytes[start..(start + MAX_READ_BYTES).min(bytes.len())]);
+        }
+        let reads: Vec<u64> = out.snapshot_reads.iter().map(|r| r.offset / CHUNK).collect();
+        let chunks: Vec<Frame> =
+            raft.take_outputs().sends.into_iter().filter(|&(to, _)| to == NodeId(2)).map(|(_, f)| f).collect();
+        (reads, chunks)
+    };
+    let offsets = |chunks: &[Frame]| -> Vec<u64> {
+        let offset = |f: &Frame| match decode(f) {
+            wire::Decoded::InstallSnapshot(m) => m.offset() / CHUNK,
+            other => panic!("not a chunk: {other:?}"),
+        };
+        chunks.iter().map(offset).collect()
+    };
+    let deliver_chunks = |rafts: &mut [Raft], chunks: &[Frame]| {
+        for chunk in chunks {
+            rafts[1].on_message(NodeId(1), &decode(chunk), now);
+            for (_, ack) in flush(&mut rafts[1]) {
+                rafts[0].on_message(NodeId(2), &decode(&ack), now);
+            }
+        }
+    };
+    let (reads, chunks) = send_chunks(&mut rafts[0]);
+    assert_eq!(reads, (0..window).collect::<Vec<_>>(), "a window's worth read");
+    assert_eq!(offsets(&chunks), (0..window).collect::<Vec<_>>(), "a window in flight before an ack, no more");
+    let (reads, more) = send_chunks(&mut rafts[0]);
+    assert!(reads.is_empty() && more.is_empty(), "nothing past the window unacked");
+
+    // Three acked: the window opens by three.
+    deliver_chunks(&mut rafts, &chunks[..3]);
+    let (reads, more) = send_chunks(&mut rafts[0]);
+    assert_eq!(reads, [window, window + 1, window + 2]);
+    assert_eq!(offsets(&more), [window, window + 1, window + 2]);
+
+    // The first chunk past the first window is lost; the one after it shows that.
+    let in_flight: Vec<Frame> = chunks[3..].iter().chain(&more).cloned().collect();
+    let lost = usize::try_from(window - 3).unwrap();
+    deliver_chunks(&mut rafts, &in_flight[..lost]);
+    deliver_chunks(&mut rafts, &in_flight[lost + 1..lost + 2]);
+    // Acked as far as it, the window had opened past the first, and chunks beyond were read.
+    let (mut reads, mut chunks) = send_chunks(&mut rafts[0]);
+    reads.sort_unstable();
+    assert_eq!(reads, (window..2 * window).collect::<Vec<_>>());
+    assert_eq!(offsets(&chunks), (window..2 * window).collect::<Vec<_>>(), "again from the lost one, a window's worth");
+
+    // The rest, each round's acks opening the window to the next.
+    for _ in 0..4 {
+        deliver_chunks(&mut rafts, &chunks);
+        chunks = send_chunks(&mut rafts[0]).1;
+    }
+    assert!(chunks.is_empty(), "all sent");
+    assert_eq!(rafts[1].snapshot_index(), 10, "installed");
+}
+
 /// An ack of a snapshot the leader has moved on from, in flight as it took a newer one,
 /// isn't counted towards the newer: the peer has only what it acked of that.
 #[test]
