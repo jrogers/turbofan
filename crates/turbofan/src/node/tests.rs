@@ -179,6 +179,37 @@ fn messages_apply_once_in_order_and_a_reattach_replays_responses() {
     assert!(client(&mut node, 7, &message(3, b"three"), 0)[0].contains("NoSession"));
 }
 
+/// A client reattaches on a new connection while the node still holds the old one, half open
+/// (its client gone without a reset reaching the node): the session moves to the new one, its
+/// responses with it; the old one's late disconnect leaves it there, and a message on the old one
+/// finds no session.
+#[test]
+fn a_reattach_takes_the_session_from_a_half_open_connection() {
+    let mut node = leader();
+    let session = open(&mut node, 7, 0);
+    let message = |client_seq, payload| wire::Message { session: session.0, client_seq, payload };
+    assert!(client(&mut node, 7, &message(1, b"one"), 0)[0].contains("Egress"));
+
+    let reattach = wire::Reattach { session: session.0, last_egress_seq: 1, epoch: 0, credentials: b"" };
+    assert!(client(&mut node, 8, &reattach, 0)[0].contains("Opened"));
+    let sent = client(&mut node, 8, &message(2, b"two"), 0);
+    assert!(sent.len() == 1 && sent[0].starts_with("8: Egress"), "the response on the new one: {sent:?}");
+
+    node.on_disconnect(7);
+    assert_eq!(node.local.attached.get(&session), Some(&8), "the old one's disconnect leaves it");
+    let sent = client(&mut node, 8, &message(3, b"three"), 0);
+    assert!(sent.len() == 1 && sent[0].starts_with("8: Egress"), "{sent:?}");
+
+    // Had the old one not been told, its frames would find no session there.
+    let mut node = leader();
+    let session = open(&mut node, 7, 0);
+    let reattach = wire::Reattach { session: session.0, last_egress_seq: 0, epoch: 0, credentials: b"" };
+    client(&mut node, 8, &reattach, 0);
+    let stale = wire::Message { session: session.0, client_seq: 1, payload: b"late" };
+    assert!(client(&mut node, 7, &stale, 0)[0].contains("NoSession"));
+    assert!(!node.service.0.iter().any(|e| e.contains("late")), "not applied");
+}
+
 /// A ring longer than this node keeps (a snapshot from a node that kept more, or the setting
 /// lowered) is cut to it at the next response, not left to grow.
 #[test]
