@@ -463,6 +463,8 @@ impl<S: Service> Node<S> {
         if self.is_ready() {
             self.expire_sessions(now);
             self.fire_timers(now);
+            // What the outbox gained while it handed over, if that was given up on.
+            self.log_outbox();
         }
     }
 
@@ -593,11 +595,12 @@ impl<S: Service> Node<S> {
         deadline
     }
 
-    /// Whether it leads, and has applied an entry of its own term: then its state is current, and
-    /// it takes clients and operators. Before, it redirects them, to no leader.
+    /// Whether it leads, has applied an entry of its own term, and isn't handing the leadership
+    /// over: then its state is current, it proposes, and it takes clients and operators. Else it
+    /// redirects them, to no leader, and its timers and the outbox wait.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.local.ready && self.raft.role() == Role::Leader
+        self.local.ready && self.raft.role() == Role::Leader && !self.raft.transferring()
     }
 
     /// After any input: apply what's committed, and notice losing the leadership.

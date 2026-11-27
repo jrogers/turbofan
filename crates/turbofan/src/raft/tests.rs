@@ -1393,6 +1393,38 @@ fn the_leadership_is_handed_to_a_caught_up_follower() {
     assert_eq!(rafts[0].leader(), Some(NodeId(2)), "the old leader hears from the new");
 }
 
+/// While it hands the leadership over, a leader takes no proposals and starts no change of
+/// members, as the Raft thesis has it (§3.10): its log stays no newer than the target's, which,
+/// of two voters, needs its vote. Made, the target leads; given up on, it takes them again.
+#[test]
+fn a_leader_handing_over_takes_no_proposals() {
+    for made in [true, false] {
+        let mut rafts = cluster(2);
+        let both = [1, 2];
+        elect(&mut rafts, &both, 1, 1000 * MS);
+        rafts[0].propose(b"x");
+        let sends = flush(&mut rafts[0]);
+        deliver(&mut rafts, &both, 1, sends, 1000 * MS);
+        assert_eq!(rafts[0].transfer_leadership(Some(NodeId(2))), Some(NodeId(2)));
+        assert_eq!(rafts[0].propose(b"during"), None, "not while handing over");
+        assert!(!rafts[0].add_member(member(3)), "nor a change of members");
+        let sends = flush(&mut rafts[0]);
+        if made {
+            deliver(&mut rafts, &both, 1, sends, 1000 * MS);
+            assert_eq!((rafts[1].role(), rafts[1].term()), (Role::Leader, 2), "the target won");
+            assert_eq!(rafts[0].role(), Role::Follower);
+        } else {
+            // Its TimeoutNow lost, the handover is given up on after an election timeout.
+            deliver(&mut rafts, &[1], 1, sends, 1000 * MS);
+            while rafts[0].transferring() {
+                heartbeat(&mut rafts, &both, 1);
+            }
+            assert_eq!((rafts[0].role(), rafts[0].term()), (Role::Leader, 1));
+            assert!(rafts[0].propose(b"after").is_some(), "proposals taken again");
+        }
+    }
+}
+
 /// A `Members` entry takes effect when it's appended, and is undone if it's truncated.
 #[test]
 fn a_truncated_members_entry_is_undone() {

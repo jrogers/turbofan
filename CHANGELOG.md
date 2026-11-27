@@ -15,6 +15,13 @@ a patch version (0.1.1) doesn't.
   still commit: a caller resubmitting them had them applied twice. Now a `Client` takes nothing
   more on a connection it's leaving, redirected or given up on. Found reviewing what the
   simulation never reaches (`scripts/coverage.sh`).
+- Of two voters, a leadership handover failed whenever anything was proposed during it, at the
+  cost of an election: the leader logged the entry but replicated only as far as the handover
+  began, then refused the target its vote for a log older than its own, and the target couldn't
+  win without it. Now, as the Raft thesis has it, a leader handing over takes no proposals
+  (`Raft::propose` returns `None`, `Node::is_ready` is false: clients and operators are
+  redirected, to no leader, and timers wait) and starts no change of members, and a handover
+  isn't started while a member is catching up. Given up on, the leader takes proposals again.
 
 ## 0.14.1 (2026-11-26)
 

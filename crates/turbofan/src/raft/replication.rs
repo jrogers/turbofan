@@ -220,7 +220,7 @@ impl Raft {
         }
         // A heartbeat to a peer too far behind on its acks (gone, say) carries no records: each
         // would otherwise queue another for it, up to a megabyte.
-        let to = if next > self.peers[peer].matched + MAX_IN_FLIGHT { 0 } else { self.replicate_to() };
+        let to = if next > self.peers[peer].matched + MAX_IN_FLIGHT { 0 } else { self.last_index() };
         // Every field of the append, but its records, which these fix: the same for each peer at
         // `next`, so the one made for the first goes to the rest.
         let key = [next, to, self.commit, self.reads.round, self.last_index(), self.meta.term];
@@ -311,14 +311,6 @@ impl Raft {
         if self.role == Role::Leader && !self.is_voter(self.config.id) && self.commit >= self.config_index() {
             self.become_follower(self.meta.term, self.now);
         }
-    }
-
-    /// How far the log is sent to peers: all of it, but while the leadership is being handed
-    /// over, only as far as it was when that began, so no voter's log is newer than the
-    /// target's will be. What's proposed meanwhile goes once the transfer gives up, or is
-    /// dropped by the new leader, for clients to resend.
-    pub(super) fn replicate_to(&self) -> u64 {
-        self.transfer.map_or(self.last_index(), |t| t.upto)
     }
 
     /// Appends the record `bytes` encode, checked as they came in.

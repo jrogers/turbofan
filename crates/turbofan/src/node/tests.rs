@@ -998,47 +998,36 @@ fn admin(node: &mut Node<Recorder>, conn: ConnId, request: &impl turbofan_sbe::E
     node.on_admin(conn, &codec::decode_frame(&frame).unwrap().unwrap().0, now);
 }
 
-/// A shutdown asked while the leadership is being handed over waits on the handover: its snapshot
-/// is logged past where the leader replicates to meanwhile (no voter's log newer than the
-/// target's), so it isn't taken, answered or stopped at. Given up on, the leader shuts down; made,
-/// the operator is redirected to the new leader, which does. Of three voters: of two, the old
-/// leader's vote is needed, and its log, with the shutdown's entry, is newer than the target's.
+/// A leader handing the leadership over isn't ready: a shutdown asked meanwhile is redirected, to
+/// no leader, and asked again it's carried out by whichever leads once the handover is done: the
+/// old leader if it was given up on, the target if it was made. Of two voters: the old leader
+/// proposes nothing meanwhile, so its vote isn't refused the target for a newer log.
 #[test]
-fn a_shutdown_waits_on_a_handover() {
+fn a_shutdown_asked_during_a_handover_is_redirected() {
     for made in [false, true] {
         // Unless it's made, the handover's TimeoutNow is lost.
         let handover = |m: &wire::Decoded<'_>| !made && matches!(m, wire::Decoded::TimeoutNow(_));
-        let mut nodes = nodes(3);
+        let mut nodes = nodes(2);
         let l = nodes.iter().position(Node::is_ready).unwrap();
-        let other = u8::try_from((l + 1) % 3 + 1).unwrap();
+        let other = u8::try_from(2 - l).unwrap();
         let now = nodes[l].now;
         admin(&mut nodes[l], 98, &wire::TransferLeadership { request_id: 1, to: other }, now);
+        assert!(!nodes[l].is_ready(), "not ready while handing over");
         admin(&mut nodes[l], 99, &wire::Shutdown { request_id: 2 }, now);
-        // The shutdown waits on the handover.
-        let given_up = now + raft::nanos(Duration::from_millis(150));
         let mut sent = exchange(&mut nodes, now, &handover);
-        let mut now = now;
-        while now <= given_up {
-            assert!(nodes.iter().all(|n| n.raft().snapshot_index() == 0), "no snapshot while handing over");
-            assert!(!sent.iter().any(|s| s.contains("ShutDown")), "not while handing over: {sent:?}");
-            assert!(!nodes.iter().any(Node::stopped));
-            let tick = tick(&mut nodes, &handover);
-            now = tick.0;
-            sent.extend(tick.1);
-            if made && nodes[usize::from(other) - 1].is_ready() {
-                break;
-            }
+        let redirect = format!("{} 99: Redirect(RedirectRef {{ leader: 0,", l + 1);
+        assert!(sent.iter().any(|s| s.starts_with(&redirect)), "{sent:?}");
+        while !nodes.iter().any(Node::is_ready) {
+            sent.extend(tick(&mut nodes, &handover).1);
         }
-        if made {
-            // The old leader redirects the operator, as it stands down, to no leader yet: the
-            // operator tries the others, and asked, the new one shuts down.
-            let n = usize::from(other) - 1;
-            assert!(nodes[n].is_ready() && !nodes[l].is_ready());
-            let redirect = format!("{} 99: Redirect(", l + 1);
-            assert!(sent.iter().any(|s| s.starts_with(&redirect)), "{sent:?}");
-            admin(&mut nodes[n], 99, &wire::Shutdown { request_id: 2 }, now);
-            sent = exchange(&mut nodes, now, &|_| false);
-        }
+        let leader = nodes.iter().position(Node::is_ready).unwrap();
+        assert_eq!(leader, if made { usize::from(other) - 1 } else { l });
+        let to = if made { other } else { 0 };
+        let transferred = format!("LeadershipTransferred(LeadershipTransferredRef {{ request_id: 1, leader: {to} }})");
+        assert!(sent.iter().any(|s| s.ends_with(&transferred)), "{sent:?}");
+        let now = nodes[leader].now;
+        admin(&mut nodes[leader], 99, &wire::Shutdown { request_id: 2 }, now);
+        sent = exchange(&mut nodes, now, &|_| false);
         for _ in 0..10 {
             sent.extend(tick(&mut nodes, &|_| false).1);
         }

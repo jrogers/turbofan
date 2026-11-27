@@ -787,13 +787,16 @@ impl Raft {
         if self.role == Role::Leader { self.heartbeat_at } else { self.election_at }
     }
 
-    /// Appends `payload` to the log if this node leads, returning its index.
+    /// Appends `payload` to the log if this node leads, returning its index. Not while it hands
+    /// the leadership over ([`Raft::transferring`]), as the Raft thesis has it (§3.10): an entry
+    /// the target lacked would make the leader's log newer than the target's, and, of two voters,
+    /// the leader's vote is needed. Given up on, the leader takes proposals again.
     ///
     /// # Panics
     ///
     /// If `payload` is over [`codec::MAX_PAYLOAD_BYTES`]; callers check what they're given.
     pub fn propose(&mut self, payload: &[u8]) -> Option<u64> {
-        if self.role != Role::Leader {
+        if self.role != Role::Leader || self.transfer.is_some() {
             return None;
         }
         let index = self.last_index() + 1;
@@ -921,7 +924,7 @@ impl Raft {
                 for _ in 0..=MAX_IN_FLIGHT {
                     let p = &self.peers[i];
                     let pipelined = p.next >= self.log.first
-                        && p.next <= self.replicate_to()
+                        && p.next <= self.last_index()
                         && p.next <= p.matched + MAX_IN_FLIGHT
                         && p.probe.is_none();
                     if !pipelined {

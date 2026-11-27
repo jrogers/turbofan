@@ -49,7 +49,8 @@ impl Raft {
     /// Refused (`None`) unless this node leads, isn't transferring already, and `to` is another
     /// voter, heard from within an election timeout.
     pub fn transfer_leadership(&mut self, to: Option<NodeId>) -> Option<NodeId> {
-        if self.role != Role::Leader || self.transfer.is_some() || self.stop.is_some() {
+        // Not with a member catching up: once it has, the change is proposed.
+        if self.role != Role::Leader || self.transfer.is_some() || self.stop.is_some() || self.catching_up.is_some() {
             return None;
         }
         let alive = self.now.saturating_sub(nanos(self.config.election_timeout));
@@ -232,9 +233,10 @@ impl Raft {
     }
 
     /// Whether this leader can start a change: one at a time, each committed before the next,
-    /// and not before an entry of its own term is committed.
+    /// not before an entry of its own term is committed, and not while handing over.
     pub(super) fn can_change(&self) -> bool {
         self.role == Role::Leader
+            && self.transfer.is_none()
             && self.catching_up.is_none()
             && self.config_index() <= self.commit
             && self.term_at(self.commit) == Some(self.meta.term)
