@@ -22,7 +22,8 @@
 //! stops, as the driver does, and is replaced: removed from the members, wiped, and started again
 //! to join, as an operator would. On restart, a log is cut at a rotten or torn record, as the log
 //! does, and the node doubts it; if that leaves no leader to replace a broken member with, the
-//! operator ends the doubt of nodes that only lost power.
+//! operator ends the doubt of nodes that only lost power, as it does whenever there's been no
+//! leader for a while (two voters, one in doubt, need three votes).
 //!
 //! A quarter of the seeds have every kind of fault on; the rest, each kind half the time
 //! ([`swarm`]), for what one fault needs to go on uninterrupted to be reached. A failure names
@@ -38,7 +39,7 @@
 //!
 //! Seven nodes run, three or five of them the first members. An operator adds and removes
 //! members now and then, between three and seven of them, the leader among those removed and
-//! removed ones among those added back, some as learners, the voters kept to three or more. And hands the leadership over now and then. The nodes
+//! removed ones among those added back, some as learners, the voters kept to three or more (in some seeds, two). And hands the leadership over now and then. The nodes
 //! start on an old version and are upgraded one by one, restarted on the new; the operator asks
 //! to activate the new version until it's let, which mustn't be while any member is old. Once the
 //! faults stop, it shuts the cluster down, and every member stops with the same snapshot; then
@@ -162,6 +163,7 @@ fn simulate() {
         assert!(covered.lost_responses > 0, "no client's session diverged by its responses alone");
         assert!(covered.queries_answered > 0, "no query was answered");
         assert!(covered.deposed_queries > 0, "no query reached a deposed leader behind another node");
+        assert!(covered.doubts_of_few > 0, "no node of fewer than three voters was in doubt");
     }
 }
 
@@ -207,6 +209,9 @@ struct Coverage {
     /// Queries that reached a leader deposed without knowing it, sent once another node had
     /// applied more than it had: one it answered alone would be stale.
     deposed_queries: u64,
+    /// Doubts the operator ended of a node with fewer than three voters: one that needs a vote
+    /// more than there are.
+    doubts_of_few: u64,
 }
 
 impl Coverage {
@@ -233,6 +238,7 @@ impl Coverage {
         self.lost_responses += other.lost_responses;
         self.queries_answered += other.queries_answered;
         self.deposed_queries += other.deposed_queries;
+        self.doubts_of_few += other.doubts_of_few;
     }
 }
 
@@ -384,9 +390,11 @@ enum Fault {
     Depose,
     Clock,
     Rot,
+    /// Not a fault but the operator's: changes of members leave two voters, not three, at least.
+    TwoVoters,
 }
 
-const FAULTS: [Fault; 13] = [
+const FAULTS: [Fault; 14] = [
     Fault::Drop,
     Fault::Duplicate,
     Fault::Late,
@@ -400,6 +408,7 @@ const FAULTS: [Fault; 13] = [
     Fault::Depose,
     Fault::Clock,
     Fault::Rot,
+    Fault::TwoVoters,
 ];
 
 /// The faults a seed has on, as bits by [`Fault`]: every one in a quarter of the seeds, else each
@@ -490,6 +499,8 @@ enum Event {
     Activate,
     /// A snapshot file rots.
     Rot,
+    /// The operator looks for a leader, and ends doubt if there's been none for a while.
+    EndDoubt,
     /// The operator replaces a node whose disk is damaged.
     Replace(NodeId),
     Shutdown,
@@ -975,6 +986,8 @@ struct Sim {
     steps: u64,
     rots: u64,
     broken: u64,
+    /// When [`Event::EndDoubt`] last found a leader.
+    led_at: u64,
     /// Nodes whose doubt the operator ended.
     overrides: u64,
     /// The log's faults this seed got to: [`Coverage::torn`] and the two after.
@@ -1084,6 +1097,7 @@ impl Sim {
             steps: 0,
             rots: 0,
             broken: 0,
+            led_at: 0,
             overrides: 0,
             covered: Coverage::default(),
             admin_frames: BTreeMap::new(),
@@ -1137,6 +1151,7 @@ impl Sim {
         self.schedule(1000 * MS, Event::Upgrade);
         self.schedule(2000 * MS, Event::Activate);
         self.schedule(3000 * MS, Event::Rot);
+        self.schedule(500 * MS, Event::EndDoubt);
         // Late in the quiet phase: transfers and changes of members first, the clients still sending.
         let after = FAULT_PHASE + 3500 * MS + self.rng.below(1000 * MS);
         self.schedule(after, Event::Shutdown);
@@ -1222,6 +1237,7 @@ impl Sim {
             Event::Upgrade => self.upgrade(),
             Event::Activate => self.activate(),
             Event::Rot => self.rot(),
+            Event::EndDoubt => self.end_doubt(),
             Event::Replace(id) => self.replace(id),
             Event::AdminRetry { frame, tries } => {
                 // Not a change of members, decided on the members then: the next is decided on
@@ -1297,18 +1313,20 @@ impl Sim {
         let others: Vec<NodeId> = self.members.iter().copied().filter(|id| !members.contains(id)).collect();
         let voters = members.len() - learners.len();
         let request_id = self.rng.next() & !ROLE_REQUEST;
-        if self.rng.one_in(3) && (!learners.is_empty() || voters > 3) {
+        // Two voters lose nothing safely: not while a disk is damaged, as one of them may be.
+        let floor = if self.has(Fault::TwoVoters) && !self.damaged() { 2 } else { 3 };
+        if self.rng.one_in(3) && (!learners.is_empty() || voters > floor) {
             let (id, learner) =
                 if learners.is_empty() { (self.rng.pick(&members), true) } else { (self.rng.pick(&learners), false) };
             let request_id = request_id | ROLE_REQUEST;
             self.admin(&turbofan::wire::SetRole { request_id, id: id.0, learner: u8::from(learner) });
-        } else if members.len() < MAX_MEMBERS && (voters <= 3 || self.rng.one_in(2)) {
+        } else if members.len() < MAX_MEMBERS && (voters <= floor || self.rng.one_in(2)) {
             let m = member(self.rng.pick(&others));
             let (peer, client, admin) = (m.peer.as_bytes(), m.client.as_bytes(), m.admin.as_bytes());
             let learner = u8::from(self.rng.one_in(3));
             self.admin(&turbofan::wire::AddMember { request_id, id: m.id.0, learner, peer, client, admin });
         } else {
-            let id = self.rng.pick(if voters <= 3 { &learners } else { &members });
+            let id = self.rng.pick(if voters <= floor { &learners } else { &members });
             self.admin(&turbofan::wire::RemoveMember { request_id, id: id.0 });
         }
     }
@@ -2275,7 +2293,7 @@ impl Sim {
     /// again, to join like a new node.
     fn replace(&mut self, id: NodeId) {
         let Some(members) = self.final_members() else {
-            self.override_doubt(id);
+            self.override_doubt(self.nodes[&id].broken_at);
             self.schedule(200 * MS, Event::Replace(id));
             return;
         };
@@ -2320,11 +2338,31 @@ impl Sim {
         self.start(id);
     }
 
-    /// Still no leader a while after `broken` broke, perhaps because a member in doubt needs one
-    /// vote more: the operator, knowing which nodes only lost power, ends their doubt, removing
-    /// the `doubt` file and restarting them. Never one that dropped a rotten record.
-    fn override_doubt(&mut self, broken: NodeId) {
-        if self.now < self.nodes[&broken].broken_at + 3000 * MS {
+    /// Whether a node's disk is damaged, found or not yet. Damage on a node that's left the members
+    /// counts too: the leader's members may not be committed, and the node not gone.
+    fn damaged(&self) -> bool {
+        self.nodes
+            .values()
+            .any(|n| n.broken || n.disk.rotten.is_some() || n.disk.rotten_record.is_some() || n.disk.rot_doubt)
+    }
+
+    /// The operator, until the shutdown, ends doubt once there's been no leader for a while.
+    fn end_doubt(&mut self) {
+        if self.leader().is_some() {
+            self.led_at = self.now;
+        }
+        self.override_doubt(self.led_at);
+        if self.shut_down.is_none() {
+            self.schedule(500 * MS, Event::EndDoubt);
+        }
+    }
+
+    /// Still no leader a while after `since` (a member broke, or the last leader was seen),
+    /// perhaps because a member in doubt needs one vote more, or more votes than there are voters:
+    /// the operator, knowing which nodes only lost power, ends their doubt, removing the `doubt`
+    /// file and restarting them. Never one that dropped a rotten record.
+    fn override_doubt(&mut self, since: u64) {
+        if self.now < since + 3000 * MS {
             return;
         }
         let torn = |n: &SimNode| n.node.as_ref().is_some_and(|n| n.raft().in_doubt()) && !n.disk.rot_doubt;
@@ -2332,6 +2370,8 @@ impl Sim {
         for id in ids {
             std::fs::remove_file(self.nodes[&id].disk.dir.path().join("log/doubt")).unwrap();
             self.overrides += 1;
+            let raft = self.nodes[&id].node.as_ref().unwrap().raft();
+            self.covered.doubts_of_few += u64::from(raft.members().iter().filter(|m| !m.learner).count() < 3);
             self.crash(id, false);
         }
     }
@@ -2344,14 +2384,11 @@ impl Sim {
         let after = 500 * MS + self.rng.below(1000 * MS);
         self.schedule(after, Event::Rot);
         // One node's disk damaged at a time, and of three voters or more: two of three lost at
-        // once would lose what only they had, past what Raft tolerates.
-        let Some(members) = self.final_members().filter(|_| self.final_voters() >= 3) else { return };
-        // Damage on a node that's left the members counts too: the leader's members may not be
-        // committed, and the node not gone.
-        let damaged = self
-            .nodes
-            .values()
-            .any(|n| n.broken || n.disk.rotten.is_some() || n.disk.rotten_record.is_some() || n.disk.rot_doubt);
+        // once would lose what only they had, past what Raft tolerates. Of four, where changes
+        // of members leave two: one under way may yet take a voter away.
+        let least = if self.has(Fault::TwoVoters) { 4 } else { 3 };
+        let Some(members) = self.final_members().filter(|_| self.final_voters() >= least) else { return };
+        let damaged = self.damaged();
         // A snapshot, or a record of the log.
         let snapshot = self.rng.one_in(2);
         let candidates: Vec<NodeId> =
