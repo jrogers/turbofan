@@ -55,7 +55,13 @@
 //! it: it diverges by its responses alone.
 //!
 //! The service is an echo with timers, which notifies the first session of some of the others'
-//! messages. Clients send numbered messages through failovers, and
+//! messages. Sessions close through the faults: a client closes its own, sending on behind the
+//! close; the service closes one when asked (`k!`), messages behind; a client goes silent past
+//! the session timeout (short, as each new leader restarts every session's clock), and some time
+//! out through failovers. Each session is opened and closed once, given nothing once closed; a
+//! client finds its session closed only as it asked, or timed out, and what it never saw applied
+//! is what it sent behind the close. It opens another, as a gateway would. Clients send numbered
+//! messages through failovers, and
 //! must see every message applied once and in order, every response once and in order, every
 //! timer fire once, and every message the service proposed applied once. And linearizably, across
 //! clients: each `a<k>` says where in the log's order its message was applied, and a message is
@@ -100,6 +106,7 @@ const DEPOSE_UNTIL: u64 = FAULT_PHASE + 2000 * MS;
 /// After the cluster is recovered from its loss and the clients stop sending, for it to settle.
 const DISASTER_QUIET: u64 = 3000 * MS;
 const CLIENTS: usize = 3;
+const SESSION_TIMEOUT: Duration = Duration::from_secs(1);
 /// Far more events waiting than a run has: past it, messages multiply, each answered by more
 /// than one, and the run would take the machine's memory.
 const MAX_QUEUED_EVENTS: usize = 200_000;
@@ -164,6 +171,10 @@ fn simulate() {
         assert!(covered.queries_answered > 0, "no query was answered");
         assert!(covered.deposed_queries > 0, "no query reached a deposed leader behind another node");
         assert!(covered.doubts_of_few > 0, "no node of fewer than three voters was in doubt");
+        assert!(covered.client_closes > 0, "no client closed its session");
+        assert!(covered.service_closes > 0, "the service closed no session");
+        assert!(covered.expiries > 0, "no session timed out");
+        assert!(covered.closed_unapplied > 0, "no session closed with messages behind the close");
     }
 }
 
@@ -212,6 +223,12 @@ struct Coverage {
     /// Doubts the operator ended of a node with fewer than three voters: one that needs a vote
     /// more than there are.
     doubts_of_few: u64,
+    /// Sessions closed by their clients, by the service, and timed out; and of those closed,
+    /// ones with messages sent behind the close, never applied.
+    client_closes: u64,
+    service_closes: u64,
+    expiries: u64,
+    closed_unapplied: u64,
 }
 
 impl Coverage {
@@ -239,6 +256,10 @@ impl Coverage {
         self.queries_answered += other.queries_answered;
         self.deposed_queries += other.deposed_queries;
         self.doubts_of_few += other.doubts_of_few;
+        self.client_closes += other.client_closes;
+        self.service_closes += other.service_closes;
+        self.expiries += other.expiries;
+        self.closed_unapplied += other.closed_unapplied;
     }
 }
 
@@ -248,6 +269,10 @@ impl Coverage {
 /// Panics if a session's messages arrive other than once each, in order.
 #[derive(Debug, Default)]
 struct Echo {
+    /// Sessions open: each opened once and closed once, and given nothing once closed.
+    open: BTreeSet<SessionId>,
+    /// Sessions the cluster timed out: the only ones a client may find closed unasked.
+    timed_out: BTreeSet<SessionId>,
     last: BTreeMap<SessionId, u64>,
     /// Responses sent to each session: its last `egress_seq`, while it's open.
     responses: BTreeMap<SessionId, u64>,
@@ -266,8 +291,17 @@ struct Echo {
 /// The state, not which version of the code holds it.
 impl PartialEq for Echo {
     fn eq(&self, other: &Self) -> bool {
-        (&self.last, &self.responses, self.fired, self.applied, self.now, self.as_new)
-            == (&other.last, &other.responses, other.fired, other.applied, other.now, other.as_new)
+        (&self.open, &self.timed_out, &self.last, &self.responses, self.fired, self.applied, self.now, self.as_new)
+            == (
+                &other.open,
+                &other.timed_out,
+                &other.last,
+                &other.responses,
+                other.fired,
+                other.applied,
+                other.now,
+                other.as_new,
+            )
     }
 }
 
@@ -285,11 +319,26 @@ impl Service for Echo {
         assert!(version <= self.version, "old code activated as version {version}");
     }
 
+    fn on_session_open(&mut self, _ctx: &mut Ctx, session: SessionId, _principal: &[u8]) {
+        assert!(self.open.insert(session), "session {session} opened twice");
+    }
+
+    fn on_session_close(&mut self, _ctx: &mut Ctx, session: SessionId, reason: CloseReason) {
+        assert!(self.open.remove(&session), "session {session} closed, not open");
+        if reason == CloseReason::Timeout {
+            self.timed_out.insert(session);
+        }
+    }
+
     fn on_message(&mut self, ctx: &mut Ctx, session: SessionId, payload: &[u8]) {
         self.at(ctx);
         assert!(ctx.service_version() <= self.version, "old code run as version {}", ctx.service_version());
         self.as_new += u64::from(ctx.service_version() >= 1);
-        let k: u64 = std::str::from_utf8(payload).unwrap().parse().unwrap();
+        assert!(self.open.contains(&session), "session {session}: a message applied once it closed");
+        // `k!`: answered, then the session closed.
+        let text = std::str::from_utf8(payload).unwrap();
+        let close = text.ends_with('!');
+        let k: u64 = text.trim_end_matches('!').parse().unwrap();
         let last = self.last.entry(session).or_default();
         assert_eq!(k, *last + 1, "session {session}: message {k} applied after {last}");
         *last = k;
@@ -299,7 +348,7 @@ impl Service for Echo {
             ctx.propose(format!("{session} {k}").as_bytes()).unwrap();
         }
         if k.is_multiple_of(NOTIFY_EVERY)
-            && let Some(&first) = self.last.keys().next()
+            && let Some(&first) = self.last.keys().find(|s| self.open.contains(s))
             && first != session
         {
             self.send(ctx, first, format!("n{k}"));
@@ -307,13 +356,19 @@ impl Service for Echo {
         if k.is_multiple_of(TIMER_EVERY) {
             ctx.schedule_timer(session.0 * TIMER_SPACE + k, ctx.now() + 30 * MS);
         }
+        if close {
+            ctx.close_session(session);
+        }
     }
 
     fn on_proposal(&mut self, ctx: &mut Ctx, payload: &[u8]) {
         self.at(ctx);
         let text = std::str::from_utf8(payload).unwrap();
         let (session, k) = text.split_once(' ').unwrap();
-        self.send(ctx, SessionId(session.parse().unwrap()), format!("p{k}"));
+        let session = SessionId(session.parse().unwrap());
+        if self.open.contains(&session) {
+            self.send(ctx, session, format!("p{k}"));
+        }
     }
 
     /// How far in the log's order it has applied messages.
@@ -324,12 +379,18 @@ impl Service for Echo {
     fn on_timer(&mut self, ctx: &mut Ctx, id: u64) {
         self.at(ctx);
         self.fired += 1;
-        self.send(ctx, SessionId(id / TIMER_SPACE), format!("t{}", id % TIMER_SPACE));
+        let session = SessionId(id / TIMER_SPACE);
+        if self.open.contains(&session) {
+            self.send(ctx, session, format!("t{}", id % TIMER_SPACE));
+        }
     }
 
-    /// Each session's last message and responses, the three counts and the time, as words.
+    /// The three counts and the time, the open sessions and those timed out (how many, then
+    /// each), and each session's last message and responses, as words.
     fn snapshot(&self) -> SnapshotWriter {
         let (fired, applied, now, as_new) = (self.fired, self.applied, self.now, self.as_new);
+        let open: Vec<u64> = self.open.iter().map(|s| s.0).collect();
+        let timed_out: Vec<u64> = self.timed_out.iter().map(|s| s.0).collect();
         let sessions: BTreeSet<SessionId> = self.last.keys().chain(self.responses.keys()).copied().collect();
         let rows: Vec<[u64; 3]> = sessions
             .into_iter()
@@ -340,7 +401,9 @@ impl Service for Echo {
             out.write_all(&applied.to_le_bytes())?;
             out.write_all(&now.to_le_bytes())?;
             out.write_all(&as_new.to_le_bytes())?;
-            for word in rows.iter().flatten() {
+            out.write_all(&(open.len() as u64).to_le_bytes())?;
+            out.write_all(&(timed_out.len() as u64).to_le_bytes())?;
+            for word in open.iter().chain(&timed_out).chain(rows.iter().flatten()) {
                 out.write_all(&word.to_le_bytes())?;
             }
             Ok(())
@@ -352,7 +415,11 @@ impl Service for Echo {
         from.read_to_end(&mut bytes)?;
         let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
         (self.fired, self.applied, self.now, self.as_new) = (words[0], words[1], words[2], words[3]);
-        let rows = words[4..].as_chunks::<3>().0;
+        let open = 6 + usize::try_from(words[4]).unwrap();
+        let timed_out = open + usize::try_from(words[5]).unwrap();
+        self.open = words[6..open].iter().map(|&s| SessionId(s)).collect();
+        self.timed_out = words[open..timed_out].iter().map(|&s| SessionId(s)).collect();
+        let rows = words[timed_out..].as_chunks::<3>().0;
         self.last = rows.iter().filter(|r| r[1] > 0).map(|&[session, last, _]| (SessionId(session), last)).collect();
         self.responses = rows.iter().filter(|r| r[2] > 0).map(|&[session, _, n]| (SessionId(session), n)).collect();
         Ok(())
@@ -392,9 +459,15 @@ enum Fault {
     Rot,
     /// Not a fault but the operator's: changes of members leave two voters, not three, at least.
     TwoVoters,
+    /// Clients close their sessions now and then, messages and queries in flight.
+    ClientClose,
+    /// Clients now and then ask the service to close their sessions, sending more behind.
+    ServiceClose,
+    /// A client goes silent for longer than the session timeout, and finds its session gone.
+    Expire,
 }
 
-const FAULTS: [Fault; 14] = [
+const FAULTS: [Fault; 17] = [
     Fault::Drop,
     Fault::Duplicate,
     Fault::Late,
@@ -409,24 +482,27 @@ const FAULTS: [Fault; 14] = [
     Fault::Clock,
     Fault::Rot,
     Fault::TwoVoters,
+    Fault::ClientClose,
+    Fault::ServiceClose,
+    Fault::Expire,
 ];
 
 /// The faults a seed has on, as bits by [`Fault`]: every one in a quarter of the seeds, else each
 /// one half the time. Drawn apart from the run's own randomness, so a seed with every fault on
 /// runs as it would with no choice.
-fn swarm(seed: u64) -> u16 {
+fn swarm(seed: u64) -> u32 {
     let mut rng = Rng(seed ^ 0x5357_4152_4d00);
     if rng.one_in(4) {
-        return u16::MAX;
+        return u32::MAX;
     }
-    FAULTS.iter().filter(|_| rng.one_in(2)).fold(0, |bits, &f| bits | 1 << f as u16)
+    FAULTS.iter().filter(|_| rng.one_in(2)).fold(0, |bits, &f| bits | 1 << f as u32)
 }
 
-fn describe_swarm(bits: u16) -> String {
-    if bits == u16::MAX {
+fn describe_swarm(bits: u32) -> String {
+    if bits == u32::MAX {
         return "all".into();
     }
-    let on: Vec<String> = FAULTS.iter().filter(|&&f| bits & 1 << f as u16 != 0).map(|f| format!("{f:?}")).collect();
+    let on: Vec<String> = FAULTS.iter().filter(|&&f| bits & 1 << f as u32 != 0).map(|f| format!("{f:?}")).collect();
     if on.is_empty() { "none".into() } else { on.join(", ") }
 }
 
@@ -501,6 +577,10 @@ enum Event {
     Rot,
     /// The operator looks for a leader, and ends doubt if there's been none for a while.
     EndDoubt,
+    /// A client closes its session.
+    ClientClose,
+    /// A client goes silent past the session timeout.
+    Freeze,
     /// The operator replaces a node whose disk is damaged.
     Replace(NodeId),
     Shutdown,
@@ -925,6 +1005,13 @@ struct SimClient {
     /// Each query waiting, by ID: the furthest in the log's order any node had applied as it was
     /// sent, which its answer must reach.
     queries: BTreeMap<u64, u64>,
+    /// The close it asked for, the only one it may get (or `NoSession`, reattaching once the
+    /// close is applied): its own, the service's (sending `k!`), or the cluster's timing it out.
+    asked: Option<CloseReason>,
+    /// Silent until then, long enough for its session to time out: no ticks, sends or connection.
+    frozen_until: u64,
+    /// When it began, its session to be opened: a late one has had little time to send.
+    since: u64,
 }
 
 /// A client connection: in order each way, like TCP.
@@ -943,7 +1030,7 @@ struct Sim {
     seed: u64,
     rng: Rng,
     /// The faults this seed has on: [`swarm`].
-    swarm: u16,
+    swarm: u32,
     now: u64,
     queue: BinaryHeap<(Reverse<u64>, Reverse<u64>)>,
     events: BTreeMap<u64, Event>,
@@ -1050,6 +1137,9 @@ fn new_client(c: usize, again: bool) -> SimClient {
         opened_with: (0, 0),
         of_lost: false,
         queries: BTreeMap::new(),
+        asked: None,
+        frozen_until: 0,
+        since: 0,
     }
 }
 
@@ -1129,7 +1219,7 @@ impl Sim {
 
     /// Whether `fault` is on for this seed.
     fn has(&self, fault: Fault) -> bool {
-        self.swarm & 1 << fault as u16 != 0
+        self.swarm & 1 << fault as u32 != 0
     }
 
     /// Whether `fault` happens now: on for this seed, and the faults not over.
@@ -1152,6 +1242,8 @@ impl Sim {
         self.schedule(2000 * MS, Event::Activate);
         self.schedule(3000 * MS, Event::Rot);
         self.schedule(500 * MS, Event::EndDoubt);
+        self.schedule(2000 * MS, Event::ClientClose);
+        self.schedule(1000 * MS, Event::Freeze);
         // Late in the quiet phase: transfers and changes of members first, the clients still sending.
         let after = FAULT_PHASE + 3500 * MS + self.rng.below(1000 * MS);
         self.schedule(after, Event::Shutdown);
@@ -1226,11 +1318,7 @@ impl Sim {
             Event::ToNode { conn, frame } => self.deliver_to_node(conn, &frame),
             Event::ToClient { conn, frame } => self.deliver_to_client(conn, &frame),
             Event::Dial(c) => self.dial(c),
-            Event::ClientTick(c) => {
-                self.clients[c].tick_at = None;
-                self.clients[c].client.on_tick(self.now);
-                self.flush_client(c);
-            }
+            Event::ClientTick(c) => self.client_tick(c),
             Event::ClientSend(c) => self.client_send(c),
             Event::AdminRequest => self.admin_request(),
             Event::ChangeMembers => self.change_members(),
@@ -1238,6 +1326,8 @@ impl Sim {
             Event::Activate => self.activate(),
             Event::Rot => self.rot(),
             Event::EndDoubt => self.end_doubt(),
+            Event::ClientClose => self.client_close(),
+            Event::Freeze => self.freeze(),
             Event::Replace(id) => self.replace(id),
             Event::AdminRetry { frame, tries } => {
                 // Not a change of members, decided on the members then: the next is decided on
@@ -1723,7 +1813,24 @@ impl Sim {
         self.flush_client(c);
     }
 
+    /// A client's tick: none while it's frozen, but one as it thaws.
+    fn client_tick(&mut self, c: usize) {
+        let thaw = self.clients[c].frozen_until;
+        if self.now < thaw {
+            self.clients[c].tick_at = Some(thaw);
+            self.schedule(thaw - self.now, Event::ClientTick(c));
+            return;
+        }
+        self.clients[c].tick_at = None;
+        self.clients[c].client.on_tick(self.now);
+        self.flush_client(c);
+    }
+
     fn dial(&mut self, c: usize) {
+        if self.now < self.clients[c].frozen_until {
+            self.schedule(self.clients[c].frozen_until - self.now, Event::Dial(c));
+            return;
+        }
         self.clients[c].dialing = false;
         let target: NodeId = self.clients[c].client.target()[1..].parse().unwrap();
         if self.nodes[&target].node.is_none() {
@@ -1783,9 +1890,18 @@ impl Sim {
             }
             return;
         }
+        if self.now < self.clients[c].frozen_until {
+            self.schedule(self.clients[c].frozen_until - self.now, Event::ClientSend(c));
+            return;
+        }
         let k = self.clients[c].sent + 1;
-        match self.clients[c].client.send(k.to_string().as_bytes()) {
+        let close = self.fault(Fault::ServiceClose) && self.clients[c].asked.is_none() && self.rng.one_in(400);
+        let payload = if close { format!("{k}!") } else { k.to_string() };
+        match self.clients[c].client.send(payload.as_bytes()) {
             Ok(_) => {
+                if close {
+                    self.clients[c].asked = Some(CloseReason::Service);
+                }
                 self.clients[c].sent = k;
                 self.clients[c].after.push(self.answered.max(self.queried));
             }
@@ -1846,6 +1962,16 @@ impl Sim {
     fn check_client_event(&mut self, c: usize, event: client::Event) {
         if let client::Event::Closed { reason: CloseReason::Diverged, unapplied, .. } = event {
             return self.diverged(c, unapplied);
+        }
+        if let client::Event::Closed { reason, unapplied, .. } = event {
+            return self.closed(c, reason, unapplied);
+        }
+        // Thawed, its session still there: the leader's clock for it started late, at a failover.
+        if matches!(event, client::Event::Opened(_))
+            && self.clients[c].asked == Some(CloseReason::NoSession)
+            && self.now >= self.clients[c].frozen_until
+        {
+            self.clients[c].asked = None;
         }
         let seed = self.seed;
         let sim_client = &mut self.clients[c];
@@ -1947,9 +2073,82 @@ impl Sim {
         assert_eq!(unapplied as u64, sent - had, "seed {seed}: client {c} sent {sent}, the cluster applied {had}");
         self.covered.diverged += 1;
         self.clients[c] = new_client(c, true);
+        self.clients[c].since = self.now;
         // What's still to come on the old session's connection isn't the new one's.
         self.reset(conn);
         self.dial_later(c);
+    }
+
+    /// A client's session closed as it asked, or as `NoSession` reattaching once the close was
+    /// applied; or the cluster timed it out: never otherwise. Asked by it or the service, what it
+    /// never saw applied is what it sent behind the close. A gateway then opens another.
+    fn closed(&mut self, c: usize, reason: CloseReason, unapplied: usize) {
+        let (seed, sim_client) = (self.seed, &self.clients[c]);
+        let asked = sim_client.asked;
+        let session = sim_client.client.session().expect("closed, so opened");
+        let timed_out =
+            self.nodes.values().filter_map(|n| n.node.as_ref()).any(|n| n.service().timed_out.contains(&session));
+        assert!(
+            asked == Some(reason)
+                || (asked.is_some() && reason == CloseReason::NoSession)
+                || (timed_out && matches!(reason, CloseReason::Timeout | CloseReason::NoSession)),
+            "seed {seed}: client {c}'s session {session} closed as {reason:?}, asked {asked:?}"
+        );
+        if asked == Some(reason) && reason != CloseReason::NoSession {
+            let behind = sim_client.sent - sim_client.answered;
+            assert_eq!(unapplied as u64, behind, "seed {seed}: client {c} sent {behind} unanswered");
+        }
+        match asked {
+            Some(CloseReason::Client) => self.covered.client_closes += 1,
+            Some(CloseReason::Service) => self.covered.service_closes += 1,
+            _ => self.covered.expiries += u64::from(timed_out),
+        }
+        self.covered.closed_unapplied += u64::from(unapplied > 0);
+        let conn = self.clients[c].conn;
+        self.clients[c] = new_client(c, true);
+        self.clients[c].since = self.now;
+        if let Some(conn) = conn {
+            self.reset(conn);
+        }
+        self.dial_later(c);
+    }
+
+    /// Now and then, through the faults, a client closes its session, messages and queries in
+    /// flight, and goes on sending behind the close.
+    fn client_close(&mut self) {
+        if !self.fault(Fault::ClientClose) {
+            return;
+        }
+        let after = 1000 * MS + self.rng.below(3000 * MS);
+        self.schedule(after, Event::ClientClose);
+        let c = usize::try_from(self.rng.below(CLIENTS as u64)).unwrap();
+        if self.clients[c].asked.is_none() {
+            self.clients[c].asked = Some(CloseReason::Client);
+            self.clients[c].client.close();
+            self.flush_client(c);
+        }
+    }
+
+    /// Now and then, through the faults, a client goes silent for longer than the session
+    /// timeout: when it reattaches, its session is gone, unless a failover restarted its clock.
+    fn freeze(&mut self) {
+        if !self.fault(Fault::Expire) {
+            return;
+        }
+        let after = 4000 * MS + self.rng.below(4000 * MS);
+        self.schedule(after, Event::Freeze);
+        let c = usize::try_from(self.rng.below(CLIENTS as u64)).unwrap();
+        if self.clients[c].asked.is_some() {
+            return;
+        }
+        let timeout = u64::try_from(SESSION_TIMEOUT.as_nanos()).unwrap();
+        // Longer than the timeout, from when its leader last heard from it.
+        let length = timeout + 500 * MS + self.rng.below(500 * MS);
+        self.clients[c].frozen_until = self.now + length;
+        self.clients[c].asked = Some(CloseReason::NoSession);
+        if let Some(conn) = self.clients[c].conn {
+            self.reset(conn);
+        }
     }
 
     /// Committed entries are the same on every node, and durable on a majority.
@@ -2462,6 +2661,9 @@ impl Sim {
         // far less.
         config.raft.read_lease = (self.seed / 3).is_multiple_of(2).then(|| Duration::from_millis(135));
         config.snapshot_every_entries = 300;
+        // Short, for a session to time out under one leader, which restarts every session's clock:
+        // short enough that some time out through failovers too, as a client's can.
+        config.session_timeout = SESSION_TIMEOUT;
         // Covers a client's messages in flight, each with its response and some a timer's.
         config.egress_ring_entries = 2 * client::MAX_UNACKED;
         config.protocol = u32::from(sim_node.upgraded);
@@ -2516,7 +2718,8 @@ impl Sim {
         let restore = self.rng.one_in(2);
         let lose_after = 2000 * MS + self.rng.below(1000 * MS);
         // The one others' messages notify: once idle, what it's sent comes of theirs.
-        let first = self.nodes[&leader].node.as_ref().unwrap().service().last.keys().next().copied();
+        let service = self.nodes[&leader].node.as_ref().unwrap().service();
+        let first = service.last.keys().find(|s| service.open.contains(s)).copied();
         let idle_client = (0..CLIENTS).find(|&c| self.clients[c].client.session() == first).expect("a client is first");
         let mut idle_at = u64::MAX;
         let standby = if restore {
@@ -2755,9 +2958,11 @@ impl Sim {
     fn check_clients_end(&self) {
         let seed = self.seed;
         for (c, sim_client) in self.clients.iter().enumerate() {
-            // A second session, opened after a recovery, has had less time.
-            let least = if self.disaster.is_some() { 10 } else { 100 };
-            assert!(sim_client.sent > least, "seed {seed}: client {c} sent only {}", sim_client.sent);
+            // A second session, opened after a recovery or a close, has had less time: a message
+            // every 50 ms of it at least, a sixth of the rate it sends at.
+            let least = if self.disaster.is_some() || sim_client.since > 0 { 10 } else { 100 };
+            let least = least.min(self.send_until.saturating_sub(sim_client.since) / (50 * MS));
+            assert!(sim_client.sent >= least, "seed {seed}: client {c} sent only {}", sim_client.sent);
             assert_eq!(sim_client.answered, sim_client.sent, "seed {seed}: client {c} unanswered");
             assert_eq!(sim_client.client.unacked(), 0);
             assert_eq!(sim_client.client.applied(), sim_client.sent, "seed {seed}: client {c} applied");
