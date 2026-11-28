@@ -2545,13 +2545,18 @@ impl Sim {
             .any(|n| n.broken || n.disk.rotten.is_some() || n.disk.rotten_record.is_some() || n.disk.rot_doubt)
     }
 
-    /// The operator, until the shutdown, ends doubt once there's been no leader for a while.
+    /// The operator, until the cluster is lost, ends doubt once there's been no leader for a while:
+    /// after the shutdown too, once it's started again. A doubter of two voters a leader of its
+    /// own term kept up stays in doubt, and once they restart neither can be elected (a nightly
+    /// simulation's seed 460035268120104).
     fn end_doubt(&mut self) {
         if self.leader().is_some() {
             self.led_at = self.now;
         }
-        self.override_doubt(self.led_at);
-        if self.shut_down.is_none() {
+        if self.shut_down.is_none() || self.started_again {
+            self.override_doubt(self.led_at);
+        }
+        if self.disaster.is_none() {
             self.schedule(500 * MS, Event::EndDoubt);
         }
     }
