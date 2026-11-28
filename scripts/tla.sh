@@ -4,6 +4,7 @@
 # pinned version and checksum, into target/tla/ the first time.
 #   scripts/tla.sh                  # every model
 #   scripts/tla.sh doubt            # one: crates/turbofan/tla/MC<Name>.cfg
+#   scripts/tla.sh doubtTwoTrace    # a scripted run, MC<Name>.tla: under a second
 # Each takes hours (its .cfg says how long), so check.sh doesn't run them: run them after
 # changing the rules in raft/, and change the spec with them. A violation
 # prints the trace that leads to it.
@@ -28,7 +29,12 @@ for model in "${models[@]}"; do
     name="$(tr '[:lower:]' '[:upper:]' <<<"${model:0:1}")${model:1}"
     config=crates/turbofan/tla/MC$name.cfg
     [[ -f $config ]] || { echo "no model $config" >&2; exit 1; }
+    # A model of its own module (MC<Name>.tla) is a scripted run: one that stops short is a
+    # deadlock, and fails. The rest are searches of MCRaft.tla, which may end anywhere.
+    module=crates/turbofan/tla/MC$name.tla
+    deadlock=()
+    [[ -f $module ]] || { module=crates/turbofan/tla/MCRaft.tla; deadlock=(-deadlock); }
     echo "== $model"
-    java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -deadlock -cleanup \
-        -metadir "target/tla/states-$model" -config "$config" crates/turbofan/tla/MCRaft.tla
+    java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto ${deadlock[@]+"${deadlock[@]}"} -cleanup \
+        -metadir "target/tla/states-$model" -config "$config" "$module"
 done
