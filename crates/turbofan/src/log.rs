@@ -46,6 +46,18 @@ pub enum Fsync {
     EachBatch,
 }
 
+/// A change a simulated log made to its directory, which a power loss before the directory's
+/// next sync may undo: [`Log::unsynced`].
+#[derive(Debug, Clone)]
+pub enum DirChange {
+    /// A file created.
+    Created(PathBuf),
+    /// A file removed, with its bytes.
+    Removed(PathBuf, Vec<u8>),
+    /// A file renamed over another, with the bytes of the one it replaced.
+    Renamed { from: PathBuf, to: PathBuf, replaced: Vec<u8> },
+}
+
 /// An open log directory, locked against a second process.
 #[derive(Debug)]
 pub struct Log {
@@ -66,6 +78,8 @@ pub struct Log {
     next_index: u64,
     /// A segment was created or removed since the directory was last synced.
     dir_dirty: bool,
+    /// Simulated: the changes to the directory since it was last synced, as it would have been.
+    changes: Option<Vec<DirChange>>,
     /// Where the last read stopped: its segment, the next index and its offset there.
     cursor: Option<(u64, u64, u64)>,
     /// With [`Fsync::Never`], where to send a handle on the segment to sync behind the writes,
@@ -93,13 +107,23 @@ impl Log {
     }
 
     /// [`Log::open`], for a simulation, whose crashes are modelled: segments close once they
-    /// hold `segment_bytes`, small so that many roll and compact, and nothing is synced.
+    /// hold `segment_bytes`, small so that many roll and compact, and nothing is synced, but the
+    /// changes to the directory since it would have been are kept: [`Log::unsynced`].
     ///
     /// # Errors
     ///
     /// As [`Log::open`].
     pub fn open_simulated(dir: &Path, segment_bytes: u64, each: impl FnMut(Record<'_>)) -> io::Result<Self> {
-        Self::open_with(dir, segment_bytes, false, each)
+        let mut log = Self::open_with(dir, segment_bytes, false, each)?;
+        log.changes = Some(Vec::new());
+        Ok(log)
+    }
+
+    /// Simulated, the changes made to the directory since it would last have been synced,
+    /// oldest first: what a power loss now may undo, each on its own. Else none.
+    #[must_use]
+    pub fn unsynced(&self) -> &[DirChange] {
+        self.changes.as_deref().unwrap_or_default()
     }
 
     fn open_with(dir: &Path, segment_bytes: u64, sync: bool, mut each: impl FnMut(Record<'_>)) -> io::Result<Self> {
@@ -160,6 +184,7 @@ impl Log {
             doubt,
             next_index,
             dir_dirty: false,
+            changes: None,
             cursor: None,
             flush_behind: None,
             unflushed: 0,
@@ -185,7 +210,7 @@ impl Log {
     pub fn trust(&mut self) -> io::Result<()> {
         if self.doubt {
             self.sync()?;
-            match fs::remove_file(self.dir.join("doubt")) {
+            match self.remove(&self.dir.join("doubt")) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
@@ -346,15 +371,40 @@ impl Log {
     ///
     /// If syncing fails; what was appended since the last sync may then be lost.
     pub fn sync(&mut self) -> io::Result<()> {
-        if !self.sync {
-            return Ok(());
+        if self.sync {
+            self.flush.sync_data(&self.file)?;
         }
-        self.flush.sync_data(&self.file)?;
         if self.dir_dirty {
-            sync_dir(&self.dir)?;
+            self.sync_dir()?;
             self.dir_dirty = false;
         }
         Ok(())
+    }
+
+    /// Syncs the directory, or, simulated, forgets the changes that would have made durable.
+    fn sync_dir(&mut self) -> io::Result<()> {
+        if self.sync {
+            sync_dir(&self.dir)?;
+        }
+        if let Some(changes) = &mut self.changes {
+            changes.clear();
+        }
+        Ok(())
+    }
+
+    /// Removes the file at `path`, kept as a change if simulated.
+    fn remove(&mut self, path: &Path) -> io::Result<()> {
+        if let Some(changes) = &mut self.changes {
+            changes.push(DirChange::Removed(path.into(), fs::read(path)?));
+        }
+        fs::remove_file(path)
+    }
+
+    /// Notes that the file at `path` was created, if simulated.
+    fn created(&mut self, path: PathBuf) {
+        if let Some(changes) = &mut self.changes {
+            changes.push(DirChange::Created(path));
+        }
     }
 
     /// Removes the records from `index` on, which a new leader's log has replaced, and syncs.
@@ -371,7 +421,7 @@ impl Log {
         let mut reopened = false;
         while self.segments.len() > 1 && *self.segments.last().expect("not empty") >= index {
             let first = self.segments.pop().expect("not empty");
-            fs::remove_file(segment_path(&self.dir, first))?;
+            self.remove(&segment_path(&self.dir, first))?;
             (self.dir_dirty, reopened) = (true, true);
         }
         let first = *self.segments.last().expect("never empty");
@@ -392,9 +442,13 @@ impl Log {
             // file of what's kept, synced before it replaces it, so as not to change the capture.
             let temp = path.with_extension("tmp");
             fs::write(&temp, &bytes[..keep])?;
+            self.created(temp.clone());
             self.file = OpenOptions::new().write(true).open(&temp)?;
             if self.sync {
                 self.file.sync_data()?;
+            }
+            if let Some(changes) = &mut self.changes {
+                changes.push(DirChange::Renamed { from: temp.clone(), to: path.clone(), replaced: bytes });
             }
             fs::rename(&temp, &path)?;
         } else {
@@ -416,13 +470,11 @@ impl Log {
     pub fn compact_to(&mut self, index: u64) -> io::Result<u64> {
         self.cursor = None;
         while self.segments.len() > 1 && self.segments[1] <= index + 1 {
-            fs::remove_file(segment_path(&self.dir, self.segments[0]))?;
+            self.remove(&segment_path(&self.dir, self.segments[0]))?;
             self.segments.remove(0);
             // Synced one by one: else a crash could keep this removal and lose an earlier one, a
             // gap that opens as damage, and the records after it, acknowledged, cut.
-            if self.sync {
-                sync_dir(&self.dir)?;
-            }
+            self.sync_dir()?;
         }
         Ok(self.segments[0])
     }
@@ -467,13 +519,12 @@ impl Log {
         // Newest first, and all gone before the new one: a crash partway leaves the start of the
         // old log, which [`Log::resume`] resets, never a gap.
         for first in std::mem::take(&mut self.segments).into_iter().rev() {
-            fs::remove_file(segment_path(&self.dir, first))?;
+            self.remove(&segment_path(&self.dir, first))?;
         }
-        if self.sync {
-            sync_dir(&self.dir)?;
-        }
+        self.sync_dir()?;
         self.file =
             OpenOptions::new().create(true).truncate(true).write(true).open(segment_path(&self.dir, next_index))?;
+        self.created(segment_path(&self.dir, next_index));
         self.segments = vec![next_index];
         self.file_len = 0;
         self.next_index = next_index;
@@ -486,6 +537,7 @@ impl Log {
             self.flush.sync_data(&self.file)?;
         }
         self.file = OpenOptions::new().create_new(true).write(true).open(segment_path(&self.dir, first))?;
+        self.created(segment_path(&self.dir, first));
         self.segments.push(first);
         self.file_len = 0;
         self.dir_dirty = true;

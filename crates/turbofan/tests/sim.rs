@@ -7,7 +7,8 @@
 //! reset; nodes crashing now and then, the leader too with appends in flight, mostly the process
 //! alone (each write it made reaching the disk whole) and sometimes the power, partway through
 //! persisting (a prefix of the operations being written, and of their records, reaching the disk,
-//! the next record torn), then restarting from what's on disk; through it all, a leader a quarter
+//! the next record torn, and each change to the log's directory since it was last synced, a
+//! segment created, removed or renamed, undone or not), then restarting from what's on disk; through it all, a leader a quarter
 //! of the time or more, for what one does under faults to be reached; nodes persisting as the driver
 //! does, batches taken while one is written queued behind it and written together, and inputs
 //! handled meanwhile; slow disks, what waits for a write late; and log records and snapshot files
@@ -84,7 +85,7 @@ use std::time::Duration;
 use turbofan::client::{self, Client};
 use turbofan::codec::{self, Record};
 use turbofan::driver::Slewed;
-use turbofan::log::{Log, MAX_SEGMENT_BYTES};
+use turbofan::log::{DirChange, Log, MAX_SEGMENT_BYTES};
 use turbofan::meta::{Meta, MetaFile};
 use turbofan::node::{self, ConnId, Node, SaveSnapshot};
 use turbofan::pipeline::{Batch, Pipeline};
@@ -159,6 +160,7 @@ fn simulate() {
         assert!(covered.rot_cut > 0, "no rotten record was cut from a log with records after it");
         assert!(covered.torn_resets > 0, "no crash interrupted a snapshot replacing the log");
         assert!(covered.segments_compacted > 0, "no log segment was compacted");
+        assert!(covered.undone > 0, "no power loss undid a change to a log's directory");
         assert!(covered.stale_leaders > 0, "no paused leader resumed after another was elected");
         // A leader often enough, through the faults, for what one does under them to be reached.
         let led = covered.led_ns * 100 / covered.fault_ns;
@@ -201,6 +203,8 @@ struct Coverage {
     torn_resets: u64,
     /// Times a log's first segment was removed.
     segments_compacted: u64,
+    /// Power losses that undid a change to a log's directory it hadn't synced.
+    undone: u64,
     /// Leaders that resumed from a pause after another was elected.
     stale_leaders: u64,
     /// How long the fault phase ran, and had a leader.
@@ -245,6 +249,7 @@ impl Coverage {
         self.rot_cut += other.rot_cut;
         self.torn_resets += other.torn_resets;
         self.segments_compacted += other.segments_compacted;
+        self.undone += other.undone;
         self.stale_leaders += other.stale_leaders;
         self.fault_ns += other.fault_ns;
         self.led_ns += other.led_ns;
@@ -639,6 +644,10 @@ struct Disk {
     first: u64,
     /// The records from `first`.
     log: Vec<Vec<u8>>,
+    /// The changes to the log's directory not yet synced when the power was lost.
+    unsynced: Vec<DirChange>,
+    /// The log's records before this index are synced: no power loss may take them.
+    synced_end: u64,
 }
 
 impl Disk {
@@ -657,6 +666,8 @@ impl Disk {
             rotten_record,
             first: 1,
             log: Vec::new(),
+            unsynced: Vec::new(),
+            synced_end: 1,
         }
     }
 
@@ -682,6 +693,8 @@ impl Disk {
             rotten_record: None,
             first: 1,
             log: Vec::new(),
+            unsynced: Vec::new(),
+            synced_end: 1,
         }
     }
 
@@ -705,6 +718,8 @@ impl Disk {
         }
         assert!(recovered == self.log.concat(), "the log recovers what was written");
         assert_eq!(log.next_index(), self.first + self.log.len() as u64);
+        // Opening syncs what it keeps.
+        self.synced_end = log.next_index();
         // As the driver does: a log that ends before the snapshot, or disagrees with it, goes on
         // from it.
         let mut log = log;
@@ -736,6 +751,7 @@ impl Disk {
             Persist::TruncateFrom(index) => {
                 log.truncate_from(*index)?;
                 self.log.truncate(usize::try_from(index - self.first).unwrap());
+                self.synced_end = self.synced_end.min(*index);
             }
             Persist::Compact { log: to, snapshot } => {
                 let first = log.compact_to(*to)?;
@@ -752,6 +768,7 @@ impl Disk {
                     log.reset(snapshot.index + 1)?;
                     self.log.clear();
                     self.first = snapshot.index + 1;
+                    self.synced_end = self.first;
                 } else {
                     let first = log.compact_to(snapshot.index)?;
                     self.compact_to(first);
@@ -772,7 +789,7 @@ impl Disk {
         snapshot::install(self.snapshots.path(), snapshot, false)?;
         snapshot::remove_older(self.snapshots.path(), snapshot.index, 1).unwrap();
         self.snapshot = Some(snapshot.clone());
-        self.files = None;
+        self.lose_power();
         let segments = self.segments();
         let gone = usize::try_from(rng.below(segments.len() as u64 + 1)).unwrap();
         let kept = segments.len() - gone;
@@ -805,7 +822,7 @@ impl Disk {
         let bytes: Vec<u8> = records[..whole].iter().copied().flat_map(encode).collect();
         log.append(&bytes).unwrap();
         self.log.extend(records[..whole].iter().copied().map(encode));
-        self.files = None;
+        self.lose_power();
         let mut torn = encode(records[whole]);
         let cut = 1 + usize::try_from(rng.below(torn.len() as u64 - 1)).unwrap();
         let later = whole + 1 < records.len() && rng.one_in(2);
@@ -819,6 +836,85 @@ impl Disk {
         let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         std::io::Write::write_all(&mut file, &torn).unwrap();
         later
+    }
+
+    /// Syncs the log, as the driver does after each write.
+    fn sync(&mut self) {
+        if let Some((log, _)) = &mut self.files {
+            log.sync().unwrap();
+            self.synced_end = log.next_index();
+        }
+    }
+
+    /// The power is lost: the log and meta are closed, keeping the changes to the log's
+    /// directory it hadn't synced.
+    fn lose_power(&mut self) {
+        if let Some((log, _)) = self.files.take() {
+            self.unsynced.extend_from_slice(log.unsynced());
+        }
+    }
+
+    /// Undoes, latest first, each change to the log's directory that the power was lost before
+    /// it synced, or not, on its own. Returns whether any was. Not while a record is rotten,
+    /// which the records expected of the log go by.
+    fn undo(&mut self, rng: &mut Rng) -> bool {
+        let changes = std::mem::take(&mut self.unsynced);
+        if self.rotten_record.is_some() {
+            return false;
+        }
+        let mut undone = false;
+        for change in changes.iter().rev() {
+            if !rng.one_in(2) {
+                continue;
+            }
+            undone = true;
+            match change {
+                DirChange::Created(path) => drop(std::fs::remove_file(path)),
+                DirChange::Removed(path, bytes) => std::fs::write(path, bytes).unwrap(),
+                DirChange::Renamed { from, to, replaced } => {
+                    if to.exists() {
+                        std::fs::rename(to, from).unwrap();
+                    }
+                    std::fs::write(to, replaced).unwrap();
+                }
+            }
+        }
+        if undone {
+            self.reread();
+            let end = self.first + self.log.len() as u64;
+            let covered = self.snapshot.as_ref().is_some_and(|s| s.index + 1 >= self.synced_end);
+            assert!(
+                end >= self.synced_end || covered,
+                "the power lost before the log's directory was synced took records {end}..{} it had synced",
+                self.synced_end
+            );
+        }
+        undone
+    }
+
+    /// The records a restart finds once changes to the log's directory were undone, as the log
+    /// reads them: from its first segment, each segment continuing the last, up to damage or a
+    /// gap.
+    fn reread(&mut self) {
+        let segments = self.segments();
+        self.first = segments.first().map_or(1, |&(first, _)| first);
+        self.log.clear();
+        for (first, path) in segments {
+            if first != self.first + self.log.len() as u64 {
+                break;
+            }
+            let bytes = std::fs::read(path).unwrap();
+            let mut at = 0;
+            while let Ok(Some((record, len))) = Record::decode(&bytes[at..])
+                && record.index == self.first + self.log.len() as u64
+            {
+                self.log.push(bytes[at..at + len].to_vec());
+                at += len;
+            }
+            if at < bytes.len() {
+                break;
+            }
+        }
     }
 
     /// The log's segment files, by their first index, oldest first.
@@ -1598,6 +1694,7 @@ impl Sim {
             reads.extend(more);
             chunks.extend(more_chunks);
         }
+        self.nodes.get_mut(&id).unwrap().disk.sync();
         self.reads += (reads.len() + chunks.len()) as u64;
         let sim_node = self.nodes.get_mut(&id).unwrap();
         let mut snapshot = None;
@@ -2644,6 +2741,8 @@ impl Sim {
             }
             _ => {}
         }
+        disk.lose_power();
+        self.covered.undone += u64::from(disk.undo(&mut self.rng));
     }
 
     fn start(&mut self, id: NodeId) {

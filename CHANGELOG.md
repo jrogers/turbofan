@@ -6,6 +6,13 @@ a patch version (0.1.1) doesn't.
 
 ## Unreleased
 
+### Added
+
+- `log::Log::unsynced`, of a log opened by `Log::open_simulated`: the changes to its directory
+  (`log::DirChange`: segments created, removed or renamed) since it would last have been synced,
+  which a simulated power loss may undo. The simulation undoes them, each or not, and checks that
+  no power loss takes a record the log had synced; it fails on the compaction fixed below.
+
 ### Fixed
 
 - Compacting the log removed its oldest segments without syncing the directory between them: a
