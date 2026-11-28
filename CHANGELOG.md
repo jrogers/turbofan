@@ -8,6 +8,10 @@ a patch version (0.1.1) doesn't.
 
 ### Fixed
 
+- Compacting the log removed its oldest segments without syncing the directory between them: a
+  filesystem keeping a later removal through a crash but losing an earlier one would leave a gap,
+  which the log opened as damage, cutting the records after it, which it had acknowledged, and
+  doubting itself. Now each removal is synced before the next.
 - A client's open session could be closed as `NoSession` by a leader that had redirected it and
   been elected again: it no longer knew the client's connection, which the client hadn't dropped
   yet, and answered a keepalive sent on it before the redirect was read. The client took that

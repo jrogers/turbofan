@@ -418,7 +418,11 @@ impl Log {
         while self.segments.len() > 1 && self.segments[1] <= index + 1 {
             fs::remove_file(segment_path(&self.dir, self.segments[0]))?;
             self.segments.remove(0);
-            self.dir_dirty = true;
+            // Synced one by one: else a crash could keep this removal and lose an earlier one, a
+            // gap that opens as damage, and the records after it, acknowledged, cut.
+            if self.sync {
+                sync_dir(&self.dir)?;
+            }
         }
         Ok(self.segments[0])
     }
